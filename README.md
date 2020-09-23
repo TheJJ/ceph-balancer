@@ -76,20 +76,60 @@ This happens since it sees only this server's OSDs as "underfull", but each PG h
 To solve this, the main optimization goal is equal OSD utilization:
 
 Order all OSDs by utilization (optionally only for one crush root).
-From the fullest OSD, try to move the biggest PG shard to the least-utilized OSD.
+From the fullest OSD, try to move the biggest PG shard on it to the least-utilized OSD.
 If this violates constraints, try the next least-utilized OSD, and so on.
+
+Once a suitable OSD is found, check if the new placment has lower utilization variance.
+If this is the case, record the PG movement and try to move another PG with the same approach.
 
 If this is done forever, all OSDs will have very little utilization variance.
 
-TODO: explain more :)
+Pseudocode:
+
+```python
+while not found_enough_moves:
+    for from_osd in osds_by_utilization_asc(crushroot):
+        for pg in pgs_by_shardsize_on_osd(osd):
+            for to_osd in osds_by_utilization_desc(candidate_osds_for(pg)):
+                if is_crush_move_valid(pg, from_osd, to_osd):
+                    if utilization_variance_is_better(osds, pg, from_osd, to_osd):
+                        movements.append((pg, from_osd, to_osd))
+                        goto next_move
+    next_move:
+
+for movement in movements:
+    print(f"ceph osd pg-upmap-items {generate_upmap(movement)}")
+```
+
+Runtime:
+* Worst-case (the cluster is fully optimized already) is `O(OSDs²*PGs)`
+
+This can and should be optimized further.
+Especially the performance in the case where a cluster already is balanced must be improved.
 
 
-## TODOs
+## Usage
 
-Currently, it can only create one PG movement, the goal is of course to create many of them at once.
+```
+./placementoptimizer.py --help
+
+# balance can generate upmap items on stdout
+./placementoptimizer.py balance --help
+
+# balance can generate upmap items on stdout
+./placementoptimizer.py balance --help
+```
+
+## Contributions
+
+The script is not the prettiest (yet), but produces balancing-improvement movements.
+
+Ideally, with some further improvements and tuning, it could be integrated in upstream-Ceph as an alternative balancer implementation.
+
+So if you have any idea and suggestion how to improve things, please submit [pull requests](https://github.com/TheJJ/ceph-balancer/pulls).
 
 
-### Contact
+## Contact
 
 If you have questions, suggestions, encounter any problem,
 please join our Matrix or IRC channel and ask!

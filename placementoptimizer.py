@@ -12,6 +12,7 @@ GPLv3 or later
 # maximum movement limits
 # recommendations for pg num
 # respect OMAP_BYTES and OMAP_KEYS for a pg
+# don't touch a pool with decreasing pg_num
 
 # even "better" algorithm:
 # get osdmap and crushmap
@@ -162,7 +163,9 @@ for pool in osd_dump["pools"]:
     pools[id] = {
         'name': name,
         'crush_rule': pool["crush_rule"],
-        'pg_num': pool["pg_num"],
+        'pg_num': pool["pg_num"],  # current pgs before merge
+        'pgp_num': pool["pg_placement_num"],  # actual placed pg count
+        'pg_num_target': pool["pg_num_target"],  # target pg num
         'size': pool["size"],
         'min_size': pool["min_size"],
     }
@@ -547,6 +550,12 @@ class PGMoveChecker:
         self.pg_mappings = pg_mappings  # current pg->[osd] mapping state
         self.pg_osds = pg_mappings.get_mapping(move_pg)  # acting osds managing this pg
 
+    def get_osd_candidates(self):
+        """
+        return all possible candidate OSDs for the PG to relocate.
+        """
+        return self.osd_candidates
+
     def prepare_crush_check(self):
         """
         perform precalculations for moving this pg
@@ -614,7 +623,7 @@ class PGMoveChecker:
         # from this use count, subtract the trace of the replaced osd
         #
         # now eliminate candidates:
-        # * get trace from them
+        # * GET TRACE FROM THEM
         # * check use counts against reuses_per_step
         #
         # 1 -> -9 used 3<4, -7 used 1<2, -1 used 0<1 -> ok
@@ -633,7 +642,7 @@ class PGMoveChecker:
         # collect trace for each osd
         tree_depth = 0
         rule_depth = 0  # because we skip steps like chooseleaf_tries
-        root_name = None
+        rule_root_name = None
 
         # osd -> crush-root-trace
         constraining_traces = dict()
@@ -644,15 +653,20 @@ class PGMoveChecker:
         rule_tree_depth = dict()
 
         # gather item usages by evaluating the crush rules
-        for step in rule["steps"]:
+        for step in self.rule["steps"]:
             if step["op"] == "take":
-                root_name = step["item_name"]
+                rule_root_name = step["item_name"]
+
+                # should be the same since we fetch it the exact same way
+                assert rule_root_name == self.root_name
 
                 # first step: try to find tracebacks for all osds that ends up in this root.
                 constraining_traces = dict()
 
                 for pg_osd in self.pg_osds:
-                    trace = trace_crush_root(pg_osd, root_name)
+                    trace = trace_crush_root(pg_osd, rule_root_name)
+                    if trace is None:
+                        raise Exception(f"no trace found for {pg_osd} in {rule_root_name}")
                     constraining_traces[pg_osd] = trace
                     # the root was "used"
                     item_uses[rule_depth][trace[0]["id"]] += 1
@@ -723,7 +737,10 @@ class PGMoveChecker:
                     raise Exception("counted item uses != crush item, in step {i}: "
                                     f"{item}={uses} != {reuses_per_step[i]}")
 
-        assert root_name == self.root_name
+        # should still be the same, it could have changed if there were
+        # multiple takes
+        assert rule_root_name == self.root_name
+
         self.constraining_traces = constraining_traces  # osdid->crush-root-trace
         self.rule_tree_depth = rule_tree_depth  # rulestepid->tree_depth
         self.reuses_per_step = reuses_per_step  # rulestepid->allowed_item_reuses
@@ -882,9 +899,20 @@ class PGMappings:
 
         return used
 
+    def get_osd_weighted_size(self, osdid):
+        """
+        return the weighted OSD device size
+        """
+
+        osd = self.osds[osdid]
+        size = osd['device_size']
+        weight = osd['weight']
+
+        return size * weight
+
     def get_osd_usage(self, osdid, remap_pg=None, add_size=0):
         """
-        normalize the occupied OSD space by device size and device weight
+        returnes the occupied OSD space, weighted by device size and device weight.
 
         to calculate a simulated, different size, pass remap_pg.
         remap_pg: {'pgid': [(osd_from, osd_to), ...], ...}
@@ -892,9 +920,9 @@ class PGMappings:
         another variant is add to the used data amount with add_size.
         """
 
-        osd = self.osds[osdid]
-        size = osd['device_size']
-        weight = osd['weight']
+        osd_size = self.get_osd_weighted_size(osdid)
+        if osd_size == 0:
+            raise Exception("getting relative usage of a 0-weighted osd impossible")
 
         used = self.get_osd_occupied(osdid)
 
@@ -912,9 +940,11 @@ class PGMappings:
         used += use_delta
         used += add_size
 
-        used /= (size * weight)
+        # make it relative
+        used /= osd_size
+        used *= 100
 
-        return used * 100  # in percent :)
+        return used
 
     def get_upmaps(self):
         """
@@ -963,6 +993,54 @@ class PGMappings:
 
         return upmap_results
 
+    def osd_pool_pg_count(self, osd):
+        """
+        return {pool -> pg_count} for an OSD
+        """
+        ret = defaultdict(lambda: 0)
+        for pg in self.get_osd_pgs(osd):
+            ret[pool_from_pg(pg)] += 1
+
+        return ret
+
+    def pool_pg_count_ideal(self, poolid, candidate_osds):
+        """
+        return the ideal pg count for a poolid,
+        given the candidate osd ids.
+        expressed in the unit of osd weight, so probably TiB
+        """
+
+        pool = pools[poolid]
+        pool_total_pg_count = pool['size'] * pool['pg_num']
+
+        size_sum = 0
+
+        for osdid in candidate_osds:
+            osd = self.osds[osdid]
+            size = osd['device_size']
+            weight = osd['weight']
+
+            size_sum += size * weight
+
+        # uuh somehow no osd had a size or all weights 0?
+        assert size_sum > 0
+
+        pgs_per_size = pool_total_pg_count / size_sum
+
+        return pgs_per_size
+
+    def osd_pool_pg_count_ideal(self, poolid, osdid, candidate_osds):
+        """
+        return the ideal pg count for a pool id for some osdid.
+        """
+
+        osd_size = self.get_osd_weighted_size(osdid)
+        if osd_size == 0:
+            return 0
+
+        ideal_relative_count = self.pool_pg_count_ideal(poolid, candidate_osds)
+        return ideal_relative_count * osd_size
+
 
 if args.mode == 'balance':
     logging.info("running pg balancer")
@@ -983,6 +1061,9 @@ if args.mode == 'balance':
     else:
         osd_candidates = osds.keys()
 
+    # filter osd candidates by weight, and remove weight=0
+    osd_candidates = {osd for osd in osd_candidates if osds[osd]['weight'] != 0}
+
     # we'll do all the optimizations in this mapping state
     pg_mappings = PGMappings(pgs, osds)
 
@@ -999,6 +1080,7 @@ if args.mode == 'balance':
             break
 
         # osd -> usage
+        # if an osd has a weight of 0, it's 100% full.
         osd_usages = {osd: pg_mappings.get_osd_usage(osd) for osd in osd_candidates}
 
         # from this mapping, calculate the weighted osd size,
@@ -1010,51 +1092,107 @@ if args.mode == 'balance':
         unsuccessful_pools = set()
 
         # try to move the biggest pg from the fullest disk to the next suiting smaller disk
-        for osd_from, osd_from_usage in reversed(osds_usage_asc):
+        for osd_from, osd_from_used_percent in reversed(osds_usage_asc):
             if found_remap:
                 break
 
-            logging.debug("trying to empty osd %s (%f %%)", osd_from, osd_from_usage)
+            logging.debug("trying to empty osd %s (%f %%)", osd_from, osd_from_used_percent)
 
             # pg -> shardsize
-            pg_candidates = dict()
+            pg_candidates_sizes = dict()
             for pg_candidate in pg_mappings.get_osd_pgs(osd_from):
                 pg_pool = pool_from_pg(pg_candidate)
                 if only_poolids and pg_pool not in only_poolids:
                     continue
 
-                pg_candidates[pg_candidate] = get_pg_shardsize(pg_candidate)
+                pg_candidate_size = get_pg_shardsize(pg_candidate)
+                pg_candidates_sizes[pg_candidate] = pg_candidate_size
 
             # remaining pgs sorted by their shardsize, descending
-            pg_candidates_desc = sorted(pg_candidates.items(),
-                                        key=lambda pg: pg[1], reverse=True)
+            pg_candidates_desc = list(sorted(pg_candidates_sizes.items(),
+                                             key=lambda pg: pg[1], reverse=True))
+            pg_candidates_desc_sizes = [pg[1] for pg in pg_candidates_desc]
 
-            for move_pg, move_pg_shardsize in pg_candidates_desc:
+            # here, we decide to move not the largest/smallest pg, but rather the median one.
+            # order PGs around the median-sized one
+            # [5, 4, 3, 2, 1] => [3, 4, 2, 5, 1]
+            # https://oeis.org/A001057
+            pg_candidates = list()
+            pg_candidates_median = statistics.median_low(pg_candidates_desc_sizes)
+            # first, search the median pg size
+            pg_walk_anchor = pg_candidates_desc_sizes.index(pg_candidates_median)
+            # then, jump forward and backward
+            walk_jump = 0
+            walk_forward = True
+            while True:
+                if walk_forward:
+                    pg_walk_pos = pg_walk_anchor + walk_jump
+                    walk_jump += 1
+                    walk_forward = False
+                else:
+                    pg_walk_pos = pg_walk_anchor - walk_jump
+                    walk_forward = True
+
+                if pg_walk_pos < -1:
+                    break
+                elif pg_walk_pos >= len(pg_candidates_desc) + 1:
+                    break
+                elif pg_walk_pos < 0:
+                    continue
+                elif pg_walk_pos >= len(pg_candidates_desc):
+                    continue
+
+                pg = pg_candidates_desc[pg_walk_pos]
+                pg_candidates.append(pg)
+
+            assert len(pg_candidates) == len(pg_candidates_desc)
+
+            from_osd_pg_count = pg_mappings.osd_pool_pg_count(osd_from)
+
+            # now try to move the candidates to their possible destination
+            for move_pg, move_pg_shardsize in pg_candidates:
                 if found_remap:
                     break
 
                 pg_pool = pool_from_pg(move_pg)
 
                 if pg_pool in unsuccessful_pools:
-                    logging.debug("skipping pg %s since pool (%s) can't be balanced more", pg_candidate, pg_pool)
+                    logging.debug("skipping pg %s since pool (%s) can't be balanced more", move_pg, pg_pool)
                     continue
 
                 logging.debug("considering moving pg %s with %s from osd %s", move_pg, pprintsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
+                pool_pg_count_ideal = pg_mappings.pool_pg_count_ideal(pg_pool, try_pg_move.get_osd_candidates())
+                from_osd_pg_count_ideal = pool_pg_count_ideal * pg_mappings.get_osd_weighted_size(osd_from)
+
+                # only move the pg if the source osd has more PGs of the pool than average
+                # otherwise the regular balancer will fill this OSD again
+                # with another PG (of the same pool) from somewhere
+                if from_osd_pg_count[pg_pool] < from_osd_pg_count_ideal:
+                    logging.debug("  skipping pg %s since source osd %s "
+                                  "doesn't have too many of it (%s < %s)",
+                                  move_pg, osd_from, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
+                    continue
 
                 pg_small_enough = False
-                for rule_osd in try_pg_move.osd_candidates:
-                    target_predicted_usage = pg_mappings.get_osd_usage(rule_osd, add_size=move_pg_shardsize)
-                    if target_predicted_usage < osd_from_usage:
+                for osd_to in try_pg_move.get_osd_candidates():
+                    # check if there's a target osd that will be filled less than the source osd after move
+                    # TODO: gradually increase limit for pg size so that:
+                    #       predicted_target_usage < ((target_usage + source_usage)/2 + limit
+                    target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
+                    if target_predicted_usage < osd_from_used_percent:
                         pg_small_enough = True
                         break
 
                 if not pg_small_enough:
                     # the pg is so big, it would increase the fill % of all osd_tos more than osd_from is
                     # so we would increase the variance.
-                    logging.debug("  skipping pg %s, since its not small enough")
+                    logging.debug("  skipping pg %s, since its not small enough", move_pg)
                     continue
+
+                # TODO: start with the smallest PG and check if its movement meets newusage < (oldusage + sourceusage)/2
+                # increase pg size until this is no longer met, and move the one that fitted best
 
                 try_pg_move.prepare_crush_check()
 
@@ -1064,6 +1202,17 @@ if args.mode == 'balance':
                 # try the least full osd that's allowed by crush
                 for osd_to in try_pg_move.filter_candidates(osd[0] for osd in osds_usage_asc):
                     logging.debug(f"TRY move {move_pg} osd.{osd_from} => osd.{osd_to}")
+
+                    # in order to not fight the regular balancer, don't move the PG to a disk
+                    # where the weighted pg count of this pool is already good
+                    # otherwise the balancer will move a pg on the osd_from of this pool somewhere else
+                    # i.e. don't be the +1
+                    to_osd_pg_count = pg_mappings.osd_pool_pg_count(osd_to)
+                    to_osd_pg_count_ideal = pool_pg_count_ideal * pg_mappings.get_osd_weighted_size(osd_to)
+                    if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal:
+                        logging.debug(f"   BAD => osd.{osd_to} already has "
+                                      f"too many of it ({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})")
+                        continue
 
                     if not try_pg_move.is_move_valid(osd_from, osd_to):
                         logging.debug(f"   BAD move {move_pg} osd.{osd_from} => osd.{osd_to}")
@@ -1144,7 +1293,10 @@ elif args.mode == 'show':
 
             for osdid, props in osds.items():
                 if args.use_weighted_utilization:
-                    util_val = (props['device_used'] / (props['device_size'] * props['weight']) * 100)
+                    if props['weight'] == 0:
+                        util_val = 0
+                    else:
+                        util_val = (props['device_used'] / (props['device_size'] * props['weight']) * 100)
                 else:
                     util_val = props['utilization']
 

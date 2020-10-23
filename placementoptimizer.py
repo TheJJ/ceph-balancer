@@ -1042,6 +1042,18 @@ class PGMappings:
         return ideal_relative_count * osd_size
 
 
+def A001057():
+    """
+    generate [0, 1, -1, 2, -2, 3, -3, ...]
+    https://oeis.org/A001057
+    """
+    idx = 0
+    while True:
+        val = int((1 - (2 * idx + 1) * (-1)**idx) / 4)
+        idx += 1
+        yield val
+
+
 if args.mode == 'balance':
     logging.info("running pg balancer")
 
@@ -1116,22 +1128,11 @@ if args.mode == 'balance':
             # here, we decide to move not the largest/smallest pg, but rather the median one.
             # order PGs around the median-sized one
             # [5, 4, 3, 2, 1] => [3, 4, 2, 5, 1]
-            # https://oeis.org/A001057
             pg_candidates = list()
             pg_candidates_median = statistics.median_low(pg_candidates_desc_sizes)
-            # first, search the median pg size
             pg_walk_anchor = pg_candidates_desc_sizes.index(pg_candidates_median)
-            # then, jump forward and backward
-            walk_jump = 0
-            walk_forward = True
-            while True:
-                if walk_forward:
-                    pg_walk_pos = pg_walk_anchor + walk_jump
-                    walk_jump += 1
-                    walk_forward = False
-                else:
-                    pg_walk_pos = pg_walk_anchor - walk_jump
-                    walk_forward = True
+            for walk_jump in A001057():
+                pg_walk_pos = pg_walk_anchor + walk_jump
 
                 if pg_walk_pos < -1:
                     break

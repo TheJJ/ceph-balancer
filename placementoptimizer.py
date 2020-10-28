@@ -1399,6 +1399,15 @@ elif args.mode == 'showremapped':
         if "remapped" in pgstate:
             up_osds = pginfo["up"]
             acting_osds = pginfo["acting"]
+
+            objs_total = pginfo["stat_sum"]["num_objects"]
+            objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
+            if objs_total > 0:
+                progress = 1 - (objs_misplaced / objs_total)
+            else:
+                progress = 1
+            progress *= 100
+
             moves = list()
             for up_osd, acting_osd in zip(up_osds, acting_osds):
                 if up_osd != acting_osd:
@@ -1406,7 +1415,7 @@ elif args.mode == 'showremapped':
 
             state = "backfill" if "backfilling" in pgstate else "waiting "
             move_size = pprintsize(get_pg_shardsize(pg))
-            print(f"pg {pg} {state} {move_size: >5}: {','.join(moves)}")
+            print(f"pg {pg} {state} {move_size: >5}: {objs_misplaced} of {objs_total}, {progress:.1f}%, {','.join(moves)}")
 
 
 else:

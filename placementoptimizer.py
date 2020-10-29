@@ -962,11 +962,19 @@ class PGMappings:
         # pgid -> [(map_from, map_to), ...]
         upmap_results = dict()
 
-        for pg, remaps in self.remaps.items():
+        for pg, remaps_list in self.remaps.items():
 
             # remaps is [(osdfrom, osdto), ...], now osdfrom->osdto
             # these are the "new" remappings.
-            remaps = dict(remaps)
+            remaps = dict(remaps_list)
+
+            # merge new upmaps
+            # i.e. (1, 2), (2, 3) => (1, 3)
+            for new_from, new_to in remaps_list:
+                other_to = remaps.get(new_to)
+                if other_to is not None:
+                    remaps[new_from] = other_to
+                    del remaps[new_to]
 
             # current_upmaps are is [(osdfrom, osdto), ...]
             current_upmaps = upmap_items.get(pg, [])
@@ -1112,7 +1120,7 @@ if args.mode == 'balance':
             if found_remap:
                 break
 
-            logging.debug("trying to empty osd %s (%f %%)", osd_from, osd_from_used_percent)
+            logging.debug("trying to empty osd.%s (%f %%)", osd_from, osd_from_used_percent)
 
             # pg -> shardsize
             pg_candidates_sizes = dict()
@@ -1165,7 +1173,7 @@ if args.mode == 'balance':
                     logging.debug("SKIP pg %s since pool (%s) can't be balanced more", move_pg, pg_pool)
                     continue
 
-                logging.debug("TRY-0 moving pg %s with %s from osd %s", move_pg, pprintsize(move_pg_shardsize), osd_from)
+                logging.debug("TRY-0 moving pg %s with %s from osd.%s", move_pg, pprintsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
                 pool_pg_count_ideal = pg_mappings.pool_pg_count_ideal(pg_pool, try_pg_move.get_osd_candidates())
@@ -1175,11 +1183,11 @@ if args.mode == 'balance':
                 # otherwise the regular balancer will fill this OSD again
                 # with another PG (of the same pool) from somewhere
                 if from_osd_pg_count[pg_pool] <= from_osd_pg_count_ideal:
-                    logging.debug("  BAD => skipping pg %s since source osd %s "
+                    logging.debug("  BAD => skipping pg %s since source osd.%s "
                                   "doesn't have too many of pool=%s (%s <= %s)",
                                   move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
                     continue
-                logging.debug("  OK => taking pg %s from source osd %s "
+                logging.debug("  OK => taking pg %s from source osd.%s "
                               "since it has too many of pool=%s (%s > %s)",
                               move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
 
@@ -1400,18 +1408,18 @@ elif args.mode == 'showremapped':
             up_osds = pginfo["up"]
             acting_osds = pginfo["acting"]
 
-            objs_total = pginfo["stat_sum"]["num_objects"]
-            objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
-            if objs_total > 0:
-                progress = 1 - (objs_misplaced / objs_total)
-            else:
-                progress = 1
-            progress *= 100
-
             moves = list()
             for up_osd, acting_osd in zip(up_osds, acting_osds):
                 if up_osd != acting_osd:
                     moves.append(f"{acting_osd}->{up_osd}")
+
+            objs_total = pginfo["stat_sum"]["num_objects"]
+            objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
+            if objs_total > 0:
+                progress = 1 - (objs_misplaced / (objs_total * len(moves)))
+            else:
+                progress = 1
+            progress *= 100
 
             state = "backfill" if "backfilling" in pgstate else "waiting "
             move_size = pprintsize(get_pg_shardsize(pg))

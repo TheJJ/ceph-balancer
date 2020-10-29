@@ -887,6 +887,8 @@ class PGMappings:
         if not did_remap:
             raise Exception(f"did not find osd {osd_from} in pg {pg} mapping")
 
+        self.get_osd_occupied.cache_clear()
+
         self.remaps[pg].append((osd_from, osd_to))
 
     def get_mapping(self, pg):
@@ -895,10 +897,13 @@ class PGMappings:
     def get_osd_pgs(self, osd):
         return self.osd_pgs[osd]
 
+    @lru_cache(maxsize=2**18)
     def get_osd_occupied(self, osd):
         """
         calculate the osd usage by summing all the mapped PGs shardsizes
         -> we can calculate a future size
+
+        remember to clear the cache with cache_clear() when self.osd_pgs changes!
         """
         used = 0
 

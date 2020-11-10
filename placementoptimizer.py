@@ -862,26 +862,71 @@ class PGMappings:
         # device size
         self.osds = osds
 
-        # osdid -> {pg, ...}
+        # up state: osdid -> {pg, ...}
         self.osd_pgs = defaultdict(set)
 
-        # osdid -> used kb, based on the osd-level utilization report
-        self.osd_utilizations = dict()
-        for osdid, osd in osds.items():
-            self.osd_utilizations[osdid] = osd['device_used']
+        # acting state: osdid -> {pg, ...}
+        osd_pgs_acting = defaultdict(set)
 
-        # pgid -> [up_osd, ...]
+        # choose the up mapping, since we wanna optimize the "future" cluster
+        # up pg mapping: pgid -> [up_osd, ...]
         self.pg_mappings = dict()
+
         for pg, pginfo in pgs.items():
-            # choose the up mapping, since we wanna optimize the "future" cluster
             up_osds = pginfo["up"]
             self.pg_mappings[pg] = list(up_osds)
 
             for osd in up_osds:
                 self.osd_pgs[osd].add(pg)
 
+            acting_osds = pginfo["acting"]
+            for osd in acting_osds:
+                osd_pgs_acting[osd].add(pg)
+
         # pg->[(osd_from, osd_to), ...]
         self.remaps = defaultdict(list)
+
+        # osdid -> used kb, based on the osd-level utilization report
+        self.osd_utilizations = dict()
+        for osdid, osd in osds.items():
+            # this is the current "acting" size.
+            # and the parts of not-yet-fully-transferred up pgs
+            osd_fs_used = osd['device_used']
+
+            # we want the up-size, i.e. the osd utilization when all moves
+            # would be finished.
+            # to estimate it, we need to add the shards of (up - acting)
+            # and remove the shards of (acting - up)
+
+            for pg in (self.osd_pgs[osdid] - osd_pgs_acting[osdid]):
+                shardsize = get_pg_shardsize(pg)
+                osd_fs_used += shardsize
+
+                # try to estimate the partially transferred size by
+                # the number of objects
+                # if you know a better way to estimate it, please fix.
+                pginfo = pgs[pg]
+                pg_objs = pginfo["stat_sum"]["num_objects"]
+                # estimated...
+                pg_obj_size = shardsize / pg_objs
+
+                moves = get_remaps(pginfo)
+                pg_remap_count = len(moves)
+
+                # again estimated, since we only know the total number of misplaced
+                # and not the per-osd count...
+                pg_objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
+                osd_pg_objs_misplaced = pg_objs_misplaced / pg_remap_count
+
+                # adjust fs size by average object size times estimated misplaced count.
+                # because this is kinda lame but it seems one can't get more info
+                # the balancer will work best if there are no more remapped PGs!
+                osd_fs_used -= int(pg_obj_size * osd_pg_objs_misplaced)
+
+            for pg in (osd_pgs_acting[osdid] - self.osd_pgs[osdid]):
+                osd_fs_used -= get_pg_shardsize(pg)
+
+            self.osd_utilizations[osdid] = osd_fs_used
 
     def apply_remap(self, pg, osd_from, osd_to):
         """
@@ -922,7 +967,7 @@ class PGMappings:
     @lru_cache(maxsize=2**18)
     def get_osd_shardsize_sum(self, osd):
         """
-        calculate the osd usage by summing all the mapped PGs shardsizes
+        calculate the osd usage by summing all the mapped (up) PGs shardsizes
         -> we can calculate a future size
 
         remember to clear the cache with cache_clear() when self.osd_pgs changes!
@@ -1112,6 +1157,25 @@ def get_cluster_variance(crushclasses, pg_mappings):
         variances[crushclass] = class_variance
 
     return variances
+
+
+def get_remaps(pginfo):
+    """
+    given the pginfo structure, compare up and acting sets
+
+    TODO: what about remaps of replica pgs where the order changed?
+
+    return [(osd_from, osd_to), ...]
+    """
+    up_osds = pginfo["up"]
+    acting_osds = pginfo["acting"]
+
+    moves = list()
+    for up_osd, acting_osd in zip(up_osds, acting_osds):
+        if up_osd != acting_osd:
+            moves.append((acting_osd, up_osd))
+
+    return moves
 
 
 if args.mode == 'balance':
@@ -1503,13 +1567,10 @@ elif args.mode == 'showremapped':
     for pg, pginfo in pgs.items():
         pgstate = pginfo["state"].split("+")
         if "remapped" in pgstate:
-            up_osds = pginfo["up"]
-            acting_osds = pginfo["acting"]
 
             moves = list()
-            for up_osd, acting_osd in zip(up_osds, acting_osds):
-                if up_osd != acting_osd:
-                    moves.append(f"{acting_osd}->{up_osd}")
+            for osd_from, osd_to in get_remaps(pginfo):
+                moves.append(f"{osd_from}->{osd_to}")
 
             objs_total = pginfo["stat_sum"]["num_objects"]
             objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]

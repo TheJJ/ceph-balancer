@@ -279,6 +279,21 @@ for pg in pg_dump["pg_map"]["pg_stats"]:
 
 osds = dict()
 
+for osd in osd_df_dump["nodes"]:
+    id = osd["id"]
+    osds[id] = {
+        "device_size": osd["kb"] * 1024,
+        "device_used": osd["kb_used"] * 1024,
+        "device_used_data": osd["kb_used_data"] * 1024,
+        "device_used_meta": osd["kb_used_meta"] * 1024,
+        "device_available": osd["kb_avail"] * 1024,
+        "utilization": osd["utilization"],
+        "crush_weight": osd["crush_weight"],
+        "pg_count_active": osd["pgs"],  # pgs in the osd df view
+        "status": osd["status"],
+    }
+
+
 # gather which pgs are on what osd
 for osdid, osd in osd_mappings.items():
     osd_pools_up = set()
@@ -304,14 +319,13 @@ for osdid, osd in osd_mappings.items():
 
         pg_count_acting[poolid] += 1
 
-
     if osdid == 0x7fffffff:
         osdid = -1
         crushclass = "-"
     else:
         crushclass = osd_crushclass[osdid]
 
-    osds[osdid] = {
+    osds[osdid].update({
         'pools_up': list(sorted(osd_pools_up)),
         'pools_acting': list(sorted(osd_pools_acting)),
         'pg_count_up': pg_count_up,
@@ -321,28 +335,12 @@ for osdid, osd in osd_mappings.items():
         'pg_num_acting': len(pgs_acting),
         'pgs_acting': pgs_acting,
         'crush_class': crushclass,
-        'utilization': -1,
-        "device_size": -1,
-        "device_used": -1,
-        "crush_weight": -1,
-    }
-
-
-for osd in osd_df_dump["nodes"]:
-    id = osd["id"]
-    osds[id].update({
-        "device_size": osd["kb"] * 1024,
-        "device_used": osd["kb_used"] * 1024,
-        "device_used_data": osd["kb_used_data"] * 1024,
-        "device_used_meta": osd["kb_used_meta"] * 1024,
-        "device_available": osd["kb_avail"] * 1024,
-        "utilization": osd["utilization"],
-        "crush_weight": osd["crush_weight"],
     })
 
-    if osd['pgs'] != osds[id]['pg_num_acting']:
+    if osds[osdid]['pg_count_active'] != osds[osdid]['pg_num_acting']:
         raise Exception(f"on osd.{id} calculated pg num acting: "
-                        f"{osds[id]['pg_num_acting']} != {osd['pgs']}")
+                        f"{osds[id]['pg_num_acting']} != {osds[id]['pgs']}")
+
 
 for osd in osd_dump["osds"]:
     id = osd["osd"]
@@ -834,6 +832,10 @@ class PGMoveChecker:
             elif osd == osd_to:
                 delta = pg_shardsize
 
+            if osds[osd]['weight'] == 0:
+                # relative usage of weight 0 is impossible
+                continue
+
             osd_used = self.pg_mappings.get_osd_usage(osd, add_size=delta)
             osds_used.append(osd_used)
 
@@ -1152,7 +1154,12 @@ def get_cluster_variance(crushclasses, pg_mappings):
     """
     variances = dict()
     for crushclass in crushclasses:
-        osd_usages = [pg_mappings.get_osd_usage(osdid) for osdid in crushclass_osds[crushclass]]
+        osd_usages = list()
+        for osdid in crushclass_osds[crushclass]:
+            if osds[osdid]['weight'] == 0:
+                continue
+            osd_usages.append(pg_mappings.get_osd_usage(osdid))
+
         class_variance = statistics.variance(osd_usages)
         variances[crushclass] = class_variance
 
@@ -1222,7 +1229,7 @@ if args.mode == 'balance':
     osd_usages_asc = get_osd_usages_asc(pg_mappings)
 
     cluster_variance = get_cluster_variance(enabled_crushclasses, pg_mappings)
-    logging.info("cluster variance:")
+    logging.info("cluster variance for crushclasses:")
     for crushclass, variance in cluster_variance.items():
         logging.info(f"  {crushclass}: {variance:.3f}")
 
@@ -1572,17 +1579,18 @@ elif args.mode == 'showremapped':
             for osd_from, osd_to in get_remaps(pginfo):
                 moves.append(f"{osd_from}->{osd_to}")
 
-            objs_total = pginfo["stat_sum"]["num_objects"]
+            # multiply with move-count since each pg remap moves all objects again
+            objs_total = pginfo["stat_sum"]["num_objects"] * len(moves)
             objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
             if objs_total > 0:
-                progress = 1 - (objs_misplaced / (objs_total * len(moves)))
+                progress = 1 - (objs_misplaced / objs_total)
             else:
                 progress = 1
             progress *= 100
 
             state = "backfill" if "backfilling" in pgstate else "waiting "
             move_size = pprintsize(get_pg_shardsize(pg))
-            print(f"pg {pg} {state} {move_size: >5}: {objs_misplaced} of {objs_total}, {progress:.1f}%, {','.join(moves)}")
+            print(f"pg {pg} {state} {move_size: >5}: {objs_total-objs_misplaced} of {objs_total}, {progress:.1f}%, {','.join(moves)}")
 
 
 else:

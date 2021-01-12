@@ -320,8 +320,10 @@ for osdid, osd in osd_mappings.items():
         pg_count_acting[poolid] += 1
 
     if osdid == 0x7fffffff:
+        # the "missing" osds
         osdid = -1
         crushclass = "-"
+        continue
     else:
         crushclass = osd_crushclass[osdid]
 
@@ -1231,7 +1233,11 @@ if args.mode == 'balance':
     cluster_variance = get_cluster_variance(enabled_crushclasses, pg_mappings)
     logging.info("cluster variance for crushclasses:")
     for crushclass, variance in cluster_variance.items():
+        osd_min, osd_min_used = osd_usages_asc[0]
+        osd_max, osd_max_used = osd_usages_asc[-1]
         logging.info(f"  {crushclass}: {variance:.3f}")
+        logging.info(f"                min osd.{osd_min} {osd_min_used:.1f}%")
+        logging.info(f"                max osd.{osd_max} {osd_max_used:.1f}%")
 
     while True:
         if found_remap_count >= args.max_pg_moves:

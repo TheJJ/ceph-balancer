@@ -341,7 +341,7 @@ for osdid, osd in osd_mappings.items():
 
     if osds[osdid]['pg_count_active'] != osds[osdid]['pg_num_acting']:
         raise Exception(f"on osd.{id} calculated pg num acting: "
-                        f"{osds[id]['pg_num_acting']} != {osds[id]['pgs']}")
+                        f"{osds[id]['pg_count_active']} != {osds[id]['pg_num_acting']}")
 
 
 for osd in osd_dump["osds"]:

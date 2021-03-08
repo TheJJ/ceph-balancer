@@ -4,7 +4,9 @@ JJ's Ceph Balancer
 [Ceph](https://ceph.io)'s "main" design issue is equal data placement.
 One mitigation is the [mgr balancer](https://docs.ceph.com/en/latest/rados/operations/balancer/).
 
-This is an alternative Ceph balancer implementation, with a different strategy than the current (octopus) upstream one: optimizing for equal OSD utilization.
+This is an alternative Ceph balancer implementation.
+The current (octopus) upstream balancer optimizes for (weighted) equal number of PGs on each OSD for each pool.
+This balancer has a different strategy: optimizing for equal OSD size utilization.
 
 For most clusters, the `mgr balancer` works well.
 For heterogeneous clusters with a lot of device and server capacity variance, placement may be very bad - the reason this balancer was created.
@@ -38,11 +40,11 @@ Each subtree usually has the weight of all the OSDs below it, and PGs are now di
 That way big servers/racks/datacenters/... get more data than small ones, but the relative amount is the same.
 
 In theory, each OSD should thus be filled exactly the same relative amount, all are e.g. 30% full.
-In practice, not so much.
+In practice, not so much:
 
-The cluster that was the motivation to create this has devices (same device class, weighted at 1.0) ranging from 55% to 80%.
+The cluster, which was the motivation to create this balancer, has devices (same device class, weighted at 1.0) ranging from 55% to 80% size utilization.
 
-The reason is this: The cluster has many pools (at time of writing 37), OSD sizes vary from 1T to 14T, 4 to 40 OSDs per server.
+The reason is this: The cluster has many pools (at time of writing 46), OSD sizes vary from 1T to 14T, 4 to 40 OSDs per server.
 And the `mgr balancer` can't handle this.
 
 
@@ -76,19 +78,22 @@ This happens since it sees only this server's OSDs as "underfull", but each PG h
 To solve this, the main optimization goal is equal OSD utilization:
 
 Order all OSDs by utilization (optionally only for one crush root).
+Utilization is estimated from all PGs where the OSD is in the `up` set (due to ongoing partial PG transfers).
 From the fullest OSD, try to move the biggest PG shard on it to the least-utilized OSD.
 If this violates constraints, try the next least-utilized OSD, and so on.
 
 Once a suitable OSD is found, check if the new placment has lower utilization variance.
 If this is the case, record the PG movement and try to move another PG with the same approach.
 
-If this is done forever, all OSDs will have very little utilization variance.
+If this is done forever, all OSDs will have very little utilization variance, or CRUSH constraints prevent us from doing more PG movements.
 
 Pseudocode:
 
 ```python
 while not found_enough_moves:
-    for from_osd in osds_by_utilization_asc(crushroot):
+    for i, from_osd in enumerate(osds_by_utilization_asc(crushroot)):
+        if i > 0:
+            finish('could not empty fullest device, stopping')
         for pg in pgs_by_shardsize_on_osd(osd):
             for to_osd in osds_by_utilization_desc(candidate_osds_for(pg)):
                 if is_crush_move_valid(pg, from_osd, to_osd):
@@ -102,19 +107,16 @@ for movement in movements:
 ```
 
 Runtime:
-* Worst-case (the cluster is fully optimized already) is `O(OSDs²*PGs)`
+* Worst-case (the fullest OSD can't be emptied more): `O(OSDs * PGs)`
+* If we would continue after the fullest OSD can't be emptied any more, it would be: `O(OSDs²*PGs)`
 
-This can and should be optimized further.
-Especially the performance in the case where a cluster already is balanced must be improved.
+Likely this can be optimized further.
 
 
 ## Usage
 
 ```
 ./placementoptimizer.py --help
-
-# balance can generate upmap items on stdout
-./placementoptimizer.py balance --help
 
 # balance can generate upmap items on stdout
 ./placementoptimizer.py balance --help

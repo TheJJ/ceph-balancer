@@ -289,7 +289,6 @@ for osd in osd_df_dump["nodes"]:
         "device_available": osd["kb_avail"] * 1024,
         "utilization": osd["utilization"],
         "crush_weight": osd["crush_weight"],
-        "pg_count_active": osd["pgs"],  # pgs in the osd df view
         "status": osd["status"],
     }
 
@@ -338,10 +337,6 @@ for osdid, osd in osd_mappings.items():
         'pgs_acting': pgs_acting,
         'crush_class': crushclass,
     })
-
-    if osds[osdid]['pg_count_active'] != osds[osdid]['pg_num_acting']:
-        raise Exception(f"on osd.{id} calculated pg num acting: "
-                        f"{osds[id]['pg_count_active']} != {osds[id]['pg_num_acting']}")
 
 
 for osd in osd_dump["osds"]:

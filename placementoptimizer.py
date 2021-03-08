@@ -3,11 +3,11 @@
 """
 Ceph balancer.
 
-(c) 2020 Jonas Jelten <jj@sft.lol>
+(c) 2021 Jonas Jelten <jj@sft.lol>
 GPLv3 or later
 """
 
-# some future TODOs:
+# some future TODOs to include in the optimization:
 # also consider the device's relative PG count
 # maximum movement limits
 # recommendations for pg num
@@ -862,7 +862,7 @@ class PGMappings:
         self.osds = osds
 
         # up state: osdid -> {pg, ...}
-        self.osd_pgs = defaultdict(set)
+        self.osd_pgs_up = defaultdict(set)
 
         # acting state: osdid -> {pg, ...}
         osd_pgs_acting = defaultdict(set)
@@ -876,7 +876,7 @@ class PGMappings:
             self.pg_mappings[pg] = list(up_osds)
 
             for osd in up_osds:
-                self.osd_pgs[osd].add(pg)
+                self.osd_pgs_up[osd].add(pg)
 
             acting_osds = pginfo["acting"]
             for osd in acting_osds:
@@ -894,35 +894,55 @@ class PGMappings:
 
             # we want the up-size, i.e. the osd utilization when all moves
             # would be finished.
-            # to estimate it, we need to add the shards of (up - acting)
+            # to estimate it, we need to add the (partial) shards of (up - acting)
             # and remove the shards of (acting - up)
 
-            for pg in (self.osd_pgs[osdid] - osd_pgs_acting[osdid]):
-                shardsize = get_pg_shardsize(pg)
-                osd_fs_used += shardsize
+            # pgs that are transferred to the osd, so they will be acting soon(tm)
+            for pg in (self.osd_pgs_up[osdid] - osd_pgs_acting[osdid]):
 
-                # try to estimate the partially transferred size by
-                # the number of objects
+                # try to estimate the partially transferred size by the number of objects.
+                # osd_fs_used already contains the size of partially transferred shards.
+                # now we account for ongoing transfers.
+
+                shardsize = get_pg_shardsize(pg)
+
                 # if you know a better way to estimate it, please fix.
                 pginfo = pgs[pg]
                 pg_objs = pginfo["stat_sum"]["num_objects"]
                 # estimated...
                 pg_obj_size = shardsize / pg_objs
 
-                moves = get_remaps(pginfo)
-                pg_remap_count = len(moves)
-
                 # again estimated, since we only know the total number of misplaced
                 # and not the per-osd count...
+                moves = get_remaps(pginfo)
+                pg_remap_count = len(moves)
                 pg_objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
                 osd_pg_objs_misplaced = pg_objs_misplaced / pg_remap_count
+
+                if pg_objs_misplaced == 0:
+                    # if no misplaced objs are in a remapped pg
+                    # it can also be in active+degraded+remapped state,
+                    # since the objects are truly missing on the previous shard
+                    # and need to be restored without misplacement.
+                    if pginfo["stat_sum"]["num_objects_degraded"] == 0:
+                        raise Exception(f"pg {pg} is moved to osd.{osdid} but nothing is "
+                                        f"misplaced or degraded?")
 
                 # adjust fs size by average object size times estimated misplaced count.
                 # because this is kinda lame but it seems one can't get more info
                 # the balancer will work best if there are no more remapped PGs!
-                osd_fs_used -= int(pg_obj_size * osd_pg_objs_misplaced)
+                shardsize_already_transferred = int(pg_obj_size * (pg_objs - osd_pg_objs_misplaced))
 
-            for pg in (osd_pgs_acting[osdid] - self.osd_pgs[osdid]):
+                if shardsize_already_transferred < 0:
+                    raise Exception(f"pg {pg} on osd.{osdid} is misplaced, "
+                                    f"but the partially transferred size is negative?")
+
+                missing_shardsize = shardsize - shardsize_already_transferred
+
+                osd_fs_used += missing_shardsize
+
+            # pgs that are transferred off the osd
+            for pg in (osd_pgs_acting[osdid] - self.osd_pgs_up[osdid]):
                 osd_fs_used -= get_pg_shardsize(pg)
 
             self.osd_utilizations[osdid] = osd_fs_used
@@ -933,8 +953,8 @@ class PGMappings:
         this updates the mappings stored in this object.
         """
 
-        self.osd_pgs[osd_from].remove(pg)
-        self.osd_pgs[osd_to].add(pg)
+        self.osd_pgs_up[osd_from].remove(pg)
+        self.osd_pgs_up[osd_to].add(pg)
 
         pg_mapping = self.pg_mappings[pg]
         did_remap = False
@@ -960,8 +980,8 @@ class PGMappings:
     def get_mapping(self, pg):
         return self.pg_mappings[pg]
 
-    def get_osd_pgs(self, osd):
-        return self.osd_pgs[osd]
+    def get_osd_pgs_up(self, osd):
+        return self.osd_pgs_up[osd]
 
     @lru_cache(maxsize=2**18)
     def get_osd_shardsize_sum(self, osd):
@@ -969,11 +989,11 @@ class PGMappings:
         calculate the osd usage by summing all the mapped (up) PGs shardsizes
         -> we can calculate a future size
 
-        remember to clear the cache with cache_clear() when self.osd_pgs changes!
+        remember to clear the cache with cache_clear() when self.osd_pgs_up changes!
         """
         used = 0
 
-        for pg in self.get_osd_pgs(osd):
+        for pg in self.get_osd_pgs_up(osd):
             used += get_pg_shardsize(pg)
 
         return used
@@ -1080,7 +1100,7 @@ class PGMappings:
         return {pool -> pg_count} for an OSD
         """
         ret = defaultdict(lambda: 0)
-        for pg in self.get_osd_pgs(osd):
+        for pg in self.get_osd_pgs_up(osd):
             ret[pool_from_pg(pg)] += 1
 
         return ret
@@ -1235,6 +1255,10 @@ if args.mode == 'balance':
         logging.info(f"                max osd.{osd_max} {osd_max_used:.1f}%")
 
     while True:
+        for osdid, usage in osd_usages_asc:
+            if usage >= 100:
+                logging.info(f"osd.{osdid} has calculated usage >= 100%: {usage}%")
+
         if found_remap_count >= args.max_pg_moves:
             logging.info("enough remaps found")
             break
@@ -1260,7 +1284,7 @@ if args.mode == 'balance':
 
             # pg -> shardsize
             pg_candidates_sizes = dict()
-            for pg_candidate in pg_mappings.get_osd_pgs(osd_from):
+            for pg_candidate in pg_mappings.get_osd_pgs_up(osd_from):
                 pg_pool = pool_from_pg(pg_candidate)
                 if only_poolids and pg_pool not in only_poolids:
                     continue
@@ -1370,8 +1394,13 @@ if args.mode == 'balance':
                         logging.debug(f"   BAD => osd.{osd_to} already has too many of pool={pg_pool} "
                                       f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})")
                         continue
-                    logging.debug(f"   OK => osd.{osd_to} has too few of pool={pg_pool} "
-                                  f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})")
+                    elif to_osd_pg_count_ideal >= 1.0:
+                        logging.debug(f"   OK => osd.{osd_to} has too few of pool={pg_pool} "
+                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})")
+                    else:
+                        logging.debug(f"   OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
+                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})")
+
 
                     # check if the movement size is nice
                     if args.ensure_optimal_moves:

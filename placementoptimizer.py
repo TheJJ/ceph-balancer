@@ -1186,18 +1186,34 @@ def get_cluster_variance(crushclasses, pg_mappings):
 def get_remaps(pginfo):
     """
     given the pginfo structure, compare up and acting sets
+    return which osds are source and target for pg movements.
 
-    TODO: what about remaps of replica pgs where the order changed?
-
-    return [(osd_from, osd_to), ...]
+    return [((osd_from, ...), (osd_to, ..)), ...]
     """
     up_osds = pginfo["up"]
     acting_osds = pginfo["acting"]
 
+    pool_id = pool_from_pg(pginfo["info"]["pgid"])
+    pool = pools[pool_id]
+    is_ec = bool(pool["erasure_code_profile"])
+
     moves = list()
-    for up_osd, acting_osd in zip(up_osds, acting_osds):
-        if up_osd != acting_osd:
-            moves.append((acting_osd, up_osd))
+    if is_ec:
+        for up_osd, acting_osd in zip(up_osds, acting_osds):
+            if up_osd != acting_osd:
+                moves.append(((acting_osd,), (up_osd,)))
+    else:
+        ups = set(up_osds)
+        actings = set(acting_osds)
+        from_osds = actings - ups
+        to_osds = ups - actings
+
+        moves.append(
+            (
+                tuple(sorted(from_osds)),
+                tuple(sorted(to_osds)),
+            )
+        )
 
     return moves
 
@@ -1606,8 +1622,8 @@ elif args.mode == 'showremapped':
         if "remapped" in pgstate:
 
             moves = list()
-            for osd_from, osd_to in get_remaps(pginfo):
-                moves.append(f"{osd_from}->{osd_to}")
+            for osds_from, osds_to in get_remaps(pginfo):
+                moves.append(f"{','.join(osds_from)}->{','.join(osds_to)}")
 
             # multiply with move-count since each pg remap moves all objects again
             objs_total = pginfo["stat_sum"]["num_objects"] * len(moves)
@@ -1620,7 +1636,7 @@ elif args.mode == 'showremapped':
 
             state = "backfill" if "backfilling" in pgstate else "waiting "
             move_size = pprintsize(get_pg_shardsize(pg))
-            print(f"pg {pg} {state} {move_size: >5}: {objs_total-objs_misplaced} of {objs_total}, {progress:.1f}%, {','.join(moves)}")
+            print(f"pg {pg} {state} {move_size: >5}: {objs_total-objs_misplaced} of {objs_total}, {progress:.1f}%, {';'.join(moves)}")
 
 
 else:

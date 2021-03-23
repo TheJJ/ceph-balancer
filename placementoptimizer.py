@@ -1281,14 +1281,16 @@ if args.mode == 'balance':
     # this is updated when we do move a pg
     osd_usages_asc = get_osd_usages_asc(pg_mappings)
 
-    cluster_variance = get_cluster_variance(enabled_crushclasses, pg_mappings)
+    init_cluster_variance = get_cluster_variance(enabled_crushclasses, pg_mappings)
     logging.info("cluster variance for crushclasses:")
-    for crushclass, variance in cluster_variance.items():
-        osd_min, osd_min_used = osd_usages_asc[0]
-        osd_max, osd_max_used = osd_usages_asc[-1]
+    for crushclass, variance in init_cluster_variance.items():
         logging.info(f"  {crushclass}: {variance:.3f}")
-        logging.info(f"                min osd.{osd_min} {osd_min_used:.1f}%")
-        logging.info(f"                max osd.{osd_max} {osd_max_used:.1f}%")
+
+    # TODO: track these min-max values per crushclass
+    init_osd_min, init_osd_min_used = osd_usages_asc[0]
+    init_osd_max, init_osd_max_used = osd_usages_asc[-1]
+    logging.info(f"  min osd.{init_osd_min} {init_osd_min_used:.1f}%")
+    logging.info(f"  max osd.{init_osd_max} {init_osd_max_used:.1f}%")
 
     while True:
         for osdid, usage in osd_usages_asc:
@@ -1312,7 +1314,7 @@ if args.mode == 'balance':
                 break
 
             if from_idx > args.max_full_move_attempts:
-                logging.info(f"could not empty the {from_idx}-th fullest osd.{osd_from} more, so we're done. "
+                logging.info(f"in descending full-order, couldn't empty osd.{osd_from} with fullness index {from_idx-1} more, so we're done. "
                              f"if you want to try more often, set --max-full-move-attempts=$nr, this may unlock "
                              f"more balancing possibilities.")
                 force_finish = True
@@ -1539,7 +1541,6 @@ if args.mode == 'balance':
                     for crushclass, variance in cluster_variance.items():
                         logging.info(f"    {crushclass}: {variance:.3f}")
 
-
                     found_remap = True
                     found_remap_count += 1
                     break
@@ -1553,6 +1554,20 @@ if args.mode == 'balance':
                     unsuccessful_pools.add(pg_pool)
 
     # show results!
+    logging.info(f"generated {found_remap_count} remaps.")
+    logging.info(80*"-")
+    logging.info("old cluster variance per crushclass:")
+    for crushclass, variance in init_cluster_variance.items():
+        logging.info(f"  {crushclass}: {variance:.3f}")
+    logging.info(f"old min osd.{init_osd_min} {init_osd_min_used:.1f}%")
+    logging.info(f"old max osd.{init_osd_max} {init_osd_max_used:.1f}%")
+    logging.info(80*"-")
+    logging.info(f"new min osd.{osd_min} {osd_min_used:.1f}%")
+    logging.info(f"new max osd.{osd_max} {osd_max_used:.1f}%")
+    logging.info(f"new cluster variance:")
+    for crushclass, variance in cluster_variance.items():
+        logging.info(f"  {crushclass}: {variance:.3f}")
+    logging.info(80*"-")
     for pg, upmaps in pg_mappings.get_upmaps().items():
         if upmaps:
             upmap_str = " ".join([f"{osd_from} {osd_to}" for (osd_from, osd_to) in upmaps])

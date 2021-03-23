@@ -1274,7 +1274,10 @@ if args.mode == 'balance':
     # we'll do all the optimizations in this mapping state
     pg_mappings = PGMappings(pgs, osds)
 
+    # number of found remaps
     found_remap_count = 0
+    # size of found remaps
+    found_remap_size_sum = 0
     force_finish = False
 
     # start by taking the fullest OSD
@@ -1543,6 +1546,7 @@ if args.mode == 'balance':
 
                     found_remap = True
                     found_remap_count += 1
+                    found_remap_size_sum += move_pg_shardsize
                     break
 
                 if not found_remap:
@@ -1554,7 +1558,9 @@ if args.mode == 'balance':
                     unsuccessful_pools.add(pg_pool)
 
     # show results!
+    logging.info(80*"-")
     logging.info(f"generated {found_remap_count} remaps.")
+    logging.info(f"total movement size: {pprintsize(found_remap_size_sum)}.")
     logging.info(80*"-")
     logging.info("old cluster variance per crushclass:")
     for crushclass, variance in init_cluster_variance.items():

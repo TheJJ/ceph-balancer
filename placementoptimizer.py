@@ -1262,7 +1262,7 @@ if args.mode == 'balance':
         enabled_crushclasses = set()
         for poolid in only_poolids:
             root_name = rootname_from_rule(crushrules[pools[poolid]['crush_rule']])
-            enabled_crushclasses |= {osds[osdid]['crush_class'] for osdid in candidates_for_root(root_name)}
+            enabled_crushclasses |= {osds[osdid]['crush_class'] for osdid in candidates_for_root(root_name) if osds[osdid]['weight'] != 0}
 
     osd_candidates = set()
     for crushclass in enabled_crushclasses:

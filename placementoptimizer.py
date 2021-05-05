@@ -332,11 +332,7 @@ for osdid, osd in osd_mappings.items():
 
     if osdid == 0x7fffffff:
         # the "missing" osds
-        osdid = -1
-        crushclass = "-"
         continue
-    else:
-        crushclass = osd_crushclass[osdid]
 
     osds[osdid].update({
         'pools_up': list(sorted(osd_pools_up)),
@@ -347,17 +343,19 @@ for osdid, osd in osd_mappings.items():
         'pgs_up': pgs_up,
         'pg_num_acting': len(pgs_acting),
         'pgs_acting': pgs_acting,
-        'crush_class': crushclass,
     })
 
 
 for osd in osd_dump["osds"]:
-    id = osd["osd"]
-    osds[id].update({
+    osdid = osd["osd"]
+    crushclass = osd_crushclass.get(osdid)
+
+    osds[osdid].update({
         "weight": osd["weight"],
         "cluster_addr": osd["cluster_addr"],
         "public_addr": osd["public_addr"],
         "state": tuple(osd["state"]),
+        'crush_class': crushclass,
     })
 
 
@@ -1637,10 +1635,12 @@ elif args.mode == 'show':
                     for pg in placed_pgs:
                         used += get_pg_shardsize(pg)
 
-                    util_val = 100 * used / props['device_size']
-
                 else:
                     used = props['device_used']
+
+                if props['device_size'] == 0:
+                    util_val = 0
+                else:
                     util_val = 100 * used / props['device_size']
 
                 weight_val = props['weight']
@@ -1658,8 +1658,8 @@ elif args.mode == 'show':
                     pg_count = props['pg_count_up']
                     pg_num = props['pg_num_up']
                 elif args.pgstate == 'acting':
-                    pg_count = props['pg_count_acting']
-                    pg_num = props['pg_num_acting']
+                    pg_count = props.get('pg_count_acting', dict())
+                    pg_num = props.get('pg_num_acting', 0)
                 else:
                     raise Exception("unknown pgstate")
 
@@ -1733,7 +1733,7 @@ elif args.mode == 'showremapped':
                 tos = ','.join(str(osd) for osd in osds_to)
                 moves.append(f"{froms}->{tos}")
 
-            # multiply with move-count since each pg remap moves all objects again
+            # multiply with move-count since each shard remap moves all objects again
             objs_total = pginfo["stat_sum"]["num_objects"] * len(moves)
             objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
             objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]

@@ -13,6 +13,9 @@ GPLv3 or later
 # respect OMAP_BYTES and OMAP_KEYS for a pg
 # don't touch a pool with decreasing pg_num
 # a new mode that tries to eliminate upmap_items
+# when considering an OSD for emptying, try pending PGs first
+# don't use device-size, rather use its crush weight
+#   (which equals device size usually)
 
 # even "better" algorithm:
 # get osdmap and crushmap
@@ -68,7 +71,9 @@ showsp.add_argument('--use-shardsize-sum', action='store_true',
 showsp.add_argument('--osd-fill-min', type=int, default=0,
                     help='minimum fill %% to show an osd, default: %(default)s%%')
 
-sp.add_parser('showremapped')
+remappsp = sp.add_parser('showremapped')
+remappsp.add_argument('--by-osd', action='store_true',
+                      help="group the results by osd")
 
 balancep = sp.add_parser('balance')
 balancep.add_argument('--max-pg-moves', '-m', type=int, default=10,
@@ -935,8 +940,8 @@ class PGMappings:
                     # since the objects are truly missing on the previous shard
                     # and need to be restored without misplacement.
                     if pginfo["stat_sum"]["num_objects_degraded"] == 0:
-                        raise Exception(f"pg {pg} is moved to osd.{osdid} but nothing is "
-                                        f"misplaced or degraded?")
+                        logging.warn(f"pg {pg} is moved to osd.{osdid} but nothing is "
+                                     f"misplaced or degraded?")
 
                 # adjust fs size by average object size times estimated misplaced count.
                 # because this is kinda lame but it seems one can't get more info
@@ -1582,9 +1587,9 @@ if args.mode == 'balance':
 
 elif args.mode == 'show':
     if args.format == 'plain':
-        poolname = 'name'.rjust(maxpoolnamelen)
+        poolname = 'name'.ljust(maxpoolnamelen)
         print()
-        print(f"{'poolid': >6} {poolname} {'type': >7} {'size': >5} {'min': >3} {'pg_num': >6} {'stored': >7} {'used': >7} {'avail': >7} {'shrdsize': >8} crush")
+        print(f"{'poolid': >6} {poolname} {'type': <7} {'size': >5} {'min': >3} {'pg_num': >6} {'stored': >7} {'used': >7} {'avail': >7} {'shrdsize': >8} crush")
 
         # default, sort by pool id
         sort_func = lambda x: x[0]
@@ -1593,7 +1598,7 @@ elif args.mode == 'show':
             sort_func = lambda x: x[1]['pg_shard_size_avg']
 
         for poolid, poolprops in sorted(pools.items(), key=sort_func):
-            poolname = poolprops['name'].rjust(maxpoolnamelen)
+            poolname = poolprops['name'].ljust(maxpoolnamelen)
             repl_type = poolprops['repl_type']
             if repl_type == "ec":
                 profile = ec_profiles[poolprops['erasure_code_profile']]
@@ -1606,7 +1611,7 @@ elif args.mode == 'show':
             used = pprintsize(poolprops['used'])  # raw usage incl metastuff
             avail = pprintsize(poolprops['store_avail'])
             shard_size = pprintsize(poolprops['pg_shard_size_avg'])
-            print(f"{poolid: >6} {poolname} {repl_type: >7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7} {shard_size: >8} {crushruleid}:{crushrules[crushruleid]['name']}")
+            print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7} {shard_size: >8} {crushruleid}:{crushrules[crushruleid]['name']}")
 
         if args.osds:
             if args.only_crushclass:
@@ -1723,6 +1728,12 @@ elif args.mode == 'show':
 
 elif args.mode == 'showremapped':
 
+    # osdid => {to: {pg -> osdid}, from: {pg -> osdid}}
+    osd_actions = defaultdict(lambda: defaultdict(dict))
+
+    # pgid -> move information
+    pg_move_status = dict()
+
     for pg, pginfo in pgs.items():
         pgstate = pginfo["state"].split("+")
         if "remapped" in pgstate:
@@ -1732,6 +1743,10 @@ elif args.mode == 'showremapped':
                 froms = ','.join(str(osd) for osd in osds_from)
                 tos = ','.join(str(osd) for osd in osds_to)
                 moves.append(f"{froms}->{tos}")
+
+                for osd_from, osd_to in zip(osds_from, osds_to):
+                    osd_actions[osd_from]["to"][pg] = osd_to
+                    osd_actions[osd_to]["from"][pg] = osd_from
 
             # multiply with move-count since each shard remap moves all objects again
             objs_total = pginfo["stat_sum"]["num_objects"] * len(moves)
@@ -1745,10 +1760,60 @@ elif args.mode == 'showremapped':
                 progress = 1
             progress *= 100
 
-            state = "backfill" if "backfilling" in pgstate else "waiting "
-            move_size = pprintsize(get_pg_shardsize(pg))
-            print(f"pg {pg} {state} {move_size: >5}: {objs_total-objs_to_restore} of {objs_total}, {progress:.1f}%, {';'.join(moves)}")
+            state = "backfill" if "backfilling" in pgstate else "waiting"
+            if "backfill_toofull" in pgstate:
+                state = "toofull"
+            if "degraded" in pgstate:
+                state = f"degraded+{state:<8}"
+            else:
+                state = f"         {state:<8}"
 
+            pg_move_size = get_pg_shardsize(pg)
+            pg_move_size_pp = pprintsize(pg_move_size)
+
+            pg_move_status[pg] = {
+                "state": state,
+                "objs_total": objs_total,
+                "objs_todo": objs_total - objs_to_restore,
+                "size": pg_move_size,
+                "sizepp": pg_move_size_pp,
+                "progress": progress,
+                "moves": moves,
+            }
+
+    if args.by_osd:
+        for osdid, actions in sorted(osd_actions.items()):
+            if osdid != -1:
+                osd_fullness = osds[osdid]['device_used'] / osds[osdid]['device_size'] * 100
+                osd_used = pprintsize(osds[osdid]['device_used'])
+                osd_size = pprintsize(osds[osdid]['device_size'])
+                osdname = f"osd.{osdid}"
+                fullness = f"  {osd_fullness:.1f}% = {osd_used} / {osd_size}"
+            else:
+                osdname = "osd.missing"
+                fullness = ""
+
+            sum_to = len(actions['to'])
+            sum_from = len(actions['from'])
+            print(f"{osdname}: =>{sum_to} <={sum_from}{fullness}")
+
+            for pg, to_osd in actions["to"].items():
+                pgstatus = pg_move_status[pg]
+                print(f"  ->{pg: <6} {pgstatus['state']} {pgstatus['sizepp']: >6} {osdid}->{to_osd}")
+            for pg, from_osd in actions["from"].items():
+                pgstatus = pg_move_status[pg]
+                print(f"  <-{pg: <6} {pgstatus['state']} {pgstatus['sizepp']: >6} {osdid}<-{from_osd}")
+            print()
+
+    else:
+        for pg, pgmoveinfo in pg_move_status.items():
+            state = pgmoveinfo['state']
+            move_size_pp = pgmoveinfo['sizepp']
+            objs_total = pgmoveinfo['objs_total']
+            objs_todo = pgmoveinfo['objs_todo']
+            progress = pgmoveinfo['progress']
+            move_actions = ';'.join(pgmoveinfo['moves'])
+            print(f"pg {pg: <6} {state} {move_size_pp: >6}: {objs_todo} of {objs_total}, {progress:.1f}%, {move_actions}")
 
 else:
     raise Exception(f"unknown args mode {args.mode}")

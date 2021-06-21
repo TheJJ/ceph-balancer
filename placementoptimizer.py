@@ -170,6 +170,7 @@ def pprintsize(size_bytes, commaplaces=1):
 pg_dump = jsoncall("ceph pg dump --format json".split(), swallow_stderr=True)
 osd_dump = jsoncall("ceph osd dump --format json".split())
 osd_df_dump = jsoncall("ceph osd df --format json".split())
+osd_df_tree_dump = jsoncall("ceph osd df tree --format json".split())
 df_dump = jsoncall("ceph df detail --format json".split())
 pool_dump = jsoncall("ceph osd pool ls detail --format json".split())
 crush_dump = jsoncall("ceph osd crush dump --format json".split())
@@ -458,6 +459,9 @@ bucket_ids_tmp = dict()
 # all bucket ids of roots
 bucket_root_ids = list()
 
+# hostname -> osdids
+host_osds = defaultdict(set)
+
 for device in crush_dump["devices"]:
     id = device["id"]
     assert id >= 0
@@ -482,6 +486,13 @@ for bucket in buckets:
             osds[item_id].update({
                 "crush_weight": size,
             })
+
+
+# find osd host name
+for node in osd_df_tree_dump["nodes"]:
+    if node['type'] == "host":
+        for osdid in node['children']:
+            osds[osdid]["host_name"] = node['name']
 
 
 def bucket_fill(id, parent_id=None):
@@ -1896,11 +1907,12 @@ elif args.mode == 'show':
             if args.only_crushclass:
                 maxcrushclasslen = len(args.only_crushclass)
             maxcrushclasslen = min(maxcrushclasslen, len('class'))
-            crushclassheader = 'class'.rjust(maxcrushclasslen)
+            crushclassheader = 'cls'.rjust(maxcrushclasslen)
 
             osd_entries = list()
 
             for osdid, props in osds.items():
+                hostname = props.get('host_name', '?')
                 crushclass = props['crush_class']
 
                 if args.only_crushclass:
@@ -1964,20 +1976,21 @@ elif args.mode == 'show':
 
                 class_val = crushclass.rjust(maxcrushclasslen)
 
-                osd_entries.append((osdid, class_val, devsize, weight_val, cweight, util_val, pg_num, pool_list))
+                osd_entries.append((osdid, hostname, class_val, devsize, weight_val, cweight, util_val, pg_num, pool_list))
 
             # default sort by osdid
             sort_func = lambda x: x[0]
 
             if args.sort_utilization:
-                sort_func = lambda x: x[5]
+                sort_func = lambda x: x[6]
 
             if args.sort_pg_count is not None:
-                sort_func = lambda x: x[6].get(args.sort_pg_count, 0)
+                sort_func = lambda x: x[7].get(args.sort_pg_count, 0)
 
             # header:
-            print(f"{'osdid': >6} {crushclassheader} {'devsize': >7} {'weight': >5} {'cweight': >7} {'util': >5} {'pg_num': >6}  pools")
-            for osdid, crushclass, devsize, weight, cweight, util, pg_num, pool_pgs in sorted(osd_entries, key=sort_func):
+            print()
+            print(f"{'osdid': >6} {'hostname': >10} {crushclassheader} {'devsize': >7} {'weight': >6} {'cweight': >7} {'util': >5} {'pg_num': >6}  pools")
+            for osdid, hostname, crushclass, devsize, weight, cweight, util, pg_num, pool_pgs in sorted(osd_entries, key=sort_func):
 
                 pool_overview = list()
                 for pool, count in pool_pgs.items():
@@ -1997,7 +2010,7 @@ elif args.mode == 'show':
                 weight = "%.2f" % weight
 
                 pool_list_str = ' '.join(pool_overview)
-                print(f"{osdid: >6} {crushclass} {pprintsize(devsize): >7} {weight: >5} {pprintsize(cweight): >7} {util: >5} {pg_num: >6}  {pool_list_str}")
+                print(f"{osdid: >6} {hostname: >10} {crushclass} {pprintsize(devsize): >7} {weight: >6} {pprintsize(cweight): >7} {util: >5} {pg_num: >6}  {pool_list_str}")
 
     elif args.format == 'json':
         ret = {
@@ -2094,7 +2107,7 @@ elif args.mode == 'showremapped':
             sum_data_from_pp = pprintsize(sum_data_from, 2)
             sum_data_delta_pp = pprintsize(sum_data_delta, 2)
 
-            print(f"{osdname}: =>{sum_to} {sum_data_to_pp} <={sum_from} {sum_data_from_pp}"
+            print(f"{osdname}: {osds[osdid]['host_name']}  =>{sum_to} {sum_data_to_pp} <={sum_from} {sum_data_from_pp}"
                   f" (\N{Greek Capital Letter Delta}{sum_data_delta_pp}) {fullness}")
 
             for pg, to_osd in actions["to"].items():

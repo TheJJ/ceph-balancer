@@ -1879,9 +1879,16 @@ elif args.mode == 'show':
             print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7} {shard_size: >8} {crushruleid}:{crushrulename} {rootweights_pp: >12}")
 
         for crushroot in stored_sum_class.keys():
+            crushclass_usage = ""
+            crush_tree_class = crushroot.split("~")
+            if len(crush_tree_class) >= 2:
+                crush_class = crush_tree_class[1]
+                crushclass_usage = f"{crushclasses_usage[crush_class]:.3f}%"
+
             print(f"{crushroot: <14}    {' ' * maxpoolnamelen} {' ' * 13} "
                   f"{pprintsize(stored_sum_class[crushroot], 2): >7} "
-                  f"{pprintsize(used_sum_class[crushroot], 2): >7}")
+                  f"{pprintsize(used_sum_class[crushroot], 2): >7}"
+                  f"{crushclass_usage: >10}")
 
         print(f"sum    {' ' * maxpoolnamelen} {' ' * 24} {pprintsize(stored_sum, 2): >7} {pprintsize(used_sum, 2): >7}")
 

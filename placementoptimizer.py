@@ -143,6 +143,18 @@ def clamp(number, smallest, largest):
 log_setup(args.verbose - args.quiet)
 
 
+class strlazy:
+    """
+    to be used like this: logging.debug("rolf %s", strlazy(lambda: do_something()))
+    so do_something is only called when the debug message is actually printed
+    do_something could also be an f-string.
+    """
+    def __init__(self, fun):
+        self.fun = fun
+    def __str__(self):
+        return self.fun()
+
+
 def jsoncall(cmd, swallow_stderr=False):
     if not isinstance(cmd, list):
         raise ValueError("need cmd as list")
@@ -458,9 +470,6 @@ bucket_ids_tmp = dict()
 
 # all bucket ids of roots
 bucket_root_ids = list()
-
-# hostname -> osdids
-host_osds = defaultdict(set)
 
 for device in crush_dump["devices"]:
     id = device["id"]
@@ -945,11 +954,11 @@ class PGMoveChecker:
         crush rules' constraints of placement.
         """
         if new_osd in self.pg_osds:
-            logging.debug(f"   invalid: osd.{new_osd} in {self.pg_osds}")
+            logging.debug(strlazy(lambda: f"   invalid: osd.{new_osd} in {self.pg_osds}"))
             return False
 
         if new_osd not in self.osd_candidates:
-            logging.debug(f"   invalid: osd.{new_osd} not in same crush root")
+            logging.debug(strlazy(lambda: f"   invalid: osd.{new_osd} not in same crush root"))
             return False
 
         # TODO: figure out the crush root for the old_osd, and use it for new_osd too
@@ -988,7 +997,7 @@ class PGMoveChecker:
             # if we used it, it'd be violating crush
             # (the +1 was 'optimized' by >= instead of >)
             if uses >= use_max_allowed:
-                logging.debug(f"   invalid: osd.{new_osd} violates crush: using item={new_item} x uses={uses+1} > max_allowed={use_max_allowed}")
+                logging.debug(strlazy(lambda: f"   invalid: osd.{new_osd} violates crush: using item={new_item} x uses={uses+1} > max_allowed={use_max_allowed}"))
                 overuse = True
                 break
 
@@ -1157,7 +1166,7 @@ class PGMappings:
                 osd_fs_used -= get_pg_shardsize(pg)
 
             self.osd_utilizations[osdid] = osd_fs_used
-            logging.debug(f"estimated {'osd.%s' % osdid: <8} usage: acting={pprintsize(osd['device_used'], 3)} up={pprintsize(osd_fs_used, 3)}")
+            logging.debug(strlazy(lambda: f"estimated {'osd.%s' % osdid: <8} usage: acting={pprintsize(osd['device_used'], 3)} up={pprintsize(osd_fs_used, 3)}"))
 
     def apply_remap(self, pg, osd_from, osd_to):
         """
@@ -1172,7 +1181,7 @@ class PGMappings:
         did_remap = False
         for i in range(len(pg_mapping)):
             if pg_mapping[i] == osd_from:
-                logging.debug(f"recording move of pg={pg} from {osd_from}->{osd_to}")
+                logging.debug(strlazy(lambda: f"recording move of pg={pg} from {osd_from}->{osd_to}"))
                 pg_mapping[i] = osd_to
                 did_remap = True
                 break
@@ -1297,6 +1306,7 @@ class PGMappings:
 
             # remaps is [(osdfrom, osdto), ...], now osdfrom->osdto
             # these are the "new" remappings.
+            # osdfrom->osdto
             remaps = dict(remaps_list)
 
             # merge new upmaps
@@ -1325,6 +1335,10 @@ class PGMappings:
                     # this remap's source osd will now be merged
                     merged_remaps.add(current_to)
 
+                    if current_from == remapped_to:
+                        # skip current=(75->72), remapped=(72->75) leading to (75->75)
+                        continue
+
                     # transform e.g. current=197->188, remapped=188->261 to 197->261
                     resulting_upmaps.append((current_from, remapped_to))
                     continue
@@ -1336,7 +1350,9 @@ class PGMappings:
                     continue
                 resulting_upmaps.append((new_from, new_to))
 
-            # TODO if we have current_upmaps=(1,2) and remaps(2,1), set []
+            for new_from, new_to in resulting_upmaps:
+                if new_from == new_to:
+                    raise Exception(f"somewhere something went wrong, we map {pg} from osd.{new_from} to osd.{new_to}")
 
             upmap_results[pg] = resulting_upmaps
 
@@ -1422,7 +1438,7 @@ def print_osd_usages(usagedict):
     """
     logging.debug("osd usages in ascending order:")
     for osdid, usage in usagedict:
-        logging.debug(f"  usage of osd.%s: %.2f%%", osdid, usage)
+        logging.debug("  usage of %s.osd.%s: %.2f%%", strlazy(lambda: osds[osdid]["host_name"]), osdid, usage)
 
 
 def get_cluster_variance(crushclasses, pg_mappings):
@@ -1608,14 +1624,15 @@ if args.mode == 'balance':
                     # -> we try to move the biggest fitting PG first.
                     mean_usage = (best_target_osd_usage + osd_from_used_percent) / 2
                     if target_predicted_usage <= mean_usage:
-                        logging.debug(f"  START with PG candidate {pg_candidate} due to perfect size fit "
-                                      f"when moving to best osd.{best_target_osd}.")
+                        logging.debug(strlazy(lambda: f"  START with PG candidate {pg_candidate} due to perfect size fit "
+                                                      f"when moving to best osd.{best_target_osd}."))
                         pg_walk_anchor = idx
                         break
 
-                    logging.debug(f"  SKIP candidate size estimation of {pg_candidate} "
+                    logging.debug(strlazy(lambda:
+                                  f"  SKIP candidate size estimation of {pg_candidate} "
                                   f"when moving to best osd.{best_target_osd}. "
-                                  f"predicted={target_predicted_usage:.3f}% > mean={mean_usage:.3f}%")
+                                  f"predicted={target_predicted_usage:.3f}% > mean={mean_usage:.3f}%"))
 
                 if pg_walk_anchor is None:
                     # no PG fitted, i.e. no pg was small enough for an optimal move.
@@ -1725,10 +1742,10 @@ if args.mode == 'balance':
                 # try the least full osd that's allowed by crush
                 to_candidates = list(try_pg_move.filter_candidates(osd[0] for osd in osd_usages_asc))
                 for osd_to_idx, osd_to in enumerate(to_candidates):
-                    logging.debug(f"TRY-1 move %s osd.%s => osd.%s (%s/%s)", move_pg, osd_from, osd_to, osd_to_idx+1, len(to_candidates))
+                    logging.debug("TRY-1 move %s osd.%s => osd.%s (%s/%s)", move_pg, osd_from, osd_to, osd_to_idx+1, len(to_candidates))
 
                     if osd_to == osd_from:
-                        logging.debug(f" BAD move to source OSD makes no sense")
+                        logging.debug(" BAD move to source OSD makes no sense")
 
                     # in order to not fight the regular balancer, don't move the PG to a disk
                     # where the weighted pg count of this pool is already good
@@ -1737,25 +1754,31 @@ if args.mode == 'balance':
                     to_osd_pg_count = pg_mappings.osd_pool_pg_count(osd_to)
                     to_osd_pg_count_ideal = pool_pg_count_ideal * pg_mappings.get_osd_size(osd_to)
                     if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal and not to_osd_pg_count_ideal < 1.0:
-                        logging.debug(f" BAD => osd.{osd_to} already has too many of pool={pg_pool} "
-                                      f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})")
+                        logging.debug(strlazy(lambda:
+                                      f" BAD => osd.{osd_to} already has too many of pool={pg_pool} "
+                                      f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})"))
                         continue
                     elif to_osd_pg_count_ideal >= 1.0:
-                        logging.debug(f" OK => osd.{osd_to} has too few of pool={pg_pool} "
-                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})")
+                        logging.debug(strlazy(lambda:
+                                      f" OK => osd.{osd_to} has too few of pool={pg_pool} "
+                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
                     else:
-                        logging.debug(f" OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
-                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})")
+                        logging.debug(strlazy(lambda:
+                                      f" OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
+                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
 
                     # how full will the target be
                     target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
                     source_usage = pg_mappings.get_osd_usage(osd_from)
 
                     # check that the destination osd won't be more full than the source osd
+                    # but what if we're balanced very good already? wouldn't we allow this if the variance decreased anyway?
+                    # maybe make it an optional flag because of this (--ensure-decreasing-usage)
                     if target_predicted_usage > source_usage:
-                        logging.debug(f" BAD target will be more full than source currently is: "
+                        logging.debug(strlazy(lambda:
+                                      f" BAD target will be more full than source currently is: "
                                       f"osd.{osd_to} would have {target_predicted_usage:.3f}%, "
-                                      f"and source's osd.{osd_from} currently is {source_usage:.3f}%")
+                                      f"and source's osd.{osd_from} currently is {source_usage:.3f}%"))
                         continue
 
                     # check if the movement size is nice

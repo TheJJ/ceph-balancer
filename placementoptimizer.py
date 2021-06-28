@@ -1126,11 +1126,11 @@ class PGMappings:
                 for osds_from, osds_to in moves:
                     # -1 means in from -> move is degraded
                     if -1 in osds_from:
-                        pg_degraded_moves += 1
+                        pg_degraded_moves += len(osds_from)
                         if osdid in osds_to:
                             degraded_shards += 1
                     else:
-                        pg_misplaced_moves += 1
+                        pg_misplaced_moves += len(osds_from)
                         if osdid in osds_to:
                             misplaced_shards += 1
 
@@ -1524,8 +1524,9 @@ if args.mode == 'balance':
         # fillaverage: calculated current osd usage
         # crushclassusage: used percent of all space provided by this crushclass
         fillaverage = statistics.mean(usages)
+        fillmedian = statistics.median(usages)
         crushclass_usage = crushclasses_usage[crushclass]
-        logging.info(f"  {crushclass}: fill={fillaverage:.2f}%, class={crushclass_usage:.2f}%")
+        logging.info(f"  {crushclass}: average={fillaverage:.2f}%, median={fillmedian:.2f}%, without_placement_constraints={crushclass_usage:.2f}%")
 
     init_cluster_variance = get_cluster_variance(enabled_crushclasses, pg_mappings)
     cluster_variance = init_cluster_variance
@@ -2053,13 +2054,15 @@ elif args.mode == 'showremapped':
         if "remapped" in pgstate:
 
             moves = list()
+            osd_move_count = 0
             for osds_from, osds_to in get_remaps(pginfo):
                 froms = ','.join(str(osd) for osd in osds_from)
                 tos = ','.join(str(osd) for osd in osds_to)
                 moves.append(f"{froms}->{tos}")
+                osd_move_count += len(osds_to)
 
             # multiply with move-count since each shard remap moves all objects again
-            objs_total = pginfo["stat_sum"]["num_objects"] * len(moves)
+            objs_total = pginfo["stat_sum"]["num_objects"] * osd_move_count
             objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
             objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
             objs_to_restore = objs_misplaced + objs_degraded

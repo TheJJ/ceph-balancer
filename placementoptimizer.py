@@ -301,9 +301,22 @@ def list_replace(iterator, search, replace):
     return ret
 
 
-@lru_cache(maxsize=2**17)
 def pool_from_pg(pg):
     return int(pg.split(".")[0])
+
+
+@lru_cache(maxsize=2**17)
+def pg_ec_profile(pg):
+    pool_id = pool_from_pg(pg)
+    pool = pools[pool_id]
+    return pool["erasure_code_profile"]
+
+
+@lru_cache(maxsize=2**17)
+def pg_is_ec(pg):
+    pool_id = pool_from_pg(pg)
+    pool = pools[pool_id]
+    return pool["repl_type"] == "ec"
 
 
 def get_remaps(pginfo):
@@ -316,9 +329,7 @@ def get_remaps(pginfo):
     up_osds = list_replace(pginfo["up"], 0x7fffffff, -1)
     acting_osds = list_replace(pginfo["acting"], 0x7fffffff, -1)
 
-    pool_id = pool_from_pg(pginfo["pgid"])
-    pool = pools[pool_id]
-    is_ec = bool(pool["erasure_code_profile"])
+    is_ec = pg_is_ec(pginfo["pgid"])
 
     moves = list()
     if is_ec:
@@ -608,9 +619,7 @@ def get_pg_shardsize(pgid):
     shard_size = pg_stats['num_bytes']
     shard_size += pg_stats['num_omap_bytes']
 
-    pool_id = pool_from_pg(pgid)
-    pool = pools[pool_id]
-    ec_profile = pool["erasure_code_profile"]
+    ec_profile = pg_ec_profile(pgid)
     if ec_profile:
         shard_size /= ec_profiles[ec_profile]["data_chunks"]
         # omap is not supported on EC pools (yet)
@@ -1166,15 +1175,28 @@ class PGMappings:
                 # sensible content?
 
                 for osds_from, osds_to in moves:
-                    # -1 means in from -> move is degraded
-                    if -1 in osds_from:
-                        pg_degraded_moves += len(osds_from)
-                        if osdid in osds_to:
-                            degraded_shards += 1
+                    # -1 means in from -> move is degraded for EC
+                    # for replica, len(from) < len(to) = degraded
+                    if pg_is_ec(pg):
+                        if -1 in osds_from:
+                            pg_degraded_moves += len(osds_from)
+                            if osdid in osds_to:
+                                degraded_shards += 1
+                        else:
+                            pg_misplaced_moves += len(osds_from)
+                            if osdid in osds_to:
+                                misplaced_shards += 1
+
                     else:
-                        pg_misplaced_moves += len(osds_from)
-                        if osdid in osds_to:
-                            misplaced_shards += 1
+                        if len(osds_to) == len(osds_from):
+                            pg_misplaced_moves += len(osds_to)
+                            if osdid in osds_to:
+                                misplaced_shards += 1
+                        else:
+                            pg_degraded_moves += len(osds_to) - len(osds_from)
+                            if osdid in osds_to:
+                                degraded_shards += 1
+
 
                 # the following assumes that all shards of this pg are recovered at the same rate,
                 # when there's multiple from/to osds for this pg
@@ -1630,6 +1652,10 @@ if args.mode == 'balance':
 
             # these pgs are up on the source osd
             pg_candidates = pg_mappings.get_osd_pgs_up(osd_from)
+
+            # TODO: build candidates more sophisticatedly:
+            # prefer pgs that are pending to be moved from osd_from
+            # and pgs that are pending to be moved to osd_to
 
             # pg -> shardsize
             pg_candidates_sizes = dict()

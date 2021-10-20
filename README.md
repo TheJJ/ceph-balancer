@@ -5,11 +5,11 @@ JJ's Ceph Balancer
 One mitigation is the [mgr balancer](https://docs.ceph.com/en/latest/rados/operations/balancer/).
 
 This is an alternative Ceph balancer implementation.
-The current (octopus) upstream balancer optimizes for (weighted) equal number of PGs on each OSD for each pool.
-This balancer has a different strategy: optimizing for equal OSD size utilization.
+* The upstream balancer optimizes for (weighted) equal number of PGs on each OSD for each pool.
+* This balancer optimizes for equal OSD storage utilization and PG placement accross all pools.
 
 For most clusters, the `mgr balancer` works well.
-For heterogeneous clusters with a lot of device and server capacity variance, placement may be very bad - the reason this balancer was created.
+For heterogeneous clusters with a lot of device and server capacity variance _and_ many pools, placement may be very bad - the reason this balancer was created.
 
 
 ## How?
@@ -42,9 +42,9 @@ That way big servers/racks/datacenters/... get more data than small ones, but th
 In theory, each OSD should thus be filled exactly the same relative amount, all are e.g. 30% full.
 In practice, not so much:
 
-The cluster, which was the motivation to create this balancer, has devices (same device class, weighted at 1.0) ranging from 55% to 80% size utilization.
+The cluster, which was the motivation to create this balancer, had devices (same device class, weighted at 1.0) ranging from 55% to 80% size utilization.
 
-The reason is this: The cluster has many pools (at time of writing 46), OSD sizes vary from 1T to 14T, 4 to 40 OSDs per server.
+The reason is this: The cluster has many pools of different sizes (at time of writing 46), OSD sizes vary from 1T to 14T, 4 to 40 OSDs per server.
 And the `mgr balancer` can't handle this.
 
 
@@ -77,17 +77,20 @@ This happens since it sees only this server's OSDs as "underfull", but each PG h
 
 To solve this, the main optimization goal is equal OSD utilization:
 
-Order all OSDs by utilization (optionally only for one crush root).
+Generate candidate PG movements and validate them against the crush constraints, PG counts, utilization estimations, ...
+To get PG candiates, order all OSDs by utilization (optionally only for one crush root).
 Utilization is estimated from all PGs where the OSD is in the `up` set (due to ongoing partial PG transfers).
-From the fullest OSD, try to move the biggest PG shard on it to the least-utilized OSD.
-If this violates constraints, try the next least-utilized OSD, and so on.
+From the fullest OSD, try to move a "suitable" PG shard on it to the least-utilized OSD.
+If this violates constraints, try the next least-utilized OSD, and so on, or try a different PG.
 
-Once a suitable OSD is found, check if the new placment has lower utilization variance.
+Once a suitable OSD is found, check if the new placment decreases the cluster utilization variance.
 If this is the case, record the PG movement and try to move another PG with the same approach.
+
+That way the balancer generates new "upmap items", i.e. movement instructions for a PG from some OSDs to better ones, which you can apply if you're satisfied with the results.
 
 If this is done forever, all OSDs will have very little utilization variance, or CRUSH constraints prevent us from doing more PG movements.
 
-Pseudocode:
+Simplified pseudocode:
 
 ```python
 while not found_enough_moves:
@@ -108,7 +111,7 @@ for movement in movements:
 
 Runtime:
 * Worst-case (the fullest OSD can't be emptied more): `O(OSDs * PGs)`
-* If we would continue after the fullest OSD can't be emptied any more, it would be: `O(OSDs²*PGs)`
+* If, after that, we tried the second-to fullest, third, ..., it would be: `O(OSDs²*PGs)`
 
 Likely this can be optimized further.
 
@@ -116,10 +119,13 @@ Likely this can be optimized further.
 ## Usage
 
 ```
-./placementoptimizer.py --help
+# to generate max 10 pg movements:
+./placementoptimizer.py -v balance --max-pg-moves 10 | tee /tmp/balance-upmaps
 
-# balance can generate upmap items on stdout
-./placementoptimizer.py balance --help
+# -> if you're satisfied, run bash /tmp/balance-upmaps
+
+# but it can do more than balance!
+./placementoptimizer.py --help
 ```
 
 ## Contributions
@@ -128,7 +134,7 @@ The script is not the prettiest (yet), but produces balancing-improvement moveme
 
 Ideally, with some further improvements and tuning, it could be integrated in upstream-Ceph as an alternative balancer implementation.
 
-So if you have any idea and suggestion how to improve things, please submit [pull requests](https://github.com/TheJJ/ceph-balancer/pulls).
+So if you have any idea and suggestion how to improve things, please submit issues and [pull requests](https://github.com/TheJJ/ceph-balancer/pulls).
 
 
 ## Contact
@@ -136,10 +142,8 @@ So if you have any idea and suggestion how to improve things, please submit [pul
 If you have questions, suggestions, encounter any problem,
 please join our Matrix or IRC channel and ask!
 
-```
-#sfttech:matrix.org
-irc.freenode.net #sfttech
-```
+* Matrix Chat: [`#sfttech:matrix.org`](https://matrix.to/#/#sfttech:matrix.org)
+* IRC Chat: [`libera.chat #sfttech`](https://web.libera.chat/#sfttech)
 
 Of course, create [issues](https://github.com/TheJJ/ceph-balancer/issues)
 and [pull requests](https://github.com/TheJJ/ceph-balancer/pulls).

@@ -372,6 +372,10 @@ osd_actions = defaultdict(lambda: defaultdict(dict))
 pgs = dict()
 
 for pginfo in pg_dump["pg_map"]["pg_stats"]:
+    if pginfo["state"] in ("unknown",):
+        # skip pgs with no active osds
+        continue
+
     pgid = pginfo["pgid"]
     up = pginfo["up"]
     acting = pginfo["acting"]

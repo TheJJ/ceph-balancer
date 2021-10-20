@@ -773,6 +773,7 @@ class PGMoveChecker:
         """
         perform precalculations for moving this pg
         """
+        logging.debug(strlazy(lambda: f"prepare crush check for rule\n{pformat(self.rule)}"))
 
         # ruledepth -> allowed number of bucket reuse
         reuses_per_step = []
@@ -797,6 +798,8 @@ class PGMoveChecker:
 
             fanout_cum *= num
         reuses_per_step.reverse()
+
+        logging.debug(strlazy(lambda: f"allowed reuses per rule step, starting at root: {pformat(reuses_per_step)}"))
 
         # for each depth, count how often items were used
         # rule_depth -> {itemid -> use count}
@@ -865,8 +868,15 @@ class PGMoveChecker:
         # because "choose" steps may skip layers in the crush hierarchy
         rule_tree_depth = dict()
 
+        current_item_type = None
+
         # gather item usages by evaluating the crush rules
         for step in self.rule["steps"]:
+            if step["op"].startswith("set_"):
+                continue
+
+            logging.debug(strlazy(lambda: f"processing crush step {step} with tree_depth={tree_depth}, rule_depth={rule_depth}"))
+
             if step["op"] == "take":
                 rule_root_name = step["item_name"]
 
@@ -874,6 +884,7 @@ class PGMoveChecker:
                 assert rule_root_name in self.root_names
 
                 # first step: try to find tracebacks for all osds that ends up in this root.
+                # we collect root-traces of all acting osds of the pg we wanna check for.
                 constraining_traces = dict()
 
                 for pg_osd in self.pg_osds:
@@ -887,6 +898,7 @@ class PGMoveChecker:
                 rule_tree_depth[rule_depth] = 0
                 tree_depth = 1
                 rule_depth += 1
+                current_item_type = rule_root_name
 
             elif step["op"].startswith("choose"):
                 if not constraining_traces:
@@ -894,32 +906,55 @@ class PGMoveChecker:
 
                 choose_type = step["type"]
 
-                # find the new tree_depth by looking for the choosen next bucket
-                # increase item counter for current osd't trace
+                # find the new tree_depth by looking how far we need to step for the choosen next bucket
 
                 for constraining_trace in constraining_traces.values():
                     steps_taken = find_item_type(constraining_trace[tree_depth:], choose_type, rule_depth, item_uses)
                     if steps_taken is None:
-                        raise Exception(f"could not find item type {step['type']} "
+                        raise Exception(f"could not find item type {choose_type} "
                                         f"requested by rule step {step}")
 
                 # how many layers we went down the tree
                 rule_tree_depth[rule_depth] = tree_depth + steps_taken
                 tree_depth += steps_taken
                 rule_depth += 1
+                current_item_type = choose_type
 
             elif step["op"] == "emit":
                 emit = True
 
-                type_found = False
-                for constraining_trace in constraining_traces.values():
-                    steps_taken = find_item_type(constraining_trace[tree_depth:], "osd", rule_depth, item_uses)
-                    if steps_taken is None:
-                        raise Exception(f"could not find item type {step['type']} "
-                                        f"requested by rule step {step}")
+                if current_item_type == "osd":
+                    # if we're already at osd level, no need to search further down
+                    for constraining_trace in constraining_traces.values():
+                        # we are already at the end of the trace since we're at osd level
+                        if len(constraining_trace) != tree_depth:
+                            raise Exception(f"when current item type is osd, "
+                                            f"trace length ({len(constraining_trace)}) "
+                                            f"must match tree_depth ({tree_depth:})!")
 
-                rule_tree_depth[rule_depth] = tree_depth + steps_taken
-                tree_depth += steps_taken
+                        steps_taken = find_item_type(constraining_trace[tree_depth - 1:], "osd", rule_depth, item_uses)
+
+                        if steps_taken is None:
+                            raise Exception(f"could not apply re-step down to osd "
+                                            f"when handling rule step {step}")
+                        if steps_taken != 1:
+                            raise Exception(f"re-step down to osd did not result in 1 step, "
+                                            f"took {steps_taken} when handling rule step {step}")
+
+                    rule_tree_depth[rule_depth] = tree_depth
+
+
+                else:
+                    # we've not yet reached osd level, so step down further
+                    for constraining_trace in constraining_traces.values():
+                        steps_taken = find_item_type(constraining_trace[tree_depth:], "osd", rule_depth, item_uses)
+                        if steps_taken is None:
+                            raise Exception(f"could not find trace steps down to osd"
+                                            f"requested by rule step {step}")
+
+                    rule_tree_depth[rule_depth] = tree_depth + steps_taken
+                    tree_depth += steps_taken
+
                 rule_depth += 1
 
                 # sanity checks lol

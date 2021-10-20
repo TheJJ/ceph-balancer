@@ -725,7 +725,16 @@ def candidates_for_root(root_name):
     if not root_ids:
         raise Exception(f"crush root {root} not known?")
 
-    return {nodeid for nodeid in root_ids.keys() if nodeid >= 0}
+    ret = set()
+
+    for nodeid in root_ids.keys():
+        if (nodeid >= 0 and
+            osds[nodeid]['weight'] != 0 and
+            osds[nodeid]['crush_weight'] != 0):
+
+            ret.add(nodeid)
+
+    return ret
 
 
 class PGMoveChecker:
@@ -749,8 +758,6 @@ class PGMoveChecker:
         self.osd_candidates = set()
         for root_name in self.root_names:
             for osdid in candidates_for_root(root_name):
-                if osds[osdid]['weight'] == 0 or osds[osdid]['crush_weight'] == 0:
-                    continue
                 self.osd_candidates.add(osdid)
 
         self.pg_mappings = pg_mappings  # current pg->[osd] mapping state
@@ -1486,7 +1493,7 @@ if args.mode == 'balance':
             pool_size = pool['size']
             pool_crushrule = crushrules[pool['crush_rule']]
             for root_name in root_uses_from_rule(pool_crushrule, pool_size).keys():
-                enabled_crushclasses |= {osds[osdid]['crush_class'] for osdid in candidates_for_root(root_name) if (osds[osdid]['weight'] != 0 and osds[osdid]['crush_weight'] != 0)}
+                enabled_crushclasses |= {osds[osdid]['crush_class'] for osdid in candidates_for_root(root_name)}
 
     osd_candidates = set()
     for crushclass in enabled_crushclasses:
@@ -1943,7 +1950,9 @@ elif args.mode == 'show':
                     if crushclass != args.only_crushclass:
                         continue
 
-                if args.use_shardsize_sum:
+                if props['device_size'] == 0:
+                    util_val = 0
+                elif args.use_shardsize_sum:
                     used = 0
                     if args.pgstate == 'up':
                         placed_pgs = props['pgs_up']
@@ -1978,8 +1987,8 @@ elif args.mode == 'show':
                 devsize = props['device_size']
 
                 if args.pgstate == 'up':
-                    pg_count = props['pg_count_up']
-                    pg_num = props['pg_num_up']
+                    pg_count = props.get('pg_count_up', {})
+                    pg_num = props.get('pg_num_up', 0)
                 elif args.pgstate == 'acting':
                     pg_count = props.get('pg_count_acting', dict())
                     pg_num = props.get('pg_num_acting', 0)
@@ -2112,9 +2121,15 @@ elif args.mode == 'showremapped':
                 osd_c_size = osds[osdid]['crush_weight'] * osds[osdid]['weight']
                 osd_c_size_pp = pprintsize(osd_c_size, 2)
 
-                osd_d_fullness = osd_d_used / osd_d_size * 100
-                osd_c_fullness = osd_d_used / osd_c_size * 100
+                if osd_d_size == 0:
+                    osd_d_fullness = 0
+                else:
+                    osd_d_fullness = osd_d_used / osd_d_size * 100
 
+                if osd_c_size == 0:
+                    osd_c_fullness = 0
+                else:
+                    osd_c_fullness = osd_d_used / osd_c_size * 100
 
                 osdname = f"osd.{osdid}"
                 fullness = (f"  drive={osd_d_fullness:.1f}% {osd_d_used_pp}/{osd_d_size_pp}"

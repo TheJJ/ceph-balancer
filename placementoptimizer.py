@@ -98,6 +98,8 @@ balancep.add_argument('--pg-size-choice', choices=['largest', 'median', 'auto'],
                             'default: %(default)s'))
 balancep.add_argument('--ensure-optimal-moves', action='store_true',
                       help='make sure that only movements which win full shardsizes are done')
+balancep.add_argument('--ensure-variance-decrease', action='store_true',
+                      help='make sure that only movements which decrease the fill rate variance are performed')
 balancep.add_argument('--osdsize', choices=['device', 'weighted', 'crush'], default="crush",
                       help="what parameter to take for determining the osd size. weighted=devsize*weight, crush=crushweight*weight")
 balancep.add_argument('--max-full-move-attempts', type=int, default=1,
@@ -1950,8 +1952,11 @@ if args.mode == 'balance':
                     new_variance = try_pg_move.get_placement_variance(osd_from, osd_to)
 
                     if new_variance >= variance_before:
-                        logging.debug(f" BAD => variance not decreasing: {new_variance} not < {variance_before}")
-                        continue
+                        # even if the variance increases, we ensure we do progress by the
+                        # guaranteed usage rate decline
+                        if args.ensure_variance_decrease:
+                            logging.debug(f" BAD => variance not decreasing: {new_variance} not < {variance_before}")
+                            continue
 
                     new_pg_mapping = list()
                     for osdid in pg_osds_up[move_pg]:

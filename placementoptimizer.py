@@ -1528,6 +1528,26 @@ class PGMappings:
         return max_avail
 
 
+class PGProps:
+    def __init__(self, size):
+        self.size = size
+
+    def __lt__(self, other):
+        """
+        the "least" pg props entry is the one we try first.
+        """
+        # TODO: smarter selection of pg movement candiates
+        # order pgs by size, from big to small
+        # order pgs by pg's num_omap_bytes
+        # prefer pgs that are remapped (up != acting)
+        # prefer pgs that have a upmap item and could be removed
+        # prefer pgs that don't have upmaps already to minimize "distance" to crush mapping
+        # randomly choose also pgs so we achive better pool balance
+        # only consider source/dest osds of a pg that was remapped, not any osd of the whole pg
+
+        return self.size < other.size
+
+
 class PGCandidates:
     """
     Generate movement candiates to empty the given osd.
@@ -1535,33 +1555,32 @@ class PGCandidates:
     def __init__(self, pg_mappings, osd):
         up_pgs = pg_mappings.get_osd_pgs_up(osd)
         acting_pgs = pg_mappings.get_osd_pgs_acting(osd)
+        remapped_pgs = up_pgs - acting_pgs
 
-        # TODO: smarter selection of pg movement candiates
-        # prefer pgs that are remapped
-        # prefer pgs that have a upmap item and could be removed
-        # randomly choose also pgs so we achive better pool balance
-        # only consider source/dest osds of a pg that was remapped, not any osd of the whole pg
-        #pg_candidates = up_pgs - acting_pgs  # = remapped pgs
-        pg_candidates = up_pgs
+        pg_candidates = list()
+        self.pg_properties = dict()
 
-        # pg -> shardsize
-        pg_candidates_sizes = dict()
-        for pg_candidate in pg_candidates:
-            pg_pool = pool_from_pg(pg_candidate)
+        for pgid in up_pgs:
+            pg_pool = pool_from_pg(pgid)
             if only_poolids and pg_pool not in only_poolids:
                 continue
 
-            pg_candidate_size = get_pg_shardsize(pg_candidate)
-            pg_candidates_sizes[pg_candidate] = pg_candidate_size
+            pg_candidates.append(pgid)
+
+            self.pg_properties[pgid] = PGProps(
+                size=get_pg_shardsize(pgid)
+            )
 
         # remaining pgs sorted by their shardsize, descending
         pg_candidates_desc = list(sorted(pg_candidates,
-                                         key=lambda pg: pg_candidates_sizes[pg], reverse=True))
-        pg_candidates_desc_sizes = [pg_candidates_sizes[pg] for pg in pg_candidates_desc]
+                                         key=lambda pg: self.pg_properties[pg].size, reverse=True))
 
         # reorder potential pg_candidates by configurable approaces
         pg_choice_method = args.pg_size_choice
         pg_walk_anchor = None
+
+        # TODO: if the candidate list is no longer only sorted by only size,
+        # the auto choice method has to be adjusted somehow!
 
         if pg_choice_method == 'auto':
             # choose the PG choice method based on
@@ -1572,7 +1591,7 @@ class PGCandidates:
             best_target_osd, best_target_osd_usage = osd_usages_asc[0]
 
             for idx, pg_candidate in enumerate(pg_candidates_desc):
-                pg_candidate_size = pg_candidates_sizes[pg_candidate]
+                pg_candidate_size = self.pg_properties[pg_candidate].size
                 # try the largest pg candidate first, and become smaller every step
                 target_predicted_usage = pg_mappings.get_osd_usage(best_target_osd, add_size=pg_candidate_size)
                 # if the optimal osd's predicted usage is < (target_usage + source_usage)/2 + limit
@@ -1605,6 +1624,7 @@ class PGCandidates:
             # here, we decide to move not the largest/smallest pg, but rather the median one.
             # order PGs around the median-sized one
             # [5, 4, 3, 2, 1] => [3, 4, 2, 5, 1]
+            pg_candidates_desc_sizes = [self.pg_properties[pg].size for pg in pg_candidates_desc]
             pg_candidates_median = statistics.median_low(pg_candidates_desc_sizes)
             pg_walk_anchor = pg_candidates_desc_sizes.index(pg_candidates_median)
 
@@ -1635,13 +1655,16 @@ class PGCandidates:
             assert len(pg_candidates) == len(pg_candidates_desc)
 
         self.pg_candidates = pg_candidates
-        self.pg_candidates_sizes = pg_candidates_sizes
 
     def get_candidates(self):
+        """
+        return an iterable with pgids on the osd,
+        in the order we should try moving them away.
+        """
         return self.pg_candidates
 
     def get_size(self, pg):
-        return self.pg_candidates_sizes[pg]
+        return self.pg_properties[pg].size
 
     def __len__(self):
         return len(self.pg_candidates)

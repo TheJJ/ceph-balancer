@@ -1159,76 +1159,78 @@ class PGMappings:
                 shardsize = get_pg_shardsize(pg)
                 pginfo = pgs[pg]
 
-                # for each move to be done, objects_misplaced+=pg_objs,
-                # thus we do /misplaced_shards below
-                pg_objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
-                pg_objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
                 pg_objs = pginfo["stat_sum"]["num_objects"]
 
-                # the pginfo statistics only provide us with pg-overall statistics
-                # so we need to figure out how much of that affects the current osdid
-                # -> see how many moves exist for the whole pg,
-                # and estimate the fraction due to movements with this osdid.
+                if pg_objs <= 0:
+                    shardsize_already_transferred = 0
+                else:
+                    # for each move to be done, objects_misplaced+=pg_objs,
+                    # thus we do /misplaced_shards below
+                    pg_objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
+                    pg_objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
 
-                # the pg is moved and the source is missing
-                pg_degraded_moves = 0
-                # the pg is moved and the source exists
-                pg_misplaced_moves = 0
-                # this osd is the target of a pg move where the source is nonexistant
-                degraded_shards = 0
-                # this osd is the target of a pg move where the source does exist
-                misplaced_shards = 0
+                    # the pginfo statistics only provide us with pg-overall statistics
+                    # so we need to figure out how much of that affects the current osdid
+                    # -> see how many moves exist for the whole pg,
+                    # and estimate the fraction due to movements with this osdid.
 
-                moves = get_remaps(pginfo)
+                    # the pg is moved and the source is missing
+                    pg_degraded_moves = 0
+                    # the pg is moved and the source exists
+                    pg_misplaced_moves = 0
+                    # this osd is the target of a pg move where the source is nonexistant
+                    degraded_shards = 0
+                    # this osd is the target of a pg move where the source does exist
+                    misplaced_shards = 0
 
-                # TODO in pginfo there's shard status, but that doesn't seem to contain
-                # sensible content?
+                    moves = get_remaps(pginfo)
 
-                for osds_from, osds_to in moves:
-                    # -1 means in from -> move is degraded for EC
-                    # for replica, len(from) < len(to) = degraded
-                    if pg_is_ec(pg):
-                        if -1 in osds_from:
-                            pg_degraded_moves += len(osds_from)
-                            if osdid in osds_to:
-                                degraded_shards += 1
-                        else:
-                            pg_misplaced_moves += len(osds_from)
-                            if osdid in osds_to:
-                                misplaced_shards += 1
+                    # TODO in pginfo there's shard status, but that doesn't seem to contain
+                    # sensible content?
 
-                    else:
-                        if len(osds_to) == len(osds_from):
-                            pg_misplaced_moves += len(osds_to)
-                            if osdid in osds_to:
-                                misplaced_shards += 1
-                        else:
-                            pg_degraded_moves += len(osds_to) - len(osds_from)
-                            if osdid in osds_to:
-                                degraded_shards += 1
+                    for osds_from, osds_to in moves:
+                        # -1 means in from -> move is degraded for EC
+                        # for replica, len(from) < len(to) = degraded
+                        if pg_is_ec(pg):
+                            if -1 in osds_from:
+                                pg_degraded_moves += len(osds_from)
+                                if osdid in osds_to:
+                                    degraded_shards += 1
+                            else:
+                                pg_misplaced_moves += len(osds_from)
+                                if osdid in osds_to:
+                                    misplaced_shards += 1
+                        else:  # replica pg
+                            if len(osds_to) == len(osds_from):
+                                pg_misplaced_moves += len(osds_to)
+                                if osdid in osds_to:
+                                    misplaced_shards += 1
+                            else:
+                                pg_degraded_moves += len(osds_to) - len(osds_from)
+                                if osdid in osds_to:
+                                    degraded_shards += 1
 
+                    # the following assumes that all shards of this pg are recovered at the same rate,
+                    # when there's multiple from/to osds for this pg
+                    osd_pg_objs_to_restore = 0
+                    if degraded_shards > 0:
+                        osd_pg_objs_degraded = pg_objs_degraded / pg_degraded_moves
+                        osd_pg_objs_to_restore += osd_pg_objs_degraded * degraded_shards
 
-                # the following assumes that all shards of this pg are recovered at the same rate,
-                # when there's multiple from/to osds for this pg
-                osd_pg_objs_to_restore = 0
-                if degraded_shards > 0:
-                    osd_pg_objs_degraded = pg_objs_degraded / pg_degraded_moves
-                    osd_pg_objs_to_restore += osd_pg_objs_degraded * degraded_shards
+                    if misplaced_shards > 0:
+                        osd_pg_objs_misplaced = pg_objs_misplaced / pg_misplaced_moves
+                        osd_pg_objs_to_restore += osd_pg_objs_misplaced * misplaced_shards
 
-                if misplaced_shards > 0:
-                    osd_pg_objs_misplaced = pg_objs_misplaced / pg_misplaced_moves
-                    osd_pg_objs_to_restore += osd_pg_objs_misplaced * misplaced_shards
+                    # adjust fs size by average object size times estimated restoration count.
+                    # because this is kinda lame but it seems one can't get more info
+                    # the balancer will work best if there are no more remapped PGs!
+                    pg_obj_size = shardsize / pg_objs
+                    pg_objs_transferred = pg_objs - osd_pg_objs_to_restore
+                    if pg_objs_transferred < 0:
+                        raise Exception(f"pg {pg} to be moved to osd.{osdid} is misplaced "
+                                        f"with {pg_objs_transferred}<0 objects already transferred")
 
-                # adjust fs size by average object size times estimated restoration count.
-                # because this is kinda lame but it seems one can't get more info
-                # the balancer will work best if there are no more remapped PGs!
-                pg_obj_size = shardsize / pg_objs
-                pg_objs_transferred = pg_objs - osd_pg_objs_to_restore
-                if pg_objs_transferred < 0:
-                    raise Exception(f"pg {pg} to be moved to osd.{osdid} is misplaced "
-                                    f"with {pg_objs_transferred}<0 objects already transferred")
-
-                shardsize_already_transferred = int(pg_obj_size * pg_objs_transferred)
+                    shardsize_already_transferred = int(pg_obj_size * pg_objs_transferred)
 
                 missing_shardsize = shardsize - shardsize_already_transferred
 

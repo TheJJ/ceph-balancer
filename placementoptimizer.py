@@ -1559,7 +1559,7 @@ class PGCandidates:
         acting_pgs = pg_mappings.get_osd_pgs_acting(osd)
         remapped_pgs = up_pgs - acting_pgs
 
-        pg_candidates = list()
+        self.pg_candidates = list()
         self.pg_properties = dict()
 
         for pgid in up_pgs:
@@ -1567,14 +1567,14 @@ class PGCandidates:
             if only_poolids and pg_pool not in only_poolids:
                 continue
 
-            pg_candidates.append(pgid)
+            self.pg_candidates.append(pgid)
 
             self.pg_properties[pgid] = PGProps(
                 size=get_pg_shardsize(pgid)
             )
 
         # remaining pgs sorted by their shardsize, descending
-        pg_candidates_desc = list(sorted(pg_candidates,
+        pg_candidates_desc = list(sorted(self.pg_candidates,
                                          key=lambda pg: self.pg_properties[pg].size, reverse=True))
 
         # reorder potential pg_candidates by configurable approaces
@@ -1617,10 +1617,10 @@ class PGCandidates:
                 # to work towards the optimal mean usage to achieve ideal balance.
                 # in other words, overshoot the usage mean between the OSDs
                 # by the minimally possible amount.
-                pg_candidates = reversed(pg_candidates_desc)
+                self.pg_candidates = reversed(pg_candidates_desc)
 
         elif pg_choice_method == 'largest':
-            pg_candidates = pg_candidates_desc
+            self.pg_candidates = pg_candidates_desc
 
         elif pg_choice_method == 'median':
             # here, we decide to move not the largest/smallest pg, but rather the median one.
@@ -1636,7 +1636,7 @@ class PGCandidates:
         # if we have a walk anchor, alternate pg sizes around that anchor point
         # and build the pg_candidates that way.
         if pg_walk_anchor is not None:
-            pg_candidates = list()
+            self.pg_candidates = list()
             hit_left = False
             hit_right = False
             for walk_jump in A001057():
@@ -1652,11 +1652,9 @@ class PGCandidates:
                     continue
 
                 pg = pg_candidates_desc[pg_walk_pos]
-                pg_candidates.append(pg)
+                self.pg_candidates.append(pg)
 
-            assert len(pg_candidates) == len(pg_candidates_desc)
-
-        self.pg_candidates = pg_candidates
+            assert len(self.pg_candidates) == len(pg_candidates_desc)
 
     def get_candidates(self):
         """

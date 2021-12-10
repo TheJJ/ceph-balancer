@@ -1635,6 +1635,7 @@ class PGShardProps:
         # [x] prefer pgs that are remapped (up != acting)
         # [ ] prefer pgs that have a upmap item and could be removed (tricky - since we have to know destination OSD)
         # [x] prefer pgs that don't have upmaps already to minimize "distance" to crush mapping
+        # [ ] prefer pgs whose upmap item uses the current osd as mapping target (-> so we don't add more items)
         # [ ] perfer pgs that have bad pool balance (i.e. their count on this osd doesn't match the expected one) (we enforce that constraint anyway, but we may never pick a pg from another pool that would be useful to balance)
         # [ ] only consider source/dest osds of a pg that was remapped, not any osd of the whole pg
 
@@ -1690,7 +1691,8 @@ class PGCandidates:
             )
 
         # best candidate first
-        pg_candidates_desc = list(sorted(self.pg_candidates))
+        pg_candidates_desc = list(sorted(self.pg_candidates,
+                                         key=lambda pg: self.pg_properties[pg]))
 
         # reorder potential pg_candidates by configurable approaces
         pg_choice_method = args.pg_size_choice
@@ -1966,6 +1968,8 @@ if args.mode == 'balance':
 
             # these pgs are up on the source osd,
             # and are in the order of preference moving them away
+            # TODO: it would be great if we could already know the destination osd candiates here
+            # for better pg candidate selection.
             pg_candidates = pg_mappings.get_pg_move_candidates(osd_from)
 
             from_osd_pg_count = pg_mappings.osd_pool_pg_count(osd_from)

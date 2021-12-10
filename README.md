@@ -144,15 +144,51 @@ Likely this can be optimized further.
 
 ## Usage
 
+### Balancing
+
 ```
 # to generate max 10 pg movements:
 ./placementoptimizer.py -v balance --max-pg-moves 10 | tee /tmp/balance-upmaps
 
-# -> if you're satisfied, run bash /tmp/balance-upmaps
+# -> if you're satisfied, run: $ bash /tmp/balance-upmaps
 
 # but it can do more than balance!
+# there's some examples below.
 ./placementoptimizer.py --help
 ```
+
+### Cluster Information Display
+
+Ongoing movement status
+```
+./placementoptimizer.py showremapped
+./placementoptimizer.py showremapped --by-osd
+./placementoptimizer.py showremapped --by-osd --osds 13337,4242
+```
+
+OSD utilization:
+```
+./placementoptimizer.py show
+./placementoptimizer.py show --osds --sort-utilization
+./placementoptimizer.py show --osds --per-pool-count
+./placementoptimizer.py show --osds --per-pool-count --sort-utilization --only-crushclass hdd
+```
+
+### Dumping and Importing Cluster State
+
+For debugging (or archiving), you can store all needed cluster state in a `.xz` file.
+```
+./placementoptimizer.py -v gather /tmp/lolfile.xz
+```
+
+To use this file instead of the "live" cluster state, use `--state` in all the usual commands:
+
+```
+./placementoptimizer.py -v show --state /tmp/lolfile.xz
+./placementoptimizer.py showremapped --state /tmp/lolfile.xz
+./placementoptimizer.py balance --state /tmp/lolfile.xz
+```
+
 
 ## Contributions
 

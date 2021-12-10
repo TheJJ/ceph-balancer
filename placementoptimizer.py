@@ -91,7 +91,7 @@ balancep.add_argument('--osdused', choices=["delta", "shardsum"], default="shard
                             "delta=adjusting the osd usage report by pending pg deltas, more accurate but doesn't account pending data deletion. "
                             "shardsum=estimate the usage by summing up all pg shardsizes, doesn't account PG metadata."))
 balancep.add_argument('--pg-size-choice', choices=['largest', 'median', 'auto'],
-                      default='auto',
+                      default='largest',
                       help=('method to select a PG move candidate on a OSD based on its size. '
                             'auto tries to determine the best PG size by looking at '
                             'the currently emptiest OSD. '
@@ -180,16 +180,22 @@ def pprintsize(size_bytes, commaplaces=1):
 # this is shitty: this whole script depends on these outputs,
 # but they might be inconsistent, if the cluster had changes
 # between calls....
+# it would be really nice if we could "start a transaction"
 
 # ceph pg dump always echoes "dumped all" on stderr, silence that.
-pg_dump = jsoncall("ceph pg dump --format json".split(), swallow_stderr=True)
 osd_dump = jsoncall("ceph osd dump --format json".split())
+pg_dump = jsoncall("ceph pg dump --format json".split(), swallow_stderr=True)
 osd_df_dump = jsoncall("ceph osd df --format json".split())
 osd_df_tree_dump = jsoncall("ceph osd df tree --format json".split())
 df_dump = jsoncall("ceph df detail --format json".split())
 pool_dump = jsoncall("ceph osd pool ls detail --format json".split())
 crush_dump = jsoncall("ceph osd crush dump --format json".split())
 crush_classes = jsoncall("ceph osd crush class ls --format json".split())
+
+# check if the osdmap version changed meanwhile
+# => we'd have inconsistent state
+if osd_dump['epoch'] != jsoncall("ceph osd dump --format json".split())['epoch']:
+    raise Exception("cluster topology changed during information gathering - wait for things to calm down and try again")
 
 
 pools = dict()                        # poolid => props
@@ -1110,11 +1116,14 @@ class PGMappings:
     PG mapping simulator
     used to calculate device usage when moving around pgs.
     """
-    def __init__(self, pgs, osds):
+    def __init__(self, pgs, osds, osd_candidates):
 
         # the "real" devices, just used for their "fixed" properties like
         # device size
         self.osds = osds
+
+        # all possible osd candidates where we can map to (due to crush class)
+        self.osd_candidates = osd_candidates
 
         # up state: osdid -> {pg, ...}
         self.osd_pgs_up = defaultdict(set)
@@ -1138,7 +1147,7 @@ class PGMappings:
                 self.osd_pgs_acting[osdid].add(pg)
 
         # pg->[(osd_from, osd_to), ...]
-        self.remaps = defaultdict(list)
+        self.remaps = dict()
 
         # osdid -> used kb, based on the osd-level utilization report
         self.osd_utilizations = dict()
@@ -1274,7 +1283,22 @@ class PGMappings:
         self.get_osd_usage.cache_clear()
         self.get_osd_space_allocated.cache_clear()
 
-        self.remaps[pg].append((osd_from, osd_to))
+        # insert a new mapping tracker
+        self.remaps.setdefault(pg, []).append((osd_from, osd_to))
+
+    def get_osd_usages(self):
+        """
+        calculate {osdid -> usage percent}
+        """
+        # if an osd has a weight of 0, it's 100% full.
+        return {osdid: self.get_osd_usage(osdid) for osdid in self.osd_candidates}
+
+    def get_osd_usages_asc(self):
+        """
+        return [(osdid, usage in percent)] sorted ascendingly by usage
+        """
+        # from this mapping, calculate the weighted osd size,
+        return list(sorted(self.get_osd_usages().items(), key=lambda osd: osd[1]))
 
     def get_mapping(self, pg):
         return list(self.pg_mappings[pg])
@@ -1285,7 +1309,7 @@ class PGMappings:
     def get_osd_pgs_acting(self, osd):
         return set(self.osd_pgs_acting[osd])
 
-    def get_source_pg_candidates(self, osd):
+    def get_pg_move_candidates(self, osd):
         return PGCandidates(self, osd)
 
     @lru_cache(maxsize=2**18)
@@ -1381,64 +1405,73 @@ class PGMappings:
         get all applied mappings
         return {pgid: [(map_from, map_to), ...]}
         """
-        # pgid -> [(map_from, map_to), ...]
+        # {pgid -> [(map_from, map_to), ...]}
         upmap_results = dict()
 
-        for pg, remaps_list in self.remaps.items():
-
-            # remaps is [(osdfrom, osdto), ...], now osdfrom->osdto
-            # these are the "new" remappings.
-            # osdfrom->osdto
-            remaps = dict(remaps_list)
-
-            # merge new upmaps
-            # i.e. (1, 2), (2, 3) => (1, 3)
-            for new_from, new_to in remaps_list:
-                other_to = remaps.get(new_to)
-                if other_to is not None:
-                    remaps[new_from] = other_to
-                    del remaps[new_to]
-
-            # current_upmaps are is [(osdfrom, osdto), ...]
-            current_upmaps = upmap_items.get(pg, [])
-
-            # now, let's merge current_upmaps and remaps:
-
-            # which of the current_upmaps to retain
-            resulting_upmaps = list()
-
-            # what remap-source-osds we already covered with merges
-            merged_remaps = set()
-
-            for current_from, current_to in current_upmaps:
-                # is the previous to-device one we would map to somewhere else
-                remapped_to = remaps.get(current_to)
-                if remapped_to is not None:
-                    # this remap's source osd will now be merged
-                    merged_remaps.add(current_to)
-
-                    if current_from == remapped_to:
-                        # skip current=(75->72), remapped=(72->75) leading to (75->75)
-                        continue
-
-                    # transform e.g. current=197->188, remapped=188->261 to 197->261
-                    resulting_upmaps.append((current_from, remapped_to))
-                    continue
-
-                resulting_upmaps.append((current_from, current_to))
-
-            for new_from, new_to in remaps.items():
-                if new_from in merged_remaps:
-                    continue
-                resulting_upmaps.append((new_from, new_to))
-
-            for new_from, new_to in resulting_upmaps:
-                if new_from == new_to:
-                    raise Exception(f"somewhere something went wrong, we map {pg} from osd.{new_from} to osd.{new_to}")
-
-            upmap_results[pg] = resulting_upmaps
+        for pgid in self.remaps.keys():
+            upmap_results[pgid] = self.get_pg_upmap(pgid)
 
         return upmap_results
+
+    def get_pg_upmap(self, pgid):
+        """
+        get all applied mappings for a pg
+        return [(map_from, map_to), ...]
+        """
+
+        remaps_list = self.remaps.get(pgid, [])
+
+        # remaps is [(osdfrom, osdto), ...], now osdfrom->osdto
+        # these are the "new" remappings.
+        # osdfrom->osdto
+        new_remaps = dict(remaps_list)
+
+        # merge new upmaps
+        # i.e. (1, 2), (2, 3) => (1, 3)
+        for new_from, new_to in remaps_list:
+            other_to = new_remaps.get(new_to)
+            if other_to is not None:
+                new_remaps[new_from] = other_to
+                del new_remaps[new_to]
+
+        # current_upmaps are is [(osdfrom, osdto), ...]
+        current_upmaps = upmap_items.get(pgid, [])
+
+        # now, let's merge current_upmaps and remaps:
+
+        # which of the current_upmaps to retain
+        resulting_upmaps = list()
+
+        # what remap-source-osds we already covered with merges
+        merged_remaps = set()
+
+        for current_from, current_to in current_upmaps:
+            # do we currently map to a device, from which we move it again now?
+            current_remapped_to = new_remaps.get(current_to)
+            if current_remapped_to is not None:
+                # this remap's source osd will now be merged
+                merged_remaps.add(current_to)
+
+                if current_from == current_remapped_to:
+                    # skip current=(75->72), remapped=(72->75) leading to (75->75)
+                    continue
+
+                # transform e.g. current=197->188, remapped=188->261 to 197->261
+                resulting_upmaps.append((current_from, current_remapped_to))
+                continue
+
+            resulting_upmaps.append((current_from, current_to))
+
+        for new_from, new_to in new_remaps.items():
+            if new_from in merged_remaps:
+                continue
+            resulting_upmaps.append((new_from, new_to))
+
+        for new_from, new_to in resulting_upmaps:
+            if new_from == new_to:
+                raise Exception(f"somewhere something went wrong, we map {idpg} from osd.{new_from} to osd.{new_to}")
+
+        return resulting_upmaps
 
     def osd_pool_pg_count(self, osdid):
         """
@@ -1488,7 +1521,7 @@ class PGMappings:
         similar to what `ceph df` tries to estimate
         """
 
-        # asdf asdf missing implementation details!
+        # TODO missing implementation details!
 
         pool = pools[poolid]
         pool_size = pool['size']
@@ -1513,7 +1546,7 @@ class PGMappings:
             #
             # better (since actual pg placement counts, not just hypothetical crush weights):
             # how many pgs of the given pool are on that osd
-            # asdf idea: have weight = (osd_weight * osd_pool_pg_count) / (osdid_candidates_crushweightsum * pool_pg_count)
+            # idea: have weight = (osd_weight * osd_pool_pg_count) / (osdid_candidates_crushweightsum * pool_pg_count)
             # TODO: include rule rootweights!
             osd_pool_pg_count = self.osd_pool_pg_count(osdid)[poolid]
             weight = (osd_pool_pg_count / sum_crushweight_osds_in_pool) / (pool_pg_num * pool_size / osdid_candidates_crushweightsum )
@@ -1530,30 +1563,65 @@ class PGMappings:
         return max_avail
 
 
-class PGProps:
-    def __init__(self, size):
+class PGShardProps:
+    """
+    info about one shard of a PG, i.e. the PG piece present on an OSD.
+    """
+    def __init__(self, size, remapped, upmap_count):
         self.size = size
+
+        # bool: true, if the shard is not yet fully moved,
+        # i.e. its in up, but not in acting of the osd
+        # so we can prefer moving a pg that's not yet copied fully
+        self.remapped = remapped
+
+        # int: number of remappings the pg currently has
+        # the more upmap items it has, the farther it is away from crush
+        # -> the lower, the better.
+        self.upmap_count = upmap_count
 
     def __lt__(self, other):
         """
         the "least" pg props entry is the one we try first.
         """
         # TODO: smarter selection of pg movement candiates
-        # order pgs by size, from big to small
-        # order pgs by pg's num_omap_bytes
-        # prefer pgs that are remapped (up != acting)
-        # prefer pgs that have a upmap item and could be removed
-        # prefer pgs that don't have upmaps already to minimize "distance" to crush mapping
-        # randomly choose also pgs so we achive better pool balance
-        # only consider source/dest osds of a pg that was remapped, not any osd of the whole pg
+        # [x] order pgs by size, from big to small
+        # [ ] order pgs by pg's num_omap_bytes
+        # [x] prefer pgs that are remapped (up != acting)
+        # [ ] prefer pgs that have a upmap item and could be removed (tricky - since we have to know destination OSD)
+        # [x] prefer pgs that don't have upmaps already to minimize "distance" to crush mapping
+        # [ ] perfer pgs that have bad pool balance (i.e. their count on this osd doesn't match the expected one) (we enforce that constraint anyway, but we may never pick a pg from another pool that would be useful to balance)
+        # [ ] only consider source/dest osds of a pg that was remapped, not any osd of the whole pg
 
-        return self.size < other.size
+        # "most important" sorting first
+        # so if the "important" path is the same, sort by other means
+
+        # prefer pgs that are remapped
+        if self.remapped != other.remapped:
+            return self.remapped
+
+        if self.upmap_count != other.upmap_count:
+            return self.upmap_count < other.upmap_count
+
+        # prefer biggest sized pgs
+        # TODO: integrate the automatic size selection feature
+        if self.size != other.size:
+            return self.size > other.size
+
+        return False
+
+    def __str__(self):
+        return f"size={pprintsize(self.size)} remapped={self.remapped} upmaps={self.upmap_count}"
 
 
 class PGCandidates:
     """
     Generate movement candiates to empty the given osd.
     """
+
+    def get_properties(self, pgid):
+        return self.pg_properties[pgid]
+
     def __init__(self, pg_mappings, osd):
         up_pgs = pg_mappings.get_osd_pgs_up(osd)
         acting_pgs = pg_mappings.get_osd_pgs_acting(osd)
@@ -1562,6 +1630,7 @@ class PGCandidates:
         self.pg_candidates = list()
         self.pg_properties = dict()
 
+        # we can move up pgs away - they are on the osd or planned to be on it.
         for pgid in up_pgs:
             pg_pool = pool_from_pg(pgid)
             if only_poolids and pg_pool not in only_poolids:
@@ -1569,28 +1638,27 @@ class PGCandidates:
 
             self.pg_candidates.append(pgid)
 
-            self.pg_properties[pgid] = PGProps(
-                size=get_pg_shardsize(pgid)
+            self.pg_properties[pgid] = PGShardProps(
+                size=get_pg_shardsize(pgid),
+                remapped=(pgid in remapped_pgs),   # the shard is not yet fully moved
+                upmap_count=len(pg_mappings.get_pg_upmap(pgid))
             )
 
-        # remaining pgs sorted by their shardsize, descending
-        pg_candidates_desc = list(sorted(self.pg_candidates,
-                                         key=lambda pg: self.pg_properties[pg].size, reverse=True))
+        # best candidate first
+        pg_candidates_desc = list(sorted(self.pg_candidates))
 
         # reorder potential pg_candidates by configurable approaces
         pg_choice_method = args.pg_size_choice
         pg_walk_anchor = None
 
-        # TODO: if the candidate list is no longer only sorted by only size,
-        # the auto choice method has to be adjusted somehow!
-
+        # TODO: move these choice methods also into the PGShardProps comparison function
         if pg_choice_method == 'auto':
             # choose the PG choice method based on
             # the utilization differences of the fullest and emptiest candidate OSD.
 
             # if we could move there, most balance would be created.
             # use this to guess the shard size to move.
-            best_target_osd, best_target_osd_usage = osd_usages_asc[0]
+            best_target_osd, best_target_osd_usage = pg_mappings.get_osd_usages()[-1]
 
             for idx, pg_candidate in enumerate(pg_candidates_desc):
                 pg_candidate_size = self.pg_properties[pg_candidate].size
@@ -1682,29 +1750,25 @@ def A001057():
         yield val
 
 
-def get_osd_usages(pg_mappings, osdids):
+def list_highlight(osdlist, changepos, colorcode):
     """
-    given PGMappings, calculate osdid -> usage percent
+    highlight an element at given list position with an ansi color code.
     """
-    # if an osd has a weight of 0, it's 100% full.
-    return {osdid: pg_mappings.get_osd_usage(osdid) for osdid in osdids}
+    ret = list()
+    for idx, osd in enumerate(osdlist):
+        if idx == changepos:
+            ret.append(f"\x1b[{colorcode};1m{osd}\x1b[m")
+        else:
+            ret.append(str(osd))
 
-
-def get_osd_usages_asc(pg_mappings, osdids):
-    """
-    given the pg_mapping tracker,
-    return {osdid: usage in percent}
-    """
-    osd_usages = get_osd_usages(pg_mappings, osdids)
-
-    # from this mapping, calculate the weighted osd size,
-    return list(sorted(osd_usages.items(), key=lambda osd: osd[1]))
+    return f"[{', '.join(ret)}]"
 
 
 def print_osd_usages(usagedict):
     """
     given a sorted (osdid, usage) iterable, print it for debugging.
     """
+    return
     logging.debug("osd usages in ascending order:")
     for osdid, usage in usagedict:
         logging.debug("  usage of %s.osd.%s: %.2f%%", strlazy(lambda: osds[osdid]["host_name"]), osdid, usage)
@@ -1765,7 +1829,7 @@ if args.mode == 'balance':
     osd_candidates = {osd for osd in osd_candidates if (osds[osd]['weight'] != 0 and osds[osd]['crush_weight'] != 0)}
 
     # we'll do all the optimizations in this mapping state
-    pg_mappings = PGMappings(pgs, osds)
+    pg_mappings = PGMappings(pgs, osds, osd_candidates)
 
     # to restrict source osds
     source_osds = None
@@ -1780,7 +1844,7 @@ if args.mode == 'balance':
 
     # start by taking the fullest OSD
     # this is updated when we do move a pg
-    osd_usages_asc = get_osd_usages_asc(pg_mappings, osd_candidates)
+    osd_usages_asc = pg_mappings.get_osd_usages_asc()
     print_osd_usages(osd_usages_asc)
 
     logging.info("current OSD fill rate per crushclasses:")
@@ -1855,8 +1919,9 @@ if args.mode == 'balance':
 
             logging.debug("trying to empty osd.%s (%f %%)", osd_from, osd_from_used_percent)
 
-            # these pgs are up on the source osd
-            pg_candidates = pg_mappings.get_source_pg_candidates(osd_from)
+            # these pgs are up on the source osd,
+            # and are in the order of preference moving them away
+            pg_candidates = pg_mappings.get_pg_move_candidates(osd_from)
 
             from_osd_pg_count = pg_mappings.osd_pool_pg_count(osd_from)
 
@@ -1985,16 +2050,20 @@ if args.mode == 'balance':
                             logging.debug(f" BAD => variance not decreasing: {new_variance} not < {variance_before}")
                             continue
 
+                    new_mapping_pos = None
+
+                    prev_pg_mapping = pg_osds_up[move_pg]
                     new_pg_mapping = list()
-                    for osdid in pg_osds_up[move_pg]:
+                    for idx, osdid in enumerate(prev_pg_mapping):
                         if osdid == osd_from:
                             osdid = osd_to
+                            new_mapping_pos = idx
                         new_pg_mapping.append(osdid)
 
                     pg_mappings.apply_remap(move_pg, osd_from, osd_to)
 
                     # refresh our global osd usage mapping
-                    osd_usages_asc = get_osd_usages_asc(pg_mappings, osd_candidates)
+                    osd_usages_asc = pg_mappings.get_osd_usages_asc()
                     osd_min, osd_min_used = osd_usages_asc[0]
                     osd_max, osd_max_used = osd_usages_asc[-1]
                     cluster_variance = get_cluster_variance(enabled_crushclasses, pg_mappings)
@@ -2008,9 +2077,10 @@ if args.mode == 'balance':
                     else:
                         variance_op = "=="
 
-                    logging.info(f"  SAVE move {move_pg} osd.{osd_from} => osd.{osd_to} "
-                                 f"(size={pprintsize(move_pg_shardsize)})")
-                    logging.debug(f"    pg {move_pg} is then on {new_pg_mapping}")
+                    logging.info(f"  SAVE move {move_pg} osd.{osd_from} => osd.{osd_to} ")
+                    logging.info(f"    props: {pg_candidates.get_properties(move_pg)}")
+                    logging.debug(strlazy(lambda: f"    pg {move_pg} was on {list_highlight(prev_pg_mapping, new_mapping_pos, 31)}"))
+                    logging.debug(strlazy(lambda: f"    pg {move_pg} now on {list_highlight(new_pg_mapping, new_mapping_pos, 32)}"))
                     logging.info(f"    => variance new={new_variance} {variance_op} {variance_before}=old")
                     logging.info(f"    new min osd.{osd_min} {osd_min_used:.3f}%")
                     logging.info(f"        max osd.{osd_max} {osd_max_used:.3f}%")

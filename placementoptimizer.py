@@ -28,9 +28,11 @@ import argparse
 import itertools
 import json
 import logging
+import lzma
 import shlex
 import statistics
 import subprocess
+import datetime
 from collections import defaultdict
 from functools import lru_cache
 from pprint import pformat, pprint
@@ -45,7 +47,14 @@ cli.add_argument("-q", "--quiet", action="count", default=0,
 
 sp = cli.add_subparsers(dest='mode')
 sp.required=True
-showsp = sp.add_parser('show')
+
+statep = argparse.ArgumentParser(add_help=False)
+statep.add_argument("--state", "-s", help="load cluster state from this jsonfile")
+
+gathersp = sp.add_parser('gather', help="only gather cluster information, i.e. generate a state file")
+gathersp.add_argument("output_file", help="file to store cluster balancing information to")
+
+showsp = sp.add_parser('show', parents=[statep])
 showsp.add_argument('--only-crushclass',
                     help="only display devices of this crushclass")
 showsp.add_argument('--sort-shardsize', action='store_true',
@@ -71,13 +80,13 @@ showsp.add_argument('--use-shardsize-sum', action='store_true',
 showsp.add_argument('--osd-fill-min', type=int, default=0,
                     help='minimum fill %% to show an osd, default: %(default)s%%')
 
-remappsp = sp.add_parser('showremapped')
+remappsp = sp.add_parser('showremapped', parents=[statep])
 remappsp.add_argument('--by-osd', action='store_true',
                       help="group the results by osd")
 remappsp.add_argument('--osds',
                       help="only look at these osds when using --by-osd, comma separated")
 
-balancep = sp.add_parser('balance')
+balancep = sp.add_parser('balance', parents=[statep])
 balancep.add_argument('--max-pg-moves', '-m', type=int, default=10,
                       help='maximum number of pg movements to find, default: %(default)s')
 balancep.add_argument('--only-pool',
@@ -108,7 +117,7 @@ balancep.add_argument('--max-full-move-attempts', type=int, default=1,
 balancep.add_argument('--source-osds',
                       help="only consider these osds as movement source, separated by ','")
 
-pooldiffp = sp.add_parser('poolosddiff')
+pooldiffp = sp.add_parser('poolosddiff', parents=[statep])
 pooldiffp.add_argument('--pgstate', choices=['up', 'acting'], default="acting",
                        help="what pg set to take, up or acting (default acting).")
 pooldiffp.add_argument('pool1',
@@ -177,25 +186,62 @@ def pformatsize(size_bytes, commaplaces=1):
     return "%.1fB" % size_bytes
 
 
-# this is shitty: this whole script depends on these outputs,
-# but they might be inconsistent, if the cluster had changes
-# between calls....
-# it would be really nice if we could "start a transaction"
+# to detect if imported state files are outdated
+STATE_VERSION = 1
 
-# ceph pg dump always echoes "dumped all" on stderr, silence that.
-osd_dump = jsoncall("ceph osd dump --format json".split())
-pg_dump = jsoncall("ceph pg dump --format json".split(), swallow_stderr=True)
-osd_df_dump = jsoncall("ceph osd df --format json".split())
-osd_df_tree_dump = jsoncall("ceph osd df tree --format json".split())
-df_dump = jsoncall("ceph df detail --format json".split())
-pool_dump = jsoncall("ceph osd pool ls detail --format json".split())
-crush_dump = jsoncall("ceph osd crush dump --format json".split())
-crush_classes = jsoncall("ceph osd crush class ls --format json".split())
+# use cluster state from a file
+if args.mode != "gather" and args.state:
+    logging.info(f"loading cluster state from file {args.state}...")
+    with lzma.open(args.state) as hdl:
+        CLUSTER_STATE = json.load(hdl)
 
-# check if the osdmap version changed meanwhile
-# => we'd have inconsistent state
-if osd_dump['epoch'] != jsoncall("ceph osd dump --format json".split())['epoch']:
-    raise Exception("cluster topology changed during information gathering - wait for things to calm down and try again")
+    import_version = CLUSTER_STATE['stateversion']
+    if import_version != STATE_VERSION:
+        raise Exception(f"imported file stores state in version {import_version}, but we need {STATE_VERSION}")
+
+else:
+    logging.info(f"gathering cluster state via ceph api...")
+    # this is shitty: this whole script depends on these outputs,
+    # but they might be inconsistent, if the cluster had changes
+    # between calls....
+    # it would be really nice if we could "start a transaction"
+
+    # ceph pg dump always echoes "dumped all" on stderr, silence that.
+    CLUSTER_STATE = dict(
+        stateversion=STATE_VERSION,
+        timestamp=datetime.datetime.now().isoformat(),
+        versions=jsoncall("ceph versions --format=json".split()),
+        health_detail=jsoncall("ceph health detail --format=json".split()),
+        osd_dump=jsoncall("ceph osd dump --format json".split()),
+        pg_dump=jsoncall("ceph pg dump --format json".split(), swallow_stderr=True),
+        osd_df_dump=jsoncall("ceph osd df --format json".split()),
+        osd_df_tree_dump=jsoncall("ceph osd df tree --format json".split()),
+        df_dump=jsoncall("ceph df detail --format json".split()),
+        pool_dump=jsoncall("ceph osd pool ls detail --format json".split()),
+        crush_dump=jsoncall("ceph osd crush dump --format json".split()),
+        crush_class_osds=dict(),
+    )
+
+    crush_classes = jsoncall("ceph osd crush class ls --format json".split())
+    for crush_class in crush_classes:
+        class_osds = jsoncall(f"ceph osd crush class ls-osd {crush_class} --format json".split())
+        CLUSTER_STATE["crush_class_osds"][crush_class] = class_osds
+
+    # check if the osdmap version changed meanwhile
+    # => we'd have inconsistent state
+    if CLUSTER_STATE['osd_dump']['epoch'] != jsoncall("ceph osd dump --format json".split())['epoch']:
+        raise Exception("Cluster topology changed during information gathering (e.g. a pg changed state). "
+                        "Wait for things to calm down and try again")
+
+
+# to dump the state
+if args.mode == 'gather':
+    logging.info(f"cluster state dumped. now saving to {args.output_file}...")
+    with lzma.open(args.output_file, "wt") as hdl:
+        json.dump(CLUSTER_STATE, hdl, indent='\t')
+
+    logging.warn(f"cluster state saved to {args.output_file}")
+    exit(0)
 
 
 pools = dict()                        # poolid => props
@@ -208,8 +254,7 @@ maxpoolnamelen = 0
 maxcrushclasslen = 0
 
 
-for crush_class in crush_classes:
-    class_osds = jsoncall(f"ceph osd crush class ls-osd {crush_class} --format json".split())
+for crush_class, class_osds in CLUSTER_STATE["crush_class_osds"].items():
 
     crushclass_osds[crush_class].update(class_osds)
     for osdid in class_osds:
@@ -219,11 +264,11 @@ for crush_class in crush_classes:
         maxcrushclasslen = len(crush_class)
 
     # there's more stats, but raw is probably ok
-    class_df_stats = df_dump["stats_by_class"][crush_class]
+    class_df_stats = CLUSTER_STATE["df_dump"]["stats_by_class"][crush_class]
     crushclasses_usage[crush_class] = class_df_stats["total_used_raw_ratio"] * 100
 
 
-for pool in osd_dump["pools"]:
+for pool in CLUSTER_STATE["osd_dump"]["pools"]:
     id = pool["pool"]
     name = pool["pool_name"]
 
@@ -245,7 +290,7 @@ for pool in osd_dump["pools"]:
 # current crush placement overrides
 # map pgid -> [(from, to), ...]
 upmap_items = dict()
-for upmap_item in osd_dump["pg_upmap_items"]:
+for upmap_item in CLUSTER_STATE["osd_dump"]["pg_upmap_items"]:
     remaps = list()
     for remap in upmap_item["mappings"]:
         remaps.append((remap["from"], remap["to"]))
@@ -254,14 +299,14 @@ for upmap_item in osd_dump["pg_upmap_items"]:
 
 
 ec_profiles = dict()
-for ec_profile, ec_spec in osd_dump["erasure_code_profiles"].items():
+for ec_profile, ec_spec in CLUSTER_STATE["osd_dump"]["erasure_code_profiles"].items():
     ec_profiles[ec_profile] = {
         "data_chunks": int(ec_spec["k"]),
         "coding_chunks": int(ec_spec["m"]),
     }
 
 
-for pool in df_dump["pools"]:
+for pool in CLUSTER_STATE["df_dump"]["pools"]:
     id = pool["id"]
     pools[id].update({
         "stored": pool["stats"]["stored"],  # actually stored data
@@ -274,7 +319,7 @@ for pool in df_dump["pools"]:
     })
 
 
-for pool in pool_dump:
+for pool in CLUSTER_STATE["pool_dump"]:
     id = pool["pool_id"]
     ec_profile = pool["erasure_code_profile"]
 
@@ -290,7 +335,7 @@ for pool in pool_dump:
     })
 
 
-for rule in crush_dump["rules"]:
+for rule in CLUSTER_STATE["crush_dump"]["rules"]:
     id = rule['rule_id']
     name = rule['rule_name']
     steps = rule['steps']
@@ -377,7 +422,7 @@ osd_actions = defaultdict(lambda: defaultdict(dict))
 # pgid -> pg dump pgstats entry
 pgs = dict()
 
-for pginfo in pg_dump["pg_map"]["pg_stats"]:
+for pginfo in CLUSTER_STATE["pg_dump"]["pg_map"]["pg_stats"]:
     if pginfo["state"] in ("unknown",):
         # skip pgs with no active osds
         continue
@@ -410,7 +455,7 @@ for pginfo in pg_dump["pg_map"]["pg_stats"]:
 
 osds = dict()
 
-for osd in osd_df_dump["nodes"]:
+for osd in CLUSTER_STATE["osd_df_dump"]["nodes"]:
     id = osd["id"]
     osds[id] = {
         "device_size": osd["kb"] * 1024,
@@ -473,7 +518,7 @@ for osdid, osd in osd_mappings.items():
     })
 
 
-for osd in osd_dump["osds"]:
+for osd in CLUSTER_STATE["osd_dump"]["osds"]:
     osdid = osd["osd"]
     crushclass = osd_crushclass.get(osdid)
 
@@ -487,7 +532,7 @@ for osd in osd_dump["osds"]:
 
 
 # create the crush trees
-buckets = crush_dump["buckets"]
+buckets = CLUSTER_STATE["crush_dump"]["buckets"]
 
 # bucketid -> bucket dict
 bucket_ids_tmp = dict()
@@ -495,7 +540,7 @@ bucket_ids_tmp = dict()
 # all bucket ids of roots
 bucket_root_ids = list()
 
-for device in crush_dump["devices"]:
+for device in CLUSTER_STATE["crush_dump"]["devices"]:
     id = device["id"]
     assert id >= 0
     bucket_ids_tmp[id] = device
@@ -522,7 +567,7 @@ for bucket in buckets:
 
 
 # find osd host name
-for node in osd_df_tree_dump["nodes"]:
+for node in CLUSTER_STATE["osd_df_tree_dump"]["nodes"]:
     if node['type'] == "host":
         for osdid in node['children']:
             osds[osdid]["host_name"] = node['name']

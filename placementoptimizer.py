@@ -166,7 +166,7 @@ def jsoncall(cmd, swallow_stderr=False):
     return json.loads(rawdata.decode())
 
 
-def pprintsize(size_bytes, commaplaces=1):
+def pformatsize(size_bytes, commaplaces=1):
     prefixes = ((1, 'K'), (2, 'M'), (3, 'G'), (4, 'T'), (5, 'P'), (6, 'E'), (7, 'Z'))
     for exp, name in prefixes:
         if abs(size_bytes) >= 1024 ** exp and abs(size_bytes) < 1024 ** (exp + 1):
@@ -1251,7 +1251,7 @@ class PGMappings:
                 osd_fs_used -= get_pg_shardsize(pg)
 
             self.osd_utilizations[osdid] = osd_fs_used
-            logging.debug(strlazy(lambda: f"estimated {'osd.%s' % osdid: <8} usage: acting={pprintsize(osd['device_used'], 3)} up={pprintsize(osd_fs_used, 3)}"))
+            logging.debug(strlazy(lambda: f"estimated {'osd.%s' % osdid: <8} usage: acting={pformatsize(osd['device_used'], 3)} up={pformatsize(osd_fs_used, 3)}"))
 
     def apply_remap(self, pg, osd_from, osd_to):
         """
@@ -1392,7 +1392,7 @@ class PGMappings:
 
         used += add_size
 
-        # logging.debug(f"{osdid} {pprintsize(used)}/{pprintsize(osd_size)} = {used/osd_size * 100:.2f}%")
+        # logging.debug(f"{osdid} {pformatsize(used)}/{pformatsize(osd_size)} = {used/osd_size * 100:.2f}%")
 
         # make it relative
         used /= osd_size
@@ -1611,7 +1611,7 @@ class PGShardProps:
         return False
 
     def __str__(self):
-        return f"size={pprintsize(self.size)} remapped={self.remapped} upmaps={self.upmap_count}"
+        return f"size={pformatsize(self.size)} remapped={self.remapped} upmaps={self.upmap_count}"
 
 
 class PGCandidates:
@@ -1943,7 +1943,7 @@ if args.mode == 'balance':
                     logging.debug("SKIP pg %s since pool (%s) can't be balanced more", move_pg, pg_pool)
                     continue
 
-                logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pprintsize(move_pg_shardsize), osd_from)
+                logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
                 pool_pg_count_ideal = pg_mappings.pool_pg_count_ideal(pg_pool, try_pg_move.get_osd_candidates())
@@ -2106,7 +2106,7 @@ if args.mode == 'balance':
     print_osd_usages(osd_usages_asc)
     logging.info(80*"-")
     logging.info(f"generated {found_remap_count} remaps.")
-    logging.info(f"total movement size: {pprintsize(found_remap_size_sum)}.")
+    logging.info(f"total movement size: {pformatsize(found_remap_size_sum)}.")
     logging.info(80*"-")
     logging.info("old cluster variance per crushclass:")
     for crushclass, variance in init_cluster_variance.items():
@@ -2168,10 +2168,10 @@ elif args.mode == 'show':
             pg_num = poolprops['pg_num']
             stored_sum += poolprops['stored']
             used_sum += poolprops['used']
-            stored = pprintsize(poolprops['stored'])  # used data excl metadata
-            used = pprintsize(poolprops['used'])  # raw usage incl metastuff
-            avail = pprintsize(poolprops['store_avail'])
-            shard_size = pprintsize(poolprops['pg_shard_size_avg'])
+            stored = pformatsize(poolprops['stored'])  # used data excl metadata
+            used = pformatsize(poolprops['used'])  # raw usage incl metastuff
+            avail = pformatsize(poolprops['store_avail'])
+            shard_size = pformatsize(poolprops['pg_shard_size_avg'])
             rootweights_pp = ",".join(rootweights_ppl)
             print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7} {shard_size: >8} {crushruleid}:{crushrulename} {rootweights_pp: >12}")
 
@@ -2183,11 +2183,11 @@ elif args.mode == 'show':
                 crushclass_usage = f"{crushclasses_usage[crush_class]:.3f}%"
 
             print(f"{crushroot: <14}    {' ' * maxpoolnamelen} {' ' * 13} "
-                  f"{pprintsize(stored_sum_class[crushroot], 2): >7} "
-                  f"{pprintsize(used_sum_class[crushroot], 2): >7}"
+                  f"{pformatsize(stored_sum_class[crushroot], 2): >7} "
+                  f"{pformatsize(used_sum_class[crushroot], 2): >7}"
                   f"{crushclass_usage: >10}")
 
-        print(f"sum    {' ' * maxpoolnamelen} {' ' * 24} {pprintsize(stored_sum, 2): >7} {pprintsize(used_sum, 2): >7}")
+        print(f"sum    {' ' * maxpoolnamelen} {' ' * 24} {pformatsize(stored_sum, 2): >7} {pformatsize(used_sum, 2): >7}")
 
         if args.osds:
             if args.only_crushclass:
@@ -2298,7 +2298,7 @@ elif args.mode == 'show':
                 weight = "%.2f" % weight
 
                 pool_list_str = ' '.join(pool_overview)
-                print(f"{osdid: >6} {hostname: >10} {crushclass} {pprintsize(devsize): >7} {weight: >6} {pprintsize(cweight): >7} {util: >5} {pg_num: >6}  {pool_list_str}")
+                print(f"{osdid: >6} {hostname: >10} {crushclass} {pformatsize(devsize): >7} {weight: >6} {pformatsize(cweight): >7} {util: >5} {pg_num: >6}  {pool_list_str}")
 
     elif args.format == 'json':
         ret = {
@@ -2346,7 +2346,7 @@ elif args.mode == 'showremapped':
                 state = f"         {state:<8}"
 
             pg_move_size = get_pg_shardsize(pg)
-            pg_move_size_pp = pprintsize(pg_move_size)
+            pg_move_size_pp = pformatsize(pg_move_size)
 
             pg_move_status[pg] = {
                 "state": state,
@@ -2368,13 +2368,13 @@ elif args.mode == 'showremapped':
         for osdid, actions in osdlist:
             if osdid != -1:
                 osd_d_size = osds[osdid]['device_size']
-                osd_d_size_pp = pprintsize(osd_d_size, 2)
+                osd_d_size_pp = pformatsize(osd_d_size, 2)
 
                 osd_d_used = osds[osdid]['device_used']
-                osd_d_used_pp = pprintsize(osd_d_used, 2)
+                osd_d_used_pp = pformatsize(osd_d_used, 2)
 
                 osd_c_size = osds[osdid]['crush_weight'] * osds[osdid]['weight']
-                osd_c_size_pp = pprintsize(osd_c_size, 2)
+                osd_c_size_pp = pformatsize(osd_c_size, 2)
 
                 if osd_d_size == 0:
                     osd_d_fullness = 0
@@ -2399,9 +2399,9 @@ elif args.mode == 'showremapped':
             sum_data_to = sum((pg_move_status[pg]['size'] for pg in actions["to"].keys()))
             sum_data_from = sum((pg_move_status[pg]['size'] for pg in actions["from"].keys()))
             sum_data_delta = (sum_data_from - sum_data_to)
-            sum_data_to_pp = pprintsize(sum_data_to, 2)
-            sum_data_from_pp = pprintsize(sum_data_from, 2)
-            sum_data_delta_pp = pprintsize(sum_data_delta, 2)
+            sum_data_to_pp = pformatsize(sum_data_to, 2)
+            sum_data_from_pp = pformatsize(sum_data_from, 2)
+            sum_data_delta_pp = pformatsize(sum_data_delta, 2)
 
             print(f"{osdname}: {osds[osdid]['host_name']}  =>{sum_to} {sum_data_to_pp} <={sum_from} {sum_data_from_pp}"
                   f" (\N{Greek Capital Letter Delta}{sum_data_delta_pp}) {fullness}")

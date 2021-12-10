@@ -62,15 +62,18 @@ Because of this, the best possible solution is some OSDs having an offset of 1 P
 As a PG-distribution-optimization is done per pool, without checking other pool's distribution at all, some devices will be the `+1` more often than others.
 At worst one OSD is the `+1` **for each** pool in the cluster.
 
-This OSD is then then, for example, 80% full.
+This OSD can then end up, for example, being 80% full, since it is a `+1` for 20 times.
 The one that never is the `+1` is 50% full.
+That's bad and not balanced at all.
 
-That's bad.
-
-Additionally, the shard sizes of PGs are not equal - they shrink and grow with pool usage, whereas the PG count will remain exactly the same, so the balancer will do nothing.
+Additionally, the shard sizes of PGs are not equal - they shrink and grow with pool usage, whereas the PG count will remain exactly the same, which the mgr-balancer uses, so it does nothing.
 
 To make things worse, if there's a huge server in the cluster which is so big, CRUSH can't place data often enough on it to fill it to the same level as any other server, the balancer will fail moving PGs across servers that actually would have space.
-This happens since it sees only this server's OSDs as "underfull", but each PG has one shard on that server already, so no data can be moved on it.
+This happens since it sees only this server's OSDs as "underfull", but each PG has one shard on that server already, so no data can be moved on it. Even though there are likely other OSDs in the cluster (which may have variations from 90% to 50% full, and determine the available space because one of them is the fullest overall), these other OSDs are not balanced - the only considered balancing target is the big empty server.
+
+So we have two main issues:
+* If you have multiple bigger pools, the `+1`-PG placement does not consider the global view (i.e. where other pools place the +1 PGs)
+* If there's too-empty buckets (which can't be filled more because of crush constraints), other buckets are no longer balanced
 
 
 ### jj-balancer
@@ -93,25 +96,48 @@ If this is done forever, all OSDs will have very little utilization variance, or
 Simplified pseudocode:
 
 ```python
-while not found_enough_moves:
-    for i, from_osd in enumerate(osds_by_utilization_asc(crushroot)):
-        if i > 0:
-            finish('could not empty fullest device, stopping')
-        for pg in pgs_by_shardsize_on_osd(osd):
-            for to_osd in osds_by_utilization_desc(candidate_osds_for(pg)):
-                if is_crush_move_valid(pg, from_osd, to_osd):
-                    if utilization_variance_is_better(osds, pg, from_osd, to_osd):
-                        movements.append((pg, from_osd, to_osd))
-                        goto next_move
-    next_move:
+# given an osd we want to empty, which pg do we select?
+def get_pg_move_candidates(sourceosd):
+    def compare(pg, otherpg):
+        return (pg.remapped > otherpg.remapped or
+                pg.upmap_item_count < otherpg.upmap_item_count or
+                pg.size > otherpg.size)
+    return sort(pgs_on_osd(sourceosd), compare)
 
+try_limit = 1
+max_movements = 10
+while True:
+    next_move:
+    if len(movements) >= max_movements:
+        stop()
+
+    # try to empty the fullest osds
+    for i, from_osd in enumerate(osds_by_utilization_asc(crushroot)):
+        if i > try_limit:
+            finish('could not empty {try_limit} fullest devices, stopping')
+            stop()
+
+        # try a suitable PG to move it away from a full osd
+        for pg in get_pg_move_candidates(from_osd):
+            # move it to an empty osd
+            for to_osd in osds_by_utilization_desc(candidate_osds_for(pg)):
+
+                # only move if constraints allow it
+                if (is_crush_move_valid(pg, from_osd, to_osd) and
+                    respects_pool_balance(pg, from_osd, to_osd) and
+                    cluster_utilization_variance_is_better(pg, from_osd, to_osd)):
+
+                    movements.append((pg, from_osd, to_osd))
+                    goto next_move
+
+# resulting movements
 for movement in movements:
     print(f"ceph osd pg-upmap-items {generate_upmap(movement)}")
 ```
 
 Runtime:
 * Worst-case (the fullest OSD can't be emptied more): `O(OSDs * PGs)`
-* If, after that, we tried the second-to fullest, third, ..., it would be: `O(OSDs²*PGs)`
+* If, after that, we tried the second-to fullest, third, and all others, it would be: `O(OSDs²*PGs)`
 
 Likely this can be optimized further.
 

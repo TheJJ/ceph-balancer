@@ -3,7 +3,7 @@
 """
 Ceph balancer.
 
-(c) 2020-2021 Jonas Jelten <jj@sft.lol>
+(c) 2020-2022 Jonas Jelten <jj@sft.lol>
 GPLv3 or later
 """
 
@@ -843,7 +843,8 @@ class PGMoveChecker:
         """
         perform precalculations for moving this pg
         """
-        logging.debug(strlazy(lambda: f"prepare crush check for rule\n{pformat(self.rule)}"))
+        logging.debug(strlazy(lambda: f"prepare crush check for pg {self.pg} currently up={self.pg_osds}"))
+        logging.debug(strlazy(lambda: f"rule:\n{pformat(self.rule)}"))
 
         # ruledepth -> allowed number of bucket reuse
         reuses_per_step = []
@@ -897,11 +898,11 @@ class PGMoveChecker:
         #
         # Now: replace_osd 2
         #
-        # traces: x 2: [-9, -7, -1, 2]
-        #           4: [-9, -7, -2, 4]
-        #           7: [-9, -8, -4, 7]
-        #           9: [-9, -8, -5, 9]
-        #
+        # traces from root down to osd:
+        #   2: [-9, -7, -1, 2]
+        #   4: [-9, -7, -2, 4]
+        #   7: [-9, -8, -4, 7]
+        #   9: [-9, -8, -5, 9]
         #
         # use counts - per rule depth.
         #  {0: {-9: 4}, 1: {-7: 2, -8: 2}, 2: {-1: 1, -2: 1, -4: 1, -5: 1}}
@@ -925,14 +926,20 @@ class PGMoveChecker:
         # replacement candidates for 2: 1, 5, 6, 13 14 15 16
         #
 
-        # collect trace for each osd
-        tree_depth = 0
-        rule_depth = 0  # because we skip steps like chooseleaf_tries
-        rule_root_name = None
+        # did we encounter an emit?
+        emit = False
 
+        # collect trace for each osd.
         # osd -> crush-root-trace
         constraining_traces = dict()
-        emit = False
+
+        # how far down the crush hierarchy have we stepped
+        # 1 = root depth
+        tree_depth = 0
+
+        # at what rule position is our processing
+        # since we skip steps like set_chooseleaf_tries
+        rule_depth = 0
 
         # rule_depth -> tree_depth to next rule (what tree layer is this rule step)
         # because "choose" steps may skip layers in the crush hierarchy
@@ -945,7 +952,8 @@ class PGMoveChecker:
             if step["op"].startswith("set_"):
                 continue
 
-            logging.debug(strlazy(lambda: f"processing crush step {step} with tree_depth={tree_depth}, rule_depth={rule_depth}"))
+            logging.debug(strlazy(lambda: f"processing crush step {step} with tree_depth={tree_depth}, "
+                                          f"rule_depth={rule_depth}, item_uses={item_uses}"))
 
             if step["op"] == "take":
                 rule_root_name = step["item_name"]
@@ -991,8 +999,6 @@ class PGMoveChecker:
                 current_item_type = choose_type
 
             elif step["op"] == "emit":
-                emit = True
-
                 if current_item_type == "osd":
                     # if we're already at osd level, no need to search further down
                     for constraining_trace in constraining_traces.values():
@@ -1032,13 +1038,20 @@ class PGMoveChecker:
                 assert len(item_uses) == rule_depth
                 for idx, reuses in enumerate(reuses_per_step):
                     for item, uses in item_uses[idx].items():
-                        assert reuses == uses
+                        if reuses != uses:
+                            print(f"reuses: {reuses_per_step}")
+                            print(f"item_uses: {pformat(item_uses)}")
+                            print(f"constraining_traces: {pformat(constraining_traces)}")
+                            raise Exception(f"during emit, rule step {idx} item {item} was used {uses} != {reuses} expected")
 
                 # only one emit supported so far
-                break
+                if emit == True:
+                    raise Exception("multiple emits in crush rule not yet supported")
+
+                emit = True
 
             else:
-                pass
+                raise Exception(f"unknown crush operation encountered: {step['op']}")
 
         if not emit:
             raise Exception("uuh no emit seen?")
@@ -1052,7 +1065,8 @@ class PGMoveChecker:
                 if uses != reuses_per_step[i]:
                     print(f"reuses: {reuses_per_step}")
                     print(f"item_uses: {pformat(item_uses)}")
-                    raise Exception("counted item uses != crush item, in step {i}: "
+                    print(f"constraining_traces: {pformat(constraining_traces)}")
+                    raise Exception("final item uses != crush item, in step {i}: "
                                     f"{item}={uses} != {reuses_per_step[i]}")
 
         self.constraining_traces = constraining_traces  # osdid->crush-root-trace
@@ -1977,6 +1991,12 @@ if args.mode == 'balance':
             from_osd_satisfied_pools = set()
 
             # now try to move the candidates to their possible destination
+            # TODO: instead of having all candidates,
+            #       always get the "next" one from a "smart" iterator
+            #       there we can also feed in the current osd_usages_asc
+            #       in order to "optimize" candidates by "anticipating" "target" "osds" "."
+            #       even better, we can integrate the PGMoveChecker directly, and thus calculate
+            #       target OSD candidates _within_ the pg candidate generation.
             for move_pg_idx, move_pg in enumerate(pg_candidates.get_candidates()):
                 move_pg_shardsize = pg_candidates.get_size(move_pg)
                 if found_remap or force_finish:

@@ -709,14 +709,6 @@ def get_pg_shardsize(pgid):
     return shard_size
 
 
-def find_item_type(trace, item_type, rule_depth, item_uses):
-    for idx, item in enumerate(trace, start=1):
-        if item["type_name"] == item_type:
-            item_uses[rule_depth][item["id"]] += 1
-            return idx
-    return None
-
-
 def rule_for_pg(pg):
     """
     get the crush rule for a pg.
@@ -862,6 +854,21 @@ class PGMoveChecker:
         """
         return self.osd_candidates
 
+    @staticmethod
+    def use_item_type(trace, item_type, rule_depth, item_uses):
+        """
+        given a trace (part), walk forward, until a given item type is found.
+        increase its use.
+        """
+        for idx, item in enumerate(trace):
+            if item["type_name"] == item_type:
+                item_id = item["id"]
+                cur_item_uses = item_uses[rule_depth].get(item_id, 0)
+                cur_item_uses += 1
+                item_uses[rule_depth][item_id] = cur_item_uses
+                return idx
+        return None
+
     def prepare_crush_check(self):
         """
         perform precalculations for moving this pg
@@ -897,7 +904,7 @@ class PGMoveChecker:
 
         # for each depth, count how often items were used
         # rule_depth -> {itemid -> use count}
-        item_uses = defaultdict(lambda: defaultdict(lambda: 0))
+        item_uses = defaultdict(dict)
 
         # example: 2+2 ec -> size=4
         #
@@ -990,14 +997,18 @@ class PGMoveChecker:
 
                 for pg_osd in self.pg_osds:
                     trace = trace_crush_root(pg_osd, rule_root_name)
+                    logging.debug(strlazy(lambda: f"   trace for {pg_osd}: {trace}"))
                     if trace is None:
                         raise Exception(f"no trace found for {pg_osd} in {rule_root_name}")
                     constraining_traces[pg_osd] = trace
                     # the root was "used"
-                    item_uses[rule_depth][trace[0]["id"]] += 1
+                    root_id = trace[0]["id"]
+                    root_use = item_uses[rule_depth].setdefault(root_id, 0)
+                    root_use += 1
+                    item_uses[rule_depth][root_id] = root_use
 
                 rule_tree_depth[rule_depth] = 0
-                tree_depth = 1
+                tree_depth = 0
                 rule_depth += 1
                 current_item_type = rule_root_name
 
@@ -1010,7 +1021,7 @@ class PGMoveChecker:
                 # find the new tree_depth by looking how far we need to step for the choosen next bucket
 
                 for constraining_trace in constraining_traces.values():
-                    steps_taken = find_item_type(constraining_trace[tree_depth:], choose_type, rule_depth, item_uses)
+                    steps_taken = self.use_item_type(constraining_trace[tree_depth:], choose_type, rule_depth, item_uses)
                     if steps_taken is None:
                         raise Exception(f"could not find item type {choose_type} "
                                         f"requested by rule step {step}")
@@ -1022,38 +1033,15 @@ class PGMoveChecker:
                 current_item_type = choose_type
 
             elif step["op"] == "emit":
-                if current_item_type == "osd":
-                    # if we're already at osd level, no need to search further down
-                    for constraining_trace in constraining_traces.values():
-                        # we are already at the end of the trace since we're at osd level
-                        if len(constraining_trace) != tree_depth:
-                            raise Exception(f"when current item type is osd, "
-                                            f"trace length ({len(constraining_trace)}) "
-                                            f"must match tree_depth ({tree_depth:})!")
+                # we've not yet reached osd level, so step down further
+                for constraining_trace in constraining_traces.values():
+                    steps_taken = self.use_item_type(constraining_trace[tree_depth:], "osd", rule_depth, item_uses)
+                    if steps_taken is None:
+                        raise Exception(f"could not find trace steps down to osd"
+                                        f"requested by rule step {step}")
 
-                        steps_taken = find_item_type(constraining_trace[tree_depth - 1:], "osd", rule_depth, item_uses)
-
-                        if steps_taken is None:
-                            raise Exception(f"could not apply re-step down to osd "
-                                            f"when handling rule step {step}")
-                        if steps_taken != 1:
-                            raise Exception(f"re-step down to osd did not result in 1 step, "
-                                            f"took {steps_taken} when handling rule step {step}")
-
-                    rule_tree_depth[rule_depth] = tree_depth
-
-
-                else:
-                    # we've not yet reached osd level, so step down further
-                    for constraining_trace in constraining_traces.values():
-                        steps_taken = find_item_type(constraining_trace[tree_depth:], "osd", rule_depth, item_uses)
-                        if steps_taken is None:
-                            raise Exception(f"could not find trace steps down to osd"
-                                            f"requested by rule step {step}")
-
-                    rule_tree_depth[rule_depth] = tree_depth + steps_taken
-                    tree_depth += steps_taken
-
+                rule_tree_depth[rule_depth] = tree_depth + steps_taken
+                tree_depth += steps_taken
                 rule_depth += 1
 
                 # sanity checks lol
@@ -1097,6 +1085,8 @@ class PGMoveChecker:
         self.reuses_per_step = reuses_per_step  # rulestepid->allowed_item_reuses
         self.item_uses = item_uses  # rulestepid->{item->use_count}
 
+        logging.debug(strlazy(lambda: f"crush check preparation done: rule_tree_depth={rule_tree_depth} item_uses={item_uses}"))
+
     def is_move_valid(self, old_osd, new_osd):
         """
         verify that the given new osd does not violate the
@@ -1117,6 +1107,7 @@ class PGMoveChecker:
 
         # create trace for the replacement candidate
         new_trace = trace_crush_root(new_osd, old_osd_root)
+        logging.debug(strlazy(lambda: f"   trace for {new_osd}: {new_trace}"))
 
         if new_trace is None:
             # probably not a compatible device class
@@ -1127,8 +1118,8 @@ class PGMoveChecker:
         old_trace = self.constraining_traces[old_osd]
 
         overuse = False
-        for idx, tree_stepwidth in enumerate(self.rule_tree_depth):
-            use_max_allowed = self.reuses_per_step[idx]
+        for stepid, tree_stepwidth in self.rule_tree_depth.items():
+            use_max_allowed = self.reuses_per_step[stepid]
 
             # as we would remove the old osd trace,
             # the item would no longer be occupied in the new trace
@@ -1138,17 +1129,23 @@ class PGMoveChecker:
 
             # how often is new_item used now?
             # if not used at all, it's not in the dict.
-            uses = self.item_uses[idx].get(new_item, 0)
+            uses = self.item_uses[stepid].get(new_item, 0)
 
-            if old_item == new_item:
-                uses -= 1
+            # we wanna use the new item now.
+            # the use count doesn't increase when we already use the item on the current level
+            if old_item != new_item:
+                uses += 1
 
             # if we used it, it'd be violating crush
-            # (the +1 was 'optimized' by >= instead of >)
-            if uses >= use_max_allowed:
-                logging.debug(strlazy(lambda: f"   crush invalid: osd.{new_osd} violates item={new_item} x uses={uses+1} > max_allowed={use_max_allowed}"))
+            if uses > use_max_allowed:
+                logging.debug(strlazy(lambda: (f"   item reuse check fail: osd.{old_osd}@[{tree_stepwidth}]={old_item} -> "
+                                               f"osd.{new_osd}@[{tree_stepwidth}]={new_item} x uses={uses} > max_allowed={use_max_allowed}")))
                 overuse = True
                 break
+            else:
+                logging.debug(strlazy(lambda: (f"   item reuse check ok:   osd.{old_osd}@[{tree_stepwidth}]={old_item} -> "
+                                               f"osd.{new_osd}@[{tree_stepwidth}]={new_item} x uses={uses} <= max_allowed={use_max_allowed}")))
+
 
         return not overuse
 

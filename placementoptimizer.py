@@ -321,19 +321,33 @@ for pool in CLUSTER_STATE["df_dump"]["pools"]:
     })
 
 
+# definition from `struct pg_pool_t`:
+#  enum {
+#      TYPE_REPLICATED = 1,     // replication
+#      //TYPE_RAID4 = 2,   // raid4 (never implemented)
+#      TYPE_ERASURE = 3,      // erasure-coded
+#  };
+def pool_repl_type(typeid):
+    return {
+        1: "repl",
+        3: "ec",
+    }[typeid]
+
+
 for pool in CLUSTER_STATE["pool_dump"]:
     id = pool["pool_id"]
+    pool_type = pool_repl_type(pool["type"])
     ec_profile = pool["erasure_code_profile"]
 
     pg_shard_size_avg = pools[id]["stored"] / pools[id]["pg_num"]
 
-    if ec_profile:
+    if pool_type == "ec":
         pg_shard_size_avg /= ec_profiles[ec_profile]["data_chunks"]
 
     pools[id].update({
-        "erasure_code_profile": ec_profile,
-        "repl_type": "ec" if ec_profile else "repl",
-        "pg_shard_size_avg": pg_shard_size_avg
+        "erasure_code_profile": ec_profile if pool_type == "ec" else None,
+        "repl_type": pool_type,
+        "pg_shard_size_avg": pg_shard_size_avg,
     })
 
 

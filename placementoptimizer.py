@@ -125,6 +125,8 @@ pooldiffp.add_argument('pool1',
 pooldiffp.add_argument('pool2',
                        help="compare to this pool which osds are involved")
 
+sp.add_parser('repairstats', parents=[statep])
+
 args = cli.parse_args()
 
 
@@ -529,6 +531,13 @@ for osd in CLUSTER_STATE["osd_dump"]["osds"]:
         "state": tuple(osd["state"]),
         'crush_class': crushclass,
     })
+
+
+for osd_info in CLUSTER_STATE["pg_dump"]["pg_map"]["osd_stats"]:
+    osds[osd_info['osd']]['stats'] = osd_info
+
+osd_stats_sum = CLUSTER_STATE["pg_dump"]["pg_map"]["osd_stats_sum"]
+
 
 
 # create the crush trees
@@ -2517,6 +2526,12 @@ elif args.mode == 'poolosddiff':
     }
     pprint(ret)
 
+elif args.mode == 'repairstats':
+    print(f"repaired reads globally: {osd_stats_sum['num_shards_repaired']}")
+    for osdid, osdinfos in osds.items():
+        repairs = osdinfos["stats"]["num_shards_repaired"]
+        if repairs != 0:
+            print(f"repaired on {osdid:>6}: {repairs}")
 
 else:
     raise Exception(f"unknown args mode {args.mode}")

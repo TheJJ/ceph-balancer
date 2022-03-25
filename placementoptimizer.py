@@ -1867,7 +1867,12 @@ def get_cluster_variance(crushclasses, pg_mappings):
                 continue
             osd_usages.append(pg_mappings.get_osd_usage(osdid))
 
-        class_variance = statistics.variance(osd_usages)
+        if len(osd_usages) > 1:
+            class_variance = statistics.variance(osd_usages)
+        elif osd_usages:
+            class_variance = osd_usages[0]
+        else:
+            raise Exception("no osds in crushclass, but variance requested")
         variances[crushclass] = class_variance
 
     return variances

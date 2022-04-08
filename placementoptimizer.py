@@ -227,6 +227,8 @@ else:
     crush_classes = jsoncall("ceph osd crush class ls --format json".split())
     for crush_class in crush_classes:
         class_osds = jsoncall(f"ceph osd crush class ls-osd {crush_class} --format json".split())
+        if not class_osds:
+            continue
         CLUSTER_STATE["crush_class_osds"][crush_class] = class_osds
 
     # check if the osdmap version changed meanwhile
@@ -257,6 +259,8 @@ maxcrushclasslen = 0
 
 
 for crush_class, class_osds in CLUSTER_STATE["crush_class_osds"].items():
+    if not class_osds:
+        continue
 
     crushclass_osds[crush_class].update(class_osds)
     for osdid in class_osds:

@@ -912,11 +912,11 @@ class PGMoveChecker:
 
         # example: 2+2 ec -> size=4
         #
-        # root        __________-9______________________________
-        # rack: _____-7_______    _________-8_____        ___-10____
-        # host: -1    -2    -3    -4    -5      -6        -11     -12
-        # osd: 1 2 | 3 4 | 5 6 | 7 8 | 9 10 | 11 12 |   13 14 | 15 16
-        #        _     _         _     _
+        # root        __________-9____________________________
+        # rack: _____-7_______    _________-8_____      ___-10____
+        # host: -1    -2    -3    -4    -5      -6      -11     -12
+        # osd: 1 2 | 3 4 | 5 6 | 7 8 | 9 10 | 11 12 | 13 14 | 15 16
+        #        ^     ^         ^     ^
         #
         # take root
         # choose 2 racks
@@ -984,6 +984,7 @@ class PGMoveChecker:
         # gather item usages by evaluating the crush rules
         for step in self.rule["steps"]:
             if step["op"].startswith("set_"):
+                # skip rule configuration steps
                 continue
 
             logging.debug(strlazy(lambda: f"processing crush step {step} with tree_depth={tree_depth}, "
@@ -1001,7 +1002,7 @@ class PGMoveChecker:
 
                 for pg_osd in self.pg_osds:
                     trace = trace_crush_root(pg_osd, rule_root_name)
-                    logging.debug(strlazy(lambda: f"   trace for {pg_osd}: {trace}"))
+                    logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
                     if trace is None:
                         raise Exception(f"no trace found for {pg_osd} in {rule_root_name}")
                     constraining_traces[pg_osd] = trace

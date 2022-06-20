@@ -1672,8 +1672,11 @@ class PGShardProps:
         # [x] order pgs by size, from big to small
         # [ ] order pgs by pg's num_omap_bytes
         # [x] prefer pgs that are remapped (up != acting)
-        # [ ] prefer pgs that have a upmap item and could be removed (tricky - since we have to know destination OSD)
         # [x] prefer pgs that don't have upmaps already to minimize "distance" to crush mapping
+        # TODO: for those, change the move loops: loop src, loop dst, loop candidate pgs.
+        # [ ] prefer pgs that have a upmap item and could be removed (tricky - since we have to know destination OSD)
+        # [ ] prefer pgs that have optimal moves:
+        #     prefer if predicted_target_usage < (current_target_usage + source_usage)/2
         # [ ] prefer pgs whose upmap item uses the current osd as mapping target (-> so we don't add more items)
         # [ ] perfer pgs that have bad pool balance (i.e. their count on this osd doesn't match the expected one) (we enforce that constraint anyway, but we may never pick a pg from another pool that would be useful to balance)
         # [ ] only consider source/dest osds of a pg that was remapped, not any osd of the whole pg

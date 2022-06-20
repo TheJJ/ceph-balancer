@@ -202,10 +202,9 @@ So if you have any idea and suggestion how to improve things, please submit issu
 ## Contact
 
 If you have questions, suggestions, encounter any problem,
-please join our Matrix or IRC channel and ask!
+please join our chat and ask!
 
 * Matrix Chat: [`#sfttech:matrix.org`](https://matrix.to/#/#sfttech:matrix.org)
-* IRC Chat: [`libera.chat #sfttech`](https://web.libera.chat/#sfttech)
 
 Of course, create [issues](https://github.com/TheJJ/ceph-balancer/issues)
 and [pull requests](https://github.com/TheJJ/ceph-balancer/pulls).

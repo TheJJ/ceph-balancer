@@ -1663,7 +1663,7 @@ class PGShardProps:
         """
         the "least" pg props entry is the one we try first.
         """
-        # TODO: smarter selection of pg movement candiates
+        # TODO: smarter selection of pg movement candidates
         # [x] order pgs by size, from big to small
         # [ ] order pgs by pg's num_omap_bytes
         # [x] prefer pgs that are remapped (up != acting)
@@ -1699,7 +1699,7 @@ class PGShardProps:
 
 class PGCandidates:
     """
-    Generate movement candiates to empty the given osd.
+    Generate movement candidates to empty the given osd.
     """
 
     def get_properties(self, pgid):
@@ -2010,7 +2010,7 @@ if args.mode == 'balance':
 
             # these pgs are up on the source osd,
             # and are in the order of preference moving them away
-            # TODO: it would be great if we could already know the destination osd candiates here
+            # TODO: it would be great if we could already know the destination osd candidates here
             # for better pg candidate selection.
             pg_candidates = pg_mappings.get_pg_move_candidates(osd_from)
 

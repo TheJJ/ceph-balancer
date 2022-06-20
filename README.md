@@ -6,7 +6,7 @@ One mitigation is the [mgr balancer](https://docs.ceph.com/en/latest/rados/opera
 
 This is an alternative Ceph balancer implementation.
 * The upstream balancer optimizes for (weighted) equal number of PGs on each OSD for each pool.
-* This balancer optimizes for equal OSD storage utilization and PG placement accross all pools.
+* This balancer optimizes for equal OSD storage utilization and PG placement across all pools.
 
 For most clusters, the `mgr balancer` works well.
 For heterogeneous clusters with a lot of device and server capacity variance _and_ many pools, placement may be very bad - the reason this balancer was created.
@@ -25,15 +25,15 @@ The number of PGs is configured via the `pg_num` pool attribute.
 Hence, one PG roughly has size `pg_size = pool_size/pg_num`.
 
 PGs are placed on OSDs (a disk), using constraints defined via [CRUSH](https://docs.ceph.com/en/latest/rados/operations/crush-map/).
-Usually PGs are spread accross servers, so that when one server goes down, enough disks are in other servers so the data remains available.
+Usually PGs are spread across servers, so that when one server goes down, enough disks are in other servers so the data remains available.
 The number of OSDs for one PG is configured via the pools `size` property.
 
-There's two pool kinds: replica and [erasure coded](https://en.wikipedia.org/wiki/Erasure_code).
+There are two kind of pools: replica and [erasure coded](https://en.wikipedia.org/wiki/Erasure_code).
 
-The utilized space one one OSD is the sum of all PG shards that are stored on it.
-A PG shard is the data of one of the participarting OSDs in one PG.
+The utilized space on one OSD is the sum of all PG shards that are stored on it.
+A PG shard is the data of one of the participating OSDs in one PG.
 For replica-pools, the shard size equals `pg_size / pool_size` - one full copy.
-For ec-pools, the shard size equals `pg_size / (pool_size * k)`, k is the number of data chunks in the ec profile.
+For EC-pools, the shard size equals `pg_size / (pool_size * k)`, k is the number of data chunks in the EC profile.
 
 CRUSH organizes all the datacenters, racks, servers, OSDs in a tree structure.
 Each subtree usually has the weight of all the OSDs below it, and PGs are now distributed evenly, weighted by the sub-tree size at each tree level.
@@ -51,7 +51,7 @@ And the `mgr balancer` can't handle this.
 ### `mgr balancer`
 
 Ceph's included balancer optimizes by PG count on devices.
-It does so by analyzing each pool indepently, and then tries to move each pool's PGs so that each participating device has equal normalized PG counts.
+It does so by analyzing each pool independently, and then tries to move each pool's PGs so that each participating device has equal normalized PG counts.
 Normalized means placing double the PGs on a double-sized OSD.
 
 Example: Placing 600 PGs on a 2T and 4T OSD means each 1T gets `600PGs/(4T+2T) = 100PGs/T`, thus the 2T OSD gets 200PGs, the 4T OSD 600.
@@ -69,7 +69,7 @@ That's bad and not balanced at all.
 Additionally, the shard sizes of PGs are not equal - they shrink and grow with pool usage, whereas the PG count will remain exactly the same, which the mgr-balancer uses, so it does nothing.
 
 To make things worse, if there's a huge server in the cluster which is so big, CRUSH can't place data often enough on it to fill it to the same level as any other server, the balancer will fail moving PGs across servers that actually would have space.
-This happens since it sees only this server's OSDs as "underfull", but each PG has one shard on that server already, so no data can be moved on it. Even though there are likely other OSDs in the cluster (which may have variations from 90% to 50% full, and determine the available space because one of them is the fullest overall), these other OSDs are not balanced - the only considered balancing target is the big empty server.
+This happens since it sees only this server's OSDs as "underfull", but each PG has one shard on that server already, so no data can be moved to it. Even though there are likely other OSDs in the cluster (which may have variations from 90% to 50% full, and determine the available space because one of them is the fullest overall), these other OSDs are not balanced - the only considered balancing target is the big empty server.
 
 So we have two main issues:
 * If you have multiple bigger pools, the `+1`-PG placement does not consider the global view (i.e. where other pools place the +1 PGs)
@@ -81,22 +81,22 @@ So we have two main issues:
 To solve this, the main optimization goal is equal OSD utilization:
 
 Generate candidate PG movements and validate them against the crush constraints, PG counts, utilization estimations, ...
-To get PG candiates, order all OSDs by utilization (optionally only for one crush root).
+To get PG candidates, order all OSDs by utilization (optionally only for one crush root).
 Utilization is estimated from all PGs where the OSD is in the `up` set (due to ongoing partial PG transfers).
 From the fullest OSD, try to move a "suitable" PG shard on it to the least-utilized OSD.
 If this violates constraints, try the next least-utilized OSD, and so on, or try a different PG.
 
-Once a suitable OSD is found, check if the new placment decreases the cluster utilization variance.
+Once a suitable OSD is found, check if the new placement decreases the cluster utilization variance.
 If this is the case, record the PG movement and try to move another PG with the same approach.
 
 That way the balancer generates new "upmap items", i.e. movement instructions for a PG from some OSDs to better ones, which you can apply if you're satisfied with the results.
 
 If this is done forever, all OSDs will have very little utilization variance, or CRUSH constraints prevent us from doing more PG movements.
 
-Simplified pseudocode:
+Simplified pseudo code:
 
 ```python
-# given an osd we want to empty, which pg do we select?
+# given an OSD we want to empty, which pg do we select?
 def get_pg_move_candidates(sourceosd):
     def compare(pg, otherpg):
         return (pg.remapped > otherpg.remapped or
@@ -111,7 +111,7 @@ while True:
     if len(movements) >= max_movements:
         stop()
 
-    # try to empty the fullest osds
+    # try to empty the fullest OSDs
     for i, from_osd in enumerate(osds_by_utilization_asc(crushroot)):
         if i > try_limit:
             finish('could not empty {try_limit} fullest devices, stopping')

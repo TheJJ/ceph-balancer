@@ -1052,13 +1052,15 @@ class PGMoveChecker:
                 # sanity checks lol
                 assert len(rule_tree_depth) == rule_depth
                 assert len(item_uses) == rule_depth
-                for idx, reuses in enumerate(reuses_per_step):
+                for idx, step_reuses in enumerate(reuses_per_step):
                     for item, uses in item_uses[idx].items():
-                        if reuses != uses:
+                        # uses may be <= since crush rules can emit more osds than the pool size needs
+                        if uses > step_reuses:
+                            print(f"rule:\n{pformat(self.rule)}")
                             print(f"reuses: {reuses_per_step}")
                             print(f"item_uses: {pformat(item_uses)}")
                             print(f"constraining_traces: {pformat(constraining_traces)}")
-                            raise Exception(f"during emit, rule step {idx} item {item} was used {uses} != {reuses} expected")
+                            raise Exception(f"during emit, rule step {idx} item {item} was used {uses} > {step_reuses} expected")
 
                 # only one emit supported so far
                 if emit == True:
@@ -1075,15 +1077,8 @@ class PGMoveChecker:
         if not constraining_traces:
             raise Exception("no tree traces gathered?")
 
-        # validate item uses:
-        for i in range(rule_depth):
-            for item, uses in item_uses[i].items():
-                if uses != reuses_per_step[i]:
-                    print(f"reuses: {reuses_per_step}")
-                    print(f"item_uses: {pformat(item_uses)}")
-                    print(f"constraining_traces: {pformat(constraining_traces)}")
-                    raise Exception("final item uses != crush item, in step {i}: "
-                                    f"{item}={uses} != {reuses_per_step[i]}")
+        assert len(rule_tree_depth) == rule_depth
+        assert len(item_uses) == rule_depth
 
         self.constraining_traces = constraining_traces  # osdid->crush-root-trace
         self.rule_tree_depth = rule_tree_depth  # rulestepid->tree_depth

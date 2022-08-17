@@ -127,6 +127,8 @@ pooldiffp.add_argument('pool2',
 
 sp.add_parser('repairstats', parents=[statep])
 
+stopbackfillsp = sp.add_parser("stopbackfills", parents=[statep])
+
 args = cli.parse_args()
 
 
@@ -2551,6 +2553,44 @@ elif args.mode == 'repairstats':
         repairs = osdinfos["stats"]["num_shards_repaired"]
         if repairs != 0:
             print(f"repaired on {osdid:>6}: {repairs}")
+
+elif args.mode == 'stopbackfills':
+    active_backfill = []
+    waiting_backfill= []
+
+    for pg, pginfo in pgs.items():
+        pgstate = pginfo["state"].split("+")
+        moves_backward = {}
+        if "remapped" in pgstate:
+            moves_backward = {(osd_to[0],osd_from[0]) for osd_from,osd_to in get_remaps(pginfo)}
+            moves_backward = moves_backward.union(set(upmap_items.get(pg, {})))
+
+            if "backfilling" in pgstate:
+                active_backfill.append(
+                    "ceph osd pg-upmap-items %s %s"
+                    %(
+                        pg,
+                        " ".join(f"{x} {y}" for x,y in moves_backward),
+                    )
+                )
+            elif "backfill_wait" in pgstate:
+                waiting_backfill.append(
+                    "ceph osd pg-upmap-items %s %s"
+                    %(
+                        pg,
+                        " ".join(f"{x} {y}" for x,y in moves_backward),
+                    )
+                )
+
+    if active_backfill:
+        print("----  ACTIVE  ----")
+        for item in active_backfill:
+            print(item)
+
+    if waiting_backfill:
+        print("----  WAIT  ----")
+        for item in waiting_backfill:
+            print(item)
 
 else:
     raise Exception(f"unknown args mode {args.mode}")

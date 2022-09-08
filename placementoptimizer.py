@@ -722,11 +722,15 @@ def bucket_fill(id, bucket_info, parent_id=None):
 
         else:
             # it's a device
+            if "class" in child:
+               dev_class = child["class"]
+            else:
+               dev_class = ""
             new_node = {
                 "id": cid,
                 "name": child["name"],
                 "type_name": "osd",
-                "class": child["class"],
+                "class": dev_class,
                 "parent": id,
             }
             ids[cid] = new_node
@@ -2000,8 +2004,8 @@ class ClusterState:
             osdid = osd["osd"]
             # is None when crushclass is not known
             crushclass = self.osd_crushclass.get(osdid)
-            if crushclass is None and osd["weight"] > 0:
-                raise Exception(f"crushclass for osd.{osdid} unknown but weight is > 0")
+            #if crushclass is None and osd["weight"] > 0:
+            #    raise Exception(f"crushclass for osd.{osdid} unknown but weight is > 0")
 
             self.osds[osdid].update({
                 "weight": osd["weight"],

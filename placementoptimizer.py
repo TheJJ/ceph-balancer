@@ -632,11 +632,15 @@ def bucket_fill(id, parent_id=None):
 
         else:
             # it's a device
+            if "class" in child:
+               dev_class = child["class"]
+            else:
+               dev_class = ""
             new_node = {
                 "id": cid,
                 "name": child["name"],
                 "type_name": "osd",
-                "class": child["class"],
+                "class": dev_class,
                 "parent": id,
             }
             ids[cid] = new_node

@@ -627,7 +627,7 @@ def bucket_fill(id, parent_id=None):
                 "id": cid,
                 "name": child["name"],
                 "type_name": "osd",
-                "class": child["class"],
+                "class": child.get("class", "?"),
                 "parent": id,
             }
             ids[cid] = new_node

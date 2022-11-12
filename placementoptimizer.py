@@ -368,15 +368,6 @@ for rule in CLUSTER_STATE["crush_dump"]["rules"]:
     }
 
 
-def list_replace(iterator, search, replace):
-    ret = list()
-    for elem in iterator:
-        if elem == search:
-            elem = replace
-        ret.append(elem)
-    return ret
-
-
 def pool_from_pg(pg):
     return int(pg.split(".")[0])
 
@@ -402,8 +393,6 @@ def get_remaps(pginfo):
 
     return [((osd_from, ...), (osd_to, ..)), ...]
     """
-    up_osds = list_replace(pginfo["up"], 0x7fffffff, -1)
-    acting_osds = list_replace(pginfo["acting"], 0x7fffffff, -1)
 
     is_ec = pg_is_ec(pginfo["pgid"])
 
@@ -472,6 +461,8 @@ for pginfo in CLUSTER_STATE["pg_dump"]["pg_map"]["pg_stats"]:
                 osd_actions[osd_from]["to"][pgid] = osd_to
                 osd_actions[osd_to]["from"][pgid] = osd_from
 
+    for repl in ("up", "acting"):
+        pginfo[repl] = [-1 if idx == 0x7fffffff else idx for idx in pginfo[repl]]
     pgs[pgid] = pginfo
 
 

@@ -867,7 +867,7 @@ class PGMoveChecker:
                 self.osd_candidates[root_name].add(osdid)
 
         self.pg_mappings = pg_mappings  # current pg->[osd] mapping state
-        self.pg_osds = pg_mappings.get_mapping(move_pg)  # acting osds managing this pg
+        self.pg_osds = pg_mappings.get_mapping(move_pg)  # "up" osds managing this pg
 
     def get_osd_candidates(self, source_osd):
         """

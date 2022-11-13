@@ -722,7 +722,7 @@ def root_uses_from_rule(rule, pool_size):
     rule: crush rule id
     pool_size: number of osds in one pg
 
-    return {root_name: choice_count} for the given crush rule.
+    return [(root_name, choice_count), ...} for the given crush rule.
 
     the choose-step nums are processed in order:
     val ==0: remaining_pool_size
@@ -732,7 +732,7 @@ def root_uses_from_rule(rule, pool_size):
     chosen = 0
 
     # rootname -> number of chooses for this root
-    root_usages = defaultdict(int)
+    root_usages = list()
 
     root_candidate = None
     root_chosen = None
@@ -762,7 +762,7 @@ def root_uses_from_rule(rule, pool_size):
                 if root_use_num > pool_size - chosen:
                     root_use_num = pool_size - chosen
 
-                root_usages[root_chosen] += root_use_num
+                root_usages.append((root_chosen, root_use_num))
                 chosen += root_use_num
                 root_candidate = None
                 root_chosen = None
@@ -776,6 +776,19 @@ def root_uses_from_rule(rule, pool_size):
     return root_usages
 
 
+def root_uses_from_rule_sum(rule, pool_size):
+    """
+    given crush rule and pool size (how many osds are needed through that rule),
+    get the names and overall usage sum of the crush roots holding the osds.
+    """
+    root_usages = root_uses_from_rule(rule, pool_size)
+    root_use_sum = defaultdict(int)
+    for root, uses in root_usages:
+        root_use_sum[root] += uses
+
+    return root_use_sum
+
+
 def rootweights_from_rule(rule, pool_size):
     """
     given a crush rule and a pool size (involved osds in a pg),
@@ -786,8 +799,8 @@ def rootweights_from_rule(rule, pool_size):
     # normalize the weights:
     weight_sum = sum(root_usages.values())
 
-    # TODO: handle `default` root
-    #       -> distribute it to the other involved roots
+    # TODO: handle `default` root (without explicit class)
+    #       -> distribute it to the class-specific involved roots
 
     root_weights = dict()
     for root_name, root_usage in root_usages.items():
@@ -835,23 +848,39 @@ class PGMoveChecker:
         self.pool_size = self.pool["size"]
         self.rule = crushrules[self.pool['crush_rule']]
 
-        # crush root name for the pg
-        self.root_names = root_uses_from_rule(self.rule, self.pool_size).keys()
+        # crush [(root name, number of uses), ...] for the pg
+        self.root_usages = root_uses_from_rule(self.rule, self.pool_size)
+        # for each osd in this pg, the crush root it belongs to
+        # used to find the osd's root quickly
+        # (see `get_osd_candidates`)
+        self.root_names = list()
 
         # all available placement osds for this crush root
-        self.osd_candidates = set()
-        for root_name in self.root_names:
+        # rootid -> {osd_candidate, ...}
+        self.osd_candidates = defaultdict(set)
+        for root_name, usages in self.root_usages:
+            # record which root the osd belongs to
+            for _ in range(usages):
+                self.root_names.append(root_name)
+
             for osdid in candidates_for_root(root_name):
-                self.osd_candidates.add(osdid)
+                self.osd_candidates[root_name].add(osdid)
 
         self.pg_mappings = pg_mappings  # current pg->[osd] mapping state
         self.pg_osds = pg_mappings.get_mapping(move_pg)  # acting osds managing this pg
 
-    def get_osd_candidates(self):
+    def get_osd_candidates(self, source_osd):
         """
-        return all possible candidate OSDs for the PG to relocate.
+        return all possible candidate OSDs for the PG to relocate from a given osd.
         """
-        return self.osd_candidates
+        # index of source osd in pg
+        pg_osd_idx = self.pg_osds.index(source_osd)
+
+        # get which root it belongs to
+        root_name = self.root_names[pg_osd_idx]
+
+        # and for that root, get the candidates
+        return self.osd_candidates[root_name]
 
     @staticmethod
     def use_item_type(trace, item_type, rule_depth, item_uses):
@@ -913,7 +942,8 @@ class PGMoveChecker:
         # osd: 1 2 | 3 4 | 5 6 | 7 8 | 9 10 | 11 12 | 13 14 | 15 16
         #        ^     ^         ^     ^
         #
-        # take root
+        # take root (for re-uses, it doesn't matter if there's multiple roots
+        #            because only uses in the lower levels (rack, ...) are important)
         # choose 2 racks
         # chooseleaf 2 hosts
         #
@@ -974,8 +1004,6 @@ class PGMoveChecker:
         # because "choose" steps may skip layers in the crush hierarchy
         rule_tree_depth = dict()
 
-        current_item_type = None
-
         # gather item usages by evaluating the crush rules
         for step in self.rule["steps"]:
             if step["op"].startswith("set_"):
@@ -988,14 +1016,15 @@ class PGMoveChecker:
             if step["op"] == "take":
                 rule_root_name = step["item_name"]
 
-                # should be known already since we fetch it the exact same way
-                assert rule_root_name in self.root_names
-
                 # first step: try to find tracebacks for all osds that ends up in this root.
                 # we collect root-traces of all acting osds of the pg we wanna check for.
                 constraining_traces = dict()
 
-                for pg_osd in self.pg_osds:
+                for idx, pg_osd in enumerate(self.pg_osds):
+                    # only record traces for osds in the currently requested crush root
+                    if self.root_names[idx] != rule_root_name:
+                        continue
+
                     trace = trace_crush_root(pg_osd, rule_root_name)
                     logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
                     if trace is None:
@@ -1010,7 +1039,6 @@ class PGMoveChecker:
                 rule_tree_depth[rule_depth] = 0
                 tree_depth = 0
                 rule_depth += 1
-                current_item_type = rule_root_name
 
             elif step["op"].startswith("choose"):
                 if not constraining_traces:
@@ -1030,7 +1058,6 @@ class PGMoveChecker:
                 rule_tree_depth[rule_depth] = tree_depth + steps_taken
                 tree_depth += steps_taken
                 rule_depth += 1
-                current_item_type = choose_type
 
             elif step["op"] == "emit":
                 # we've not yet reached osd level, so step down further
@@ -1088,17 +1115,15 @@ class PGMoveChecker:
         crush rules' constraints of placement.
         """
         if new_osd in self.pg_osds:
-            logging.debug(strlazy(lambda: f"   crush invalid: osd.{new_osd} in {self.pg_osds}"))
+            logging.debug(strlazy(lambda: f"   crush invalid: osd.{new_osd} in current up set of {self.pg_osds}"))
             return False
 
-        if new_osd not in self.osd_candidates:
+        # get the root for the old (source) osd
+        old_osd_root = self.root_names[self.pg_osds.index(old_osd)]
+
+        if new_osd not in self.osd_candidates[old_osd_root]:
             logging.debug(strlazy(lambda: f"   crush invalid: osd.{new_osd} not in same crush root"))
             return False
-
-        # TODO: figure out the crush root for the old_osd, and use it for new_osd too
-        # for now, just assume there's only one root per rule...
-        assert len(self.root_names) == 1
-        old_osd_root = next(iter(self.root_names))
 
         # create trace for the replacement candidate
         new_trace = trace_crush_root(new_osd, old_osd_root)
@@ -1131,7 +1156,7 @@ class PGMoveChecker:
             if old_item != new_item:
                 uses += 1
 
-            # if we used it, it'd be violating crush
+            # if we used more than allowed, that would violate the crush constraint
             if uses > use_max_allowed:
                 logging.debug(strlazy(lambda: (f"   item reuse check fail: osd.{old_osd}@[{tree_stepwidth}]={old_item} -> "
                                                f"osd.{new_osd}@[{tree_stepwidth}]={new_item} x uses={uses} > max_allowed={use_max_allowed}")))
@@ -1156,31 +1181,43 @@ class PGMoveChecker:
         if osd_from or osd_to:
             pg_shardsize = get_pg_shardsize(self.pg)
 
-        osds_used = list()
-        for osd in self.osd_candidates:
-            delta = 0
-            if osd == osd_from:
-                delta = -pg_shardsize
-            elif osd == osd_to:
-                delta = pg_shardsize
+        root_variances = dict()
+        for root_name, root_osds in self.osd_candidates.items():
+            osds_used = list()
+            for osd in root_osds:
+                delta = 0
+                if osd == osd_from:
+                    delta = -pg_shardsize
+                elif osd == osd_to:
+                    delta = pg_shardsize
 
-            if osds[osd]['weight'] == 0 or osds[osd]['crush_weight'] == 0:
-                # relative usage of weight 0 is impossible
-                continue
+                if osds[osd]['weight'] == 0 or osds[osd]['crush_weight'] == 0:
+                    # relative usage of weight 0 is impossible
+                    continue
 
-            osd_used = self.pg_mappings.get_osd_usage(osd, add_size=delta)
-            osds_used.append(osd_used)
+                osd_used = self.pg_mappings.get_osd_usage(osd, add_size=delta)
+                osds_used.append(osd_used)
 
-        var = statistics.variance(osds_used)
-        return var
+            # variance for this crush root
+            if len(osds_used) > 1:
+                root_var = statistics.variance(osds_used)
+            else:
+                root_var = 0
+            root_variances[root_name] = root_var
 
-    def filter_candidates(self, osdids):
+        # add the variances - if we do a move within one device class
+        # only that sum component will change.
+        return sum(root_variances.values())
+
+    def filter_candidates(self, src_osd, osdids):
         """
         given an iterator of osd ids, return only those
         entries that are in the same crush root
         """
+        root_name = self.root_names[self.pg_osds.index(src_osd)]
+
         for osdid in osdids:
-            if osdid not in self.osd_candidates:
+            if osdid not in self.osd_candidates[root_name]:
                 continue
             yield osdid
 
@@ -1190,14 +1227,19 @@ class PGMappings:
     PG mapping simulator
     used to calculate device usage when moving around pgs.
     """
-    def __init__(self, pgs, osds, osd_candidates):
+    def __init__(self, pgs, osds, enabled_crushclasses):
 
         # the "real" devices, just used for their "fixed" properties like
         # device size
         self.osds = osds
 
         # all possible osd candidates where we can map to (due to crush class)
-        self.osd_candidates = osd_candidates
+        # filter them by weight, and remove weight=0
+        self.osd_candidates = set()
+        for crushclass in enabled_crushclasses:
+            class_osds = crushclass_osds[crushclass]
+            available_osds = {osd for osd in class_osds if (osds[osd]['weight'] != 0 and osds[osd]['crush_weight'] != 0)}
+            self.osd_candidates |= available_osds
 
         # up state: osdid -> {pg, ...}
         self.osd_pgs_up = defaultdict(set)
@@ -1902,18 +1944,11 @@ if args.mode == 'balance':
             pool = pools[poolid]
             pool_size = pool['size']
             pool_crushrule = crushrules[pool['crush_rule']]
-            for root_name in root_uses_from_rule(pool_crushrule, pool_size).keys():
+            for root_name in root_uses_from_rule_sum(pool_crushrule, pool_size).keys():
                 enabled_crushclasses |= {osds[osdid]['crush_class'] for osdid in candidates_for_root(root_name)}
 
-    osd_candidates = set()
-    for crushclass in enabled_crushclasses:
-        osd_candidates |= crushclass_osds[crushclass]
-
-    # filter osd candidates by weight, and remove weight=0
-    osd_candidates = {osd for osd in osd_candidates if (osds[osd]['weight'] != 0 and osds[osd]['crush_weight'] != 0)}
-
     # we'll do all the optimizations in this mapping state
-    pg_mappings = PGMappings(pgs, osds, osd_candidates)
+    pg_mappings = PGMappings(pgs, osds, enabled_crushclasses)
 
     # to restrict source osds
     source_osds = None
@@ -2038,7 +2073,7 @@ if args.mode == 'balance':
                 logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
-                pool_pg_count_ideal = pg_mappings.pool_pg_count_ideal(pg_pool, try_pg_move.get_osd_candidates())
+                pool_pg_count_ideal = pg_mappings.pool_pg_count_ideal(pg_pool, try_pg_move.get_osd_candidates(osd_from))
                 from_osd_pg_count_ideal = pool_pg_count_ideal * pg_mappings.get_osd_size(osd_from)
 
                 # only move the pg if the source osd has more PGs of the pool than average
@@ -2056,7 +2091,7 @@ if args.mode == 'balance':
 
                 # pre-filter PGs to rule out those that will for sure not gain any space
                 pg_small_enough = False
-                for osd_to in try_pg_move.get_osd_candidates():
+                for osd_to in try_pg_move.get_osd_candidates(osd_from):
                     target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
 
                     # check if the target osd will be used less than the source
@@ -2077,7 +2112,8 @@ if args.mode == 'balance':
                 variance_before = try_pg_move.get_placement_variance()
 
                 # try the least full osd that's allowed by crush
-                to_candidates = list(try_pg_move.filter_candidates(osd[0] for osd in osd_usages_asc))
+                to_candidates = list(try_pg_move.filter_candidates(osd_from, (osd[0] for osd in osd_usages_asc)))
+
                 for osd_to_idx, osd_to in enumerate(to_candidates):
                     logging.debug("TRY-1 move %s osd.%s => osd.%s (%s/%s)", move_pg, osd_from, osd_to, osd_to_idx+1, len(to_candidates))
 
@@ -2185,6 +2221,9 @@ if args.mode == 'balance':
                     # TODO: calculate this though the PGMappings remaps
                     found_remap_size_sum += move_pg_shardsize
                     break
+
+                else:
+                    logging.debug(" BAD => no movement destination candidates")
 
                 if not found_remap:
                     # we tried all osds to place this pg,

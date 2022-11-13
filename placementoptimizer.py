@@ -395,6 +395,8 @@ def get_remaps(pginfo):
     """
 
     is_ec = pg_is_ec(pginfo["pgid"])
+    up_osds = pginfo["up"]
+    acting_osds = pginfo["acting"]
 
     moves = list()
     if is_ec:

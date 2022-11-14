@@ -109,6 +109,11 @@ balancep.add_argument('--ensure-optimal-moves', action='store_true',
                       help='make sure that only movements which win full shardsizes are done')
 balancep.add_argument('--ensure-variance-decrease', action='store_true',
                       help='make sure that only movements which decrease the fill rate variance are performed')
+balancep.add_argument('--allow-move-below-target-pgcount', action='store_true',
+                      help=("don't enforce keeping PGs on OSDs when that would leave "
+                            "fewer PGs than targeted on the OSD. If this is enabled, "
+                            "the mgr balancer will fill the OSD again with another PG (of the same pool) "
+                            "from somewhere else. this unlocks even more balancing possibilities."))
 balancep.add_argument('--osdsize', choices=['device', 'weighted', 'crush'], default="crush",
                       help="what parameter to take for determining the osd size. weighted=devsize*weight, crush=crushweight*weight")
 balancep.add_argument('--max-full-move-attempts', type=int, default=1,
@@ -2031,6 +2036,8 @@ if args.mode == 'balance':
                 logging.info(f"in descending full-order, couldn't empty osd.{last_attempt}, so we're done. "
                              f"if you want to try more often, set --max-full-move-attempts=$nr, this may unlock "
                              f"more balancing possibilities.")
+                logging.info(f"alternatively, --allow-move-below-target-pgcount also unlocks more "
+                             f"but the mgr-balancer may fill up these movements and make things worse again.")
                 force_finish = True
                 continue
 
@@ -2079,14 +2086,14 @@ if args.mode == 'balance':
                 # only move the pg if the source osd has more PGs of the pool than average
                 # otherwise the regular balancer will fill this OSD again
                 # with another PG (of the same pool) from somewhere
-                if from_osd_pg_count[pg_pool] <= from_osd_pg_count_ideal:
+                if not args.allow_move_below_target_pgcount and from_osd_pg_count[pg_pool] <= from_osd_pg_count_ideal:
                     from_osd_satisfied_pools.add(pg_pool)
                     logging.debug("  BAD => skipping pg %s since source osd.%s "
-                                  "doesn't have too many of pool=%s (%s <= %s)",
+                                  "doesn't have too many of pool=%s (%s <= %.4f)",
                                   move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
                     continue
                 logging.debug("  OK => taking pg %s from source osd.%s "
-                              "since it has too many of pool=%s (%s > %s)",
+                              "since it has too many of pool=%s (%s > %.4f)",
                               move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
 
                 # pre-filter PGs to rule out those that will for sure not gain any space

@@ -887,6 +887,54 @@ class PGMoveChecker:
         # and for that root, get the candidates
         return self.osd_candidates[root_name]
 
+    def max_item_reuses(self):
+        """
+        calculate how the items in the crush tree can be reused
+        by the given crush rule.
+
+        return [reuses_for_step, ...]
+
+        for example:
+        - hierarchy: root - host - osd
+        - take ssd choose 1 host class ssd
+        - take hdd choose 2 host class hdd
+
+        results in:
+        [1, 1, 1, 2, 1, 1]
+         ^        ^
+         |        second take
+         +-- first take
+        """
+
+        fanout_cum = 1
+        reuses_per_step = list()
+
+        # calculate how often one bucket layer can be reused
+        # this is the crush-constraint, set up by the rule
+        for step in reversed(self.rule["steps"]):
+            if step["op"] == "take":
+                num = 1
+                # we don't care about the root name,
+                # since the list position determines the per-root max reuses
+                # (for each root there's a separate sub-list to validate against)
+            elif step["op"].startswith("choose"):
+                num = step["num"]
+            elif step["op"] == "emit":
+                num = 1
+                fanout_cum = 1
+            else:
+                continue
+
+            reuses_per_step.append(fanout_cum)
+
+            if num <= 0:
+                num += self.pool_size
+
+            fanout_cum *= num
+        reuses_per_step.reverse()
+
+        return reuses_per_step
+
     @staticmethod
     def use_item_type(trace, item_type, rule_depth, item_uses):
         """
@@ -909,36 +957,6 @@ class PGMoveChecker:
         logging.debug(strlazy(lambda: f"prepare crush check for pg {self.pg} currently up={self.pg_osds}"))
         logging.debug(strlazy(lambda: f"rule:\n{pformat(self.rule)}"))
 
-        # ruledepth -> allowed number of bucket reuse
-        reuses_per_step = []
-        fanout_cum = 1
-
-        # calculate how often one bucket layer can be reused
-        # this is the crush-constraint, set up by the rule
-        for step in reversed(self.rule["steps"]):
-            if step["op"] == "take":
-                num = 1
-            elif step["op"].startswith("choose"):
-                num = step["num"]
-            elif step["op"] == "emit":
-                num = 1
-            else:
-                continue
-
-            reuses_per_step.append(fanout_cum)
-
-            if num <= 0:
-                num += self.pool_size
-
-            fanout_cum *= num
-        reuses_per_step.reverse()
-
-        logging.debug(strlazy(lambda: f"allowed reuses per rule step, starting at root: {pformat(reuses_per_step)}"))
-
-        # for each depth, count how often items were used
-        # rule_depth -> {itemid -> use count}
-        item_uses = defaultdict(dict)
-
         # example: 2+2 ec -> size=4
         #
         # root        __________-9____________________________
@@ -956,7 +974,7 @@ class PGMoveChecker:
         # [1, 2, 2]
         #
         # inverse aggregation, starting with 1
-        # reuses_per_step = [4, 2, 1]
+        # max_reuses_per_step = [4, 2, 1]
         #
         # current pg=[2, 4, 7, 9]
         #
@@ -974,8 +992,8 @@ class PGMoveChecker:
         # from this use count, subtract the trace of the replaced osd
         #
         # now eliminate candidates:
-        # * GET TRACE FROM THEM
-        # * check use counts against reuses_per_step
+        # * get a trace for each of them
+        # * check use counts against max_reuses_per_step
         #
         # 1 -> -9 used 3<4, -7 used 1<2, -1 used 0<1 -> ok
         # 2 -> replaced..
@@ -993,6 +1011,14 @@ class PGMoveChecker:
         # did we encounter an emit?
         emit = False
 
+        # chosen_root: [ruledepth -> allowed number of bucket reuses]
+        reuses_per_step = self.max_item_reuses()
+        logging.debug(strlazy(lambda: f"allowed reuses per rule step, starting at root: {pformat(reuses_per_step)}"))
+
+        # for each depth, count how often items were used
+        # rule_depth -> {itemid -> use count}
+        item_uses = defaultdict(dict)
+
         # collect trace for each osd.
         # osd -> crush-root-trace
         constraining_traces = dict()
@@ -1009,6 +1035,24 @@ class PGMoveChecker:
         # because "choose" steps may skip layers in the crush hierarchy
         rule_tree_depth = dict()
 
+        # offset of the lastly-visited take rule step
+        # we need it to slice the max_item_uses sublist
+        # for that particular root choice
+        take_rule_base = 0
+
+        # what root_id we're currently looking at
+        current_root_id = None
+
+        # first step: try to find item usage tracebacks for all osds.
+        constraining_traces = dict()
+        for idx, pg_osd in enumerate(self.pg_osds):
+            root_name = self.root_names[idx]
+            trace = trace_crush_root(pg_osd, root_name)
+            logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
+            if trace is None:
+                raise Exception(f"no trace found for {pg_osd} in {root_name}")
+            constraining_traces[pg_osd] = trace
+
         # gather item usages by evaluating the crush rules
         for step in self.rule["steps"]:
             if step["op"].startswith("set_"):
@@ -1019,35 +1063,30 @@ class PGMoveChecker:
                                           f"rule_depth={rule_depth}, item_uses={item_uses}"))
 
             if step["op"] == "take":
-                rule_root_name = step["item_name"]
-
-                # first step: try to find tracebacks for all osds that ends up in this root.
-                # we collect root-traces of all acting osds of the pg we wanna check for.
-                constraining_traces = dict()
-
-                for idx, pg_osd in enumerate(self.pg_osds):
-                    # only record traces for osds in the currently requested crush root
-                    if self.root_names[idx] != rule_root_name:
-                        continue
-
-                    trace = trace_crush_root(pg_osd, rule_root_name)
-                    logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
-                    if trace is None:
-                        raise Exception(f"no trace found for {pg_osd} in {rule_root_name}")
-                    constraining_traces[pg_osd] = trace
-                    # the root was "used"
-                    root_id = trace[0]["id"]
-                    root_use = item_uses[rule_depth].setdefault(root_id, 0)
-                    root_use += 1
-                    item_uses[rule_depth][root_id] = root_use
-
+                # reset the indices
                 rule_tree_depth[rule_depth] = 0
+                take_rule_base = rule_depth
                 tree_depth = 0
+
+                current_root_id = step["item"]
+
                 rule_depth += 1
 
             elif step["op"].startswith("choose"):
                 if not constraining_traces:
                     raise Exception('no backtraces captured from rule (missing "take"?)')
+
+                # for each rule step the class remains the same, so the root usages
+                # will be <= pg_num, and the sum of all roots will also be <= pg_num
+                root_use = item_uses[rule_depth].setdefault(current_root_id, 0)
+
+                # for this choice, the root will be used n times
+                num = step["num"]
+                if num <= 0:
+                    num += self.pool_size
+                root_use += num
+
+                item_uses[take_rule_base][current_root_id] = root_use
 
                 choose_type = step["type"]
 
@@ -1077,23 +1116,25 @@ class PGMoveChecker:
                 rule_depth += 1
 
                 # sanity checks lol
-                assert len(rule_tree_depth) == rule_depth
-                assert len(item_uses) == rule_depth
-                for idx, step_reuses in enumerate(reuses_per_step):
+                if len(rule_tree_depth) != rule_depth:
+                    raise Exception(f"len(rule_tree_depth) != rule_depth: {len(rule_tree_depth)} != {rule_depth}")
+                if len(item_uses) != rule_depth:
+                    raise Exception(f"len(item_uses) != rule_depth: {len(item_uses)} != {rule_depth}, item_uses={item_uses}")
+
+                # another sanity check: is the current osd mapping consistent with crush?
+                reuse_slice = reuses_per_step[take_rule_base:rule_depth]
+                for idx, step_reuses in enumerate(reuse_slice, start=take_rule_base):
                     for item, uses in item_uses[idx].items():
                         # uses may be <= since crush rules can emit more osds than the pool size needs
                         if uses > step_reuses:
                             print(f"rule:\n{pformat(self.rule)}")
                             print(f"reuses: {reuses_per_step}")
                             print(f"item_uses: {pformat(item_uses)}")
-                            print(f"constraining_traces: {pformat(constraining_traces)}")
+                            print(f"constraining_traces:\n{pformat(constraining_traces)}")
                             raise Exception(f"during emit, rule step {idx} item {item} was used {uses} > {step_reuses} expected")
 
-                # only one emit supported so far
-                if emit == True:
-                    raise Exception("multiple emits in crush rule not yet supported")
-
                 emit = True
+                current_root_id = None
 
             else:
                 raise Exception(f"unknown crush operation encountered: {step['op']}")
@@ -1104,6 +1145,8 @@ class PGMoveChecker:
         if not constraining_traces:
             raise Exception("no tree traces gathered?")
 
+        logging.debug(strlazy(lambda: f"after crush check preparations: rule_tree_depth={rule_tree_depth} item_uses={item_uses}"))
+
         assert len(rule_tree_depth) == rule_depth
         assert len(item_uses) == rule_depth
 
@@ -1112,7 +1155,7 @@ class PGMoveChecker:
         self.reuses_per_step = reuses_per_step  # rulestepid->allowed_item_reuses
         self.item_uses = item_uses  # rulestepid->{item->use_count}
 
-        logging.debug(strlazy(lambda: f"crush check preparation done: rule_tree_depth={rule_tree_depth} item_uses={item_uses}"))
+        logging.debug("crush check preparation success!")
 
     def is_move_valid(self, old_osd, new_osd):
         """
@@ -1372,7 +1415,12 @@ class PGMappings:
                 osd_fs_used -= get_pg_shardsize(pg)
 
             self.osd_utilizations[osdid] = osd_fs_used
-            logging.debug(strlazy(lambda: f"estimated {'osd.%s' % osdid: <8} usage: acting={pformatsize(osd['device_used'], 3)} up={pformatsize(osd_fs_used, 3)}"))
+
+            logging.debug(strlazy(lambda: (
+                f"estimated {'osd.%s' % osdid: <8} "
+                f"usage: acting={pformatsize(osd['device_used'], 3)}={0 if osd['device_size'] == 0 else ((100 * osd['device_used']) / osd['device_size']):.03f}% "
+                f"up={pformatsize(osd_fs_used, 3)}={0 if osd['device_size'] == 0 else ((100 * osd_fs_used) / osd['device_size']):.03f}% "
+                f"size={pformatsize(osd['device_size'], 3)}")))
 
     def apply_remap(self, pg, osd_from, osd_to):
         """
@@ -1513,7 +1561,7 @@ class PGMappings:
 
         used += add_size
 
-        # logging.debug(f"{osdid} {pformatsize(used)}/{pformatsize(osd_size)} = {used/osd_size * 100:.2f}%")
+        # logging.debug(f"usage: {args.osdused:>8}-{osdid} {pformatsize(used)}/{pformatsize(osd_size)} = {used/osd_size * 100:.2f}%")
 
         # make it relative
         used /= osd_size
@@ -1983,7 +2031,7 @@ if args.mode == 'balance':
         fillaverage = statistics.mean(usages)
         fillmedian = statistics.median(usages)
         crushclass_usage = crushclasses_usage[crushclass]
-        logging.info(f"  {crushclass}: average={fillaverage:.2f}%, median={fillmedian:.2f}%, without_placement_constraints={crushclass_usage:.2f}%")
+        logging.info(f"  {crushclass}: average={fillaverage:.2f}%, median={fillmedian:.2f}%, crushclass_usage={crushclass_usage:.2f}%")
 
     init_cluster_variance = get_cluster_variance(enabled_crushclasses, pg_mappings)
     cluster_variance = init_cluster_variance
@@ -2137,16 +2185,16 @@ if args.mode == 'balance':
                     if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal and not to_osd_pg_count_ideal < 1.0:
                         logging.debug(strlazy(lambda:
                                       f" BAD => osd.{osd_to} already has too many of pool={pg_pool} "
-                                      f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})"))
+                                      f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal:.4f})"))
                         continue
                     elif to_osd_pg_count_ideal >= 1.0:
                         logging.debug(strlazy(lambda:
                                       f" OK => osd.{osd_to} has too few of pool={pg_pool} "
-                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
+                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal:.4f})"))
                     else:
                         logging.debug(strlazy(lambda:
                                       f" OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
-                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
+                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal:.4f})"))
 
                     # how full will the target be
                     target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
@@ -2233,8 +2281,8 @@ if args.mode == 'balance':
                     logging.debug(" BAD => no movement destination candidates")
 
                 if not found_remap:
-                    # we tried all osds to place this pg,
-                    # so the shardsize is just too big
+                    # we tried all osds to place this PG and couldn't move it
+                    # to any of the candiates - probably the shardsize is just too big.
                     # if pg_size_choice is auto, we try to avoid this PG anyway,
                     # but if we still end up here, it means the choices for moves are really
                     # becoming tight.

@@ -1417,8 +1417,10 @@ class PGMappings:
             self.osd_utilizations[osdid] = osd_fs_used
 
             logging.debug(strlazy(lambda: (
-                f"estimated {'osd.%s' % osdid: <8} "
-                f"usage: acting={pformatsize(osd['device_used'], 3)}={0 if osd['device_size'] == 0 else ((100 * osd['device_used']) / osd['device_size']):.03f}% "
+                f"estimated {'osd.%s' % osdid: <8} weight={osd['weight']:.4f} "
+                f"#acting={len(self.osd_pgs_acting[osdid]):<3} "
+                f"acting={pformatsize(osd['device_used'], 3)}={0 if osd['device_size'] == 0 else ((100 * osd['device_used']) / osd['device_size']):.03f}% "
+                f"#up={len(self.osd_pgs_up[osdid]):<3} "
                 f"up={pformatsize(osd_fs_used, 3)}={0 if osd['device_size'] == 0 else ((100 * osd_fs_used) / osd['device_size']):.03f}% "
                 f"size={pformatsize(osd['device_size'], 3)}")))
 
@@ -2053,7 +2055,7 @@ if args.mode == 'balance':
     while True:
         for osdid, usage in osd_usages_asc:
             if usage >= 100:
-                logging.info(f"osd.{osdid} has calculated usage >= 100%: {usage}%")
+                logging.info(f"osd.{osdid} has calculated usage >= 100%: {usage:.4f}%")
 
         if found_remap_count >= args.max_pg_moves:
             logging.info("enough remaps found")
@@ -2282,7 +2284,7 @@ if args.mode == 'balance':
 
                 if not found_remap:
                     # we tried all osds to place this PG and couldn't move it
-                    # to any of the candiates - probably the shardsize is just too big.
+                    # to any of the candidates - probably the shardsize is just too big.
                     # if pg_size_choice is auto, we try to avoid this PG anyway,
                     # but if we still end up here, it means the choices for moves are really
                     # becoming tight.

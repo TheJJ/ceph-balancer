@@ -802,13 +802,13 @@ def rootweights_from_rule(rule, pool_size):
     root_usages = root_uses_from_rule(rule, pool_size)
 
     # normalize the weights:
-    weight_sum = sum(root_usages.values())
+    weight_sum = sum(usage for _, usage in root_usages)
 
     # TODO: handle `default` root (without explicit class)
     #       -> distribute it to the class-specific involved roots
 
     root_weights = dict()
-    for root_name, root_usage in root_usages.items():
+    for root_name, root_usage in root_usages:
         root_weights[root_name] = root_usage / weight_sum
 
     return root_weights

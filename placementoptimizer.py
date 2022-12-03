@@ -1640,7 +1640,7 @@ class PGMappings:
 
         for new_from, new_to in resulting_upmaps:
             if new_from == new_to:
-                raise Exception(f"somewhere something went wrong, we map {idpg} from osd.{new_from} to osd.{new_to}")
+                raise Exception(f"somewhere something went wrong, we map {pgid} from osd.{new_from} to osd.{new_to}")
 
         return resulting_upmaps
 

@@ -13,3 +13,6 @@ dist/
 /*.conf
 /test
 /build
+
+/todo.org
+/dumps/

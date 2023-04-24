@@ -67,6 +67,12 @@ def parse_args():
                         help="calculate osd utilization by weighting device size")
     showsp.add_argument('--use-shardsize-sum', action='store_true',
                         help="calculate osd utilization by adding all PG shards on it")
+    showsp.add_argument('--original-avail-prediction', action='store_true',
+                        help=("display what ceph reports as available size prediction - "
+                              "ceph's value is unfortunately wrong for multi-take crush rules, "
+                              "and it doesn't respect the current pg placements at all. it just uses crush weights."))
+    showsp.add_argument('--show-max-avail', action='store_true',
+                        help="show how much space would be available if the pool had infinity many pgs")
     showsp.add_argument('--osd-fill-min', type=int, default=0,
                         help='minimum fill %% to show an osd, default: %(default)s%%')
 
@@ -443,6 +449,9 @@ class ClusterState:
         # all crush bucket root ids
         self.bucket_roots = list()
 
+        # what full percentage OSDs no longer accept data
+        self.full_ratio = self.state["osd_dump"]["full_ratio"]
+
         for crush_class, class_osds in self.state["crush_class_osds"].items():
             if not class_osds:
                 continue
@@ -509,12 +518,34 @@ class ClusterState:
             pg_shard_size_avg = self.pools[id]["stored"] / self.pools[id]["pg_num"]
 
             if pool_type == "ec":
-                pg_shard_size_avg /= self.ec_profiles[ec_profile]["data_chunks"]
+                profile = self.ec_profiles[ec_profile]
+                pg_shard_size_avg /= profile["data_chunks"]
+                blowup_rate = profile["data_chunks"] / (profile["data_chunks"] + profile["coding_chunks"])
+
+            elif pool_type == "repl":
+                blowup_rate = pool["size"]
+
+            else:
+                raise Exception(f"unknown {pool_type=}")
 
             self.pools[id].update({
                 "erasure_code_profile": ec_profile if pool_type == "ec" else None,
                 "repl_type": pool_type,
                 "pg_shard_size_avg": pg_shard_size_avg,
+                "blowup_rate": blowup_rate,
+            })
+
+        for pool_stat in self.state["pg_dump"]["pg_map"]["pool_stats"]:
+            id = pool_stat["poolid"]
+
+            self.pools[id].update({
+                "num_objects": pool_stat["stat_sum"]["num_objects"],
+                "num_object_copies": pool_stat["stat_sum"]["num_object_copies"],
+                "num_objects_degraded": pool_stat["stat_sum"]["num_objects_degraded"],
+                "num_objects_misplaced": pool_stat["stat_sum"]["num_objects_misplaced"],
+                "num_omap_bytes": pool_stat["stat_sum"]["num_omap_bytes"],
+                "num_omap_keys": pool_stat["stat_sum"]["num_omap_keys"],
+                "num_bytes": pool_stat["stat_sum"]["num_bytes"],
             })
 
 
@@ -690,9 +721,11 @@ class ClusterState:
 
         del bucket_info
 
+    @lru_cache(maxsize=2 ** 14)
     def candidates_for_root(self, root_name):
         """
-        get the set of all osds where a crush rule could place shards.
+        get the all osds where a crush rule could place shards.
+        returns {osdid: osdweight}
         """
 
         for root_bucket, try_root_ids in self.bucket_roots:
@@ -703,16 +736,54 @@ class ClusterState:
         if not root_ids:
             raise Exception(f"crush root {root} not known?")
 
-        ret = set()
+        ret = dict()
 
         for nodeid in root_ids.keys():
             if (nodeid >= 0 and
                 self.osds[nodeid]['weight'] != 0 and
                 self.osds[nodeid]['crush_weight'] != 0):
 
-                ret.add(nodeid)
+                ret[nodeid] = self.osds[nodeid]['weight'] * self.osds[nodeid]['crush_weight']
 
         return ret
+
+    @lru_cache(maxsize=2 ** 14)
+    def candidates_for_pool(self, poolid):
+        """
+        get all osd candidates for a given pool (due to its crush rule).
+        returns {osdid: osdweight_summed_and_normalized_to_weight_sum}
+        """
+
+        pool = self.pools[poolid]
+        pool_size = pool['size']
+        pool_pg_num = pool['pg_num']
+        pool_crushrule = self.crushrules[pool['crush_rule']]
+
+        # cf. PGMap::get_rule_avail
+        # {rootname -> relative_root_selection_weight}
+        rootweights = rootweights_from_rule(pool_crushrule, pool_size)
+        root_weight_sum = sum(rootweights.values())
+        osd_weights = defaultdict(lambda: 0.0)
+
+        crush_sum = 0.0
+        for root_name, root_weight in rootweights.items():
+            root_weight_fraction = root_weight / root_weight_sum
+
+            # for each crush root chosen in the pool's rule, get the candidates
+            candidates = self.candidates_for_root(root_name)
+
+            # accumulate osd weights by how often they can be chosen from a crush rule.
+            for osdid, osdweight in candidates.items():
+                # apply crush rule weight (because the osd would be chosen more often due to the rule)
+                osdweight *= root_weight_fraction
+                crush_sum += osdweight
+                osd_weights[osdid] += osdweight
+
+        for osdid in osd_weights.keys():
+            osd_weights[osdid] /= crush_sum
+
+        return osd_weights
+
 
     def get_crushclass_osds(self, crushclass, skip_zeroweight : bool = False):
         """
@@ -725,6 +796,13 @@ class ClusterState:
                  self.osds[osdid]['crush_weight'] == 0)):
                 continue
             yield osdid
+
+    def get_osd_device_size(self, osdid):
+        """
+        return the raw OSD device size
+        """
+
+        return self.osds[osdid]['device_size']
 
     def get_osd_weighted_size(self, osdid):
         """
@@ -748,13 +826,14 @@ class ClusterState:
 
         return size * weight
 
-    def get_osd_size(self, osdid):
+    def get_osd_size(self, osdid, adjust_full_ratio=False):
         """
         return the osd size in bytes, depending on the size determination variant.
+        takes into account the size loss due to "full_ratio"
         """
 
         if self.osdsize_method == OSDSizeMethod.DEVICE:
-            osd_size = self.osds[osdid]['device_size']
+            osd_size = self.get_osd_device_size(osdid)
         elif self.osdsize_method == OSDSizeMethod.WEIGHTED:
             osd_size = self.get_osd_weighted_size(osdid)
         elif self.osdsize_method == OSDSizeMethod.CRUSH:
@@ -762,9 +841,12 @@ class ClusterState:
         else:
             raise Exception(f"unknown osd weight method {self.osdsize_method!r}")
 
+        if adjust_full_ratio:
+            osd_size *=  self.full_ratio
+
         return osd_size
 
-    def pool_pg_count_ideal(self, poolid, candidate_osds):
+    def pool_pg_shard_count_ideal(self, poolid, candidate_osds):
         """
         return the ideal pg count for a poolid,
         given the candidate osd ids, expressed pgs/byte
@@ -785,7 +867,7 @@ class ClusterState:
 
         return pgs_per_size
 
-    def osd_pool_pg_count_ideal(self, poolid, osdid, candidate_osds):
+    def osd_pool_pg_shard_count_ideal(self, poolid, osdid, candidate_osds):
         """
         return the ideal pg count for a pool id for some osdid.
         """
@@ -794,8 +876,7 @@ class ClusterState:
         if osd_size == 0:
             return 0
 
-        return self.pool_pg_count_ideal(poolid, candidate_osds) * osd_size
-
+        return self.pool_pg_shard_count_ideal(poolid, candidate_osds) * osd_size
 
 
 
@@ -852,7 +933,8 @@ def root_uses_from_rule(rule, pool_size):
     rule: crush rule id
     pool_size: number of osds in one pg
 
-    return {root_name: choice_count} for the given crush rule.
+    return {root_name: choice_count}, [root_for_first_emitted_osd, next_root, ...]
+    for the given crush rule.
 
     the choose-step nums are processed in order:
     val ==0: remaining_pool_size
@@ -863,6 +945,7 @@ def root_uses_from_rule(rule, pool_size):
 
     # rootname -> number of chooses for this root
     root_usages = defaultdict(int)
+    root_order = list()
 
     root_candidate = None
     root_chosen = None
@@ -873,7 +956,7 @@ def root_uses_from_rule(rule, pool_size):
             root_candidate = step["item_name"]
 
         elif step["op"].startswith("choose"):
-            # TODO: maybe "osd" type can be renamed, fetch it dynamically
+            # TODO: maybe "osd" type can be renamed? then we need to fetch it dynamically
             if root_candidate and (step["op"].startswith("chooseleaf")
                                    or step["type"] == "osd"):
                 root_chosen = root_candidate
@@ -886,13 +969,14 @@ def root_uses_from_rule(rule, pool_size):
                 elif root_use_num < 0:
                     root_use_num = pool_size - root_use_num
                 elif root_use_num > 0:
-                    pass  # = root_use_num
+                    pass  # so we use root_use_num
 
                 # limit to pool size
-                if root_use_num > pool_size - chosen:
-                    root_use_num = pool_size - chosen
-
+                root_use_num = min(pool_size - chosen, root_use_num)
                 root_usages[root_chosen] += root_use_num
+
+                root_order.extend([root_chosen] * root_use_num)
+
                 chosen += root_use_num
                 root_candidate = None
                 root_chosen = None
@@ -903,27 +987,71 @@ def root_uses_from_rule(rule, pool_size):
     if not root_usages:
         raise Exception(f"rule chooses no roots")
 
-    return root_usages
+    return root_usages, root_order
 
 
 def rootweights_from_rule(rule, pool_size):
     """
     given a crush rule and a pool size (involved osds in a pg),
     calculate the weights crush-roots are chosen for each pg.
+
+    returns {root_name -> relative_choice_weight_to_all_root_choices}
     """
-    root_usages = root_uses_from_rule(rule, pool_size)
+    # root_name -> choice_count
+    root_usages, _ = root_uses_from_rule(rule, pool_size)
 
     # normalize the weights:
     weight_sum = sum(root_usages.values())
-
-    # TODO: handle `default` root
-    #       -> distribute it to the other involved roots
 
     root_weights = dict()
     for root_name, root_usage in root_usages.items():
         root_weights[root_name] = root_usage / weight_sum
 
     return root_weights
+
+
+def get_max_reuses(rule, pool_size):
+    """
+    generate a list of item reuses per rule step.
+    one list entry per root take.
+    take_index -> take_step -> max_reuses
+    -> e.g. [[4, 2, 1, 1], [2, 1, 1]]
+       for [[root, rack, server, osd], [otherroot, server, osd]]
+    """
+
+    reuses = []
+
+    reuses_for_take: Optional[list] = None
+    fanout_cum = 1
+
+    # calculate how often one bucket layer can be reused
+    # this is the crush-constraint, set up by the rule
+    for idx, step in enumerate(rule["steps"]):
+        if step["op"] == "take":
+            if reuses_for_take is not None:
+                reuses.append(list(reversed(reuses_for_take)))
+
+            reuses_for_take = []
+            fanout_cum = 1
+            num = 1
+        elif step["op"].startswith("choose"):
+            num = step["num"]
+        elif step["op"] == "emit":
+            num = 1
+        else:
+            continue
+
+        reuses_for_take.append(fanout_cum)
+
+        if num <= 0:
+            numprev = 0
+            num += pool_size
+
+        fanout_cum *= num
+
+    reuses.append(list(reversed(reuses_for_take)))
+
+    return reuses
 
 
 class PGMoveChecker:
@@ -938,22 +1066,28 @@ class PGMoveChecker:
 
         # which pg to relocate
         self.pg = move_pg
+        self.pg_mappings = pg_mappings  # current pg->[osd] mapping state
+        self.pg_osds = pg_mappings.get_mapping(move_pg)  # acting osds managing this pg
 
         self.pool = self.cluster.pools[pool_from_pg(move_pg)]
         self.pool_size = self.pool["size"]
         self.rule = self.cluster.crushrules[self.pool['crush_rule']]
 
-        # crush root name for the pg
-        self.root_names = root_uses_from_rule(self.rule, self.pool_size).keys()
+        logging.debug(strlazy(lambda: (f"movecheck for pg {move_pg} (poolsize={self.pool_size})")))
+
+        # crush root names and usages for this pg
+        root_uses, root_order = root_uses_from_rule(self.rule, self.pool_size)
+
+        # map osd -> crush root name
+        self.osd_roots = dict()
+        for osdid, root in zip(self.pg_osds, root_order):
+            self.osd_roots[osdid] = root
 
         # all available placement osds for this crush root
         self.osd_candidates = set()
-        for root_name in self.root_names:
-            for osdid in self.cluster.candidates_for_root(root_name):
+        for root_name in root_uses.keys():
+            for osdid in self.cluster.candidates_for_root(root_name).keys():
                 self.osd_candidates.add(osdid)
-
-        self.pg_mappings = pg_mappings  # current pg->[osd] mapping state
-        self.pg_osds = pg_mappings.get_mapping(move_pg)  # acting osds managing this pg
 
     def get_osd_candidates(self):
         """
@@ -962,17 +1096,17 @@ class PGMoveChecker:
         return self.osd_candidates
 
     @staticmethod
-    def use_item_type(trace, item_type, rule_depth, item_uses):
+    def use_item_type(item_uses, trace, item_type, rule_step):
         """
-        given a trace (part), walk forward, until a given item type is found.
+        given a trace (or a part), walk forward, until a given item type is found.
         increase its use.
         """
         for idx, item in enumerate(trace):
             if item["type_name"] == item_type:
                 item_id = item["id"]
-                cur_item_uses = item_uses[rule_depth].get(item_id, 0)
+                cur_item_uses = item_uses[rule_step].get(item_id, 0)
                 cur_item_uses += 1
-                item_uses[rule_depth][item_id] = cur_item_uses
+                item_uses[rule_step][item_id] = cur_item_uses
                 return idx
         return None
 
@@ -983,86 +1117,91 @@ class PGMoveChecker:
         logging.debug(strlazy(lambda: f"prepare crush check for pg {self.pg} currently up={self.pg_osds}"))
         logging.debug(strlazy(lambda: f"rule:\n{pformat(self.rule)}"))
 
-        # ruledepth -> allowed number of bucket reuse
-        reuses_per_step = []
-        fanout_cum = 1
-
-        # calculate how often one bucket layer can be reused
-        # this is the crush-constraint, set up by the rule
-        for step in reversed(self.rule["steps"]):
-            if step["op"] == "take":
-                num = 1
-            elif step["op"].startswith("choose"):
-                num = step["num"]
-            elif step["op"] == "emit":
-                num = 1
-            else:
-                continue
-
-            reuses_per_step.append(fanout_cum)
-
-            if num <= 0:
-                num += self.pool_size
-
-            fanout_cum *= num
-        reuses_per_step.reverse()
-
-        logging.debug(strlazy(lambda: f"allowed reuses per rule step, starting at root: {pformat(reuses_per_step)}"))
-
-        # for each depth, count how often items were used
-        # rule_depth -> {itemid -> use count}
-        item_uses = defaultdict(dict)
-
-        # example: 2+2 ec -> size=4
+        # example: 4+2 ec -> size=6
+        # 4 ssds and 2 hdds
         #
-        # root        __________-9____________________________
-        # rack: _____-7_______    _________-8_____      ___-10____
-        # host: -1    -2    -3    -4    -5      -6      -11     -12
-        # osd: 1 2 | 3 4 | 5 6 | 7 8 | 9 10 | 11 12 | 13 14 | 15 16
-        #        ^     ^         ^     ^
+        # root        __________-9____________________________               _-13_
+        # room:                                                           -14    -15
+        # rack: _____-7_______    _________-8_____      ___-10____        -16    -17
+        # host: -1    -2    -3    -4    -5      -6      -11     -12       -18    -19
+        # osd: 1 2 | 3 4 | 5 6 | 7 8 | 9 10 | 11 12 | 13 14 | 15 16      17 18 | 19 20
+        #        ^     ^         ^     ^                                 ^          ^
         #
-        # take root
-        # choose 2 racks
-        # chooseleaf 2 hosts
+        # crush rule with two separate root choices:
+        # 0 take root -9
+        # 1 choose 2 rack
+        # 2 chooseleaf 2 hosts class ssd
+        # 3 emit
         #
-        # fanout: rule step's num = selections below bucket
-        # [1, 2, 2]
+        # 4 take root -13
+        # 5 chooseleaf -2 rack class hdd
+        # 6 emit
         #
-        # inverse aggregation, starting with 1
-        # reuses_per_step = [4, 2, 1]
+        # inverse reuse aggregation, starting with 1, for each take.
+        # reuses_per_step = [
+        #     [4, 2, 2, 1],   # first take
+        #     [2, 1, 1],      # second take
+        # ]
         #
-        # current pg=[2, 4, 7, 9]
-        #
-        # Now: replace_osd 2
+        # current osds=[2, 4, 7, 9, 17 20]
         #
         # traces from root down to osd:
         #   2: [-9, -7, -1, 2]
         #   4: [-9, -7, -2, 4]
         #   7: [-9, -8, -4, 7]
         #   9: [-9, -8, -5, 9]
+        #   17: [-13, -14, -16, -18, 17]
+        #   20: [-13, -15, -17, -10, 20]
         #
-        # use counts - per rule depth.
-        #  {0: {-9: 4}, 1: {-7: 2, -8: 2}, 2: {-1: 1, -2: 1, -4: 1, -5: 1}}
+        # mapping from osdindex to take-index (which take we're in)
+        # osd_take_index=[0, 0, 0, 0, 1, 1]
+        # mapping from rule step to take-index
+        # rule_take_index=[0, 0, 0, 0, 1, 1, 1]
         #
-        # from this use count, subtract the trace of the replaced osd
+        # reuses_per_step: take-index -> rule_step -> use_counts
+        #  [{0: {-9: 4},                          # for rule_step 0
+        #    1: {-7: 2, -8: 2},                   # for rule_step 1
+        #    2: {-1: 1, -2: 1, -4: 1, -5: 1}}     # for rule_step 2
+        #   {0: {-13: 2},                         # for rule_step 4
+        #    1: {-16: 1, -17: 1}}]                # for rule_step 5
         #
-        # now eliminate candidates:
-        # * GET TRACE FROM THEM
-        # * check use counts against reuses_per_step
+        # from these use_count, subtract the trace of the replaced osd
         #
-        # 1 -> -9 used 3<4, -7 used 1<2, -1 used 0<1 -> ok
-        # 2 -> replaced..
+        # to eliminate candidates:
+        # * replace old_osd with new_osd
+        # * find take_index by looking up old_osd in osd_take_index
+        # * select reuses from reuses_per_step by take_index
+        # * check if new_osd is candidate of the same root as old_osd
+        # * get trace to root after replacing with new_osd
+        # * check use new counts against reuses_per_step
+        #
+        # replacement:
+        # let's replace osd 2 by:
+        # 1 -> get osd trace = [-9 -7, -1, 1]
+        #      max_use = reuses_per_step[takeindex=1] = [4, 2, 2, 1]
+        #      -9 used 3<4, -7 used 1<2, -1 used 0<1 -> ok
+        # 2 -> ...skip, we want to replace it
         # 3 -> -9 used 3<4, -7 used 1<2, -2 used 1<1 -> fail
         # 4 -> keep, not replaced
         # 5 -> -9 used 3<4, -7 used 1<2, -3 used 0<1 -> ok
         # 6 -> -9 used 3<4, -7 used 1<2, -3 used 0<1 -> ok
         # 7 -> keep, not replaced
         # 8 -> -9 used 3<4, -8 used 2<2, -4 used 1<1 -> fail
-        # ...
+        # [...]
+        # 17 -> not in candidate list of root of 2!
         #
         # replacement candidates for 2: 1, 5, 6, 13 14 15 16
         #
+        # let's replace osd 17 by:
+        # 1 -> not in candidate list of root of 17!
+        # [...]
+        # 18 -> ok
+        # 19 -> -19 reused too often -> fail
 
+        # take_index -> take_step -> allowed number of bucket reuse
+        # e.g. [[6, 2, 1, 1], [3, 1, 1]] for [[root, rack, host, osds], [root, rack, osd]]
+        max_reuses = get_max_reuses(self.rule, self.pool_size)
+        logging.debug(strlazy(lambda: f"allowed reuses per rule step, starting at root: {pformat(max_reuses)}"))
         # did we encounter an emit?
         emit = False
 
@@ -1071,122 +1210,196 @@ class PGMoveChecker:
         constraining_traces = dict()
 
         # how far down the crush hierarchy have we stepped
-        # 1 = root depth
+        # 0 = observe the whole tree
+        # each value cuts one layer of the current step's trace
         tree_depth = 0
 
         # at what rule position is our processing
-        # since we skip steps like set_chooseleaf_tries
-        rule_depth = 0
+        rule_step = 0
 
-        # rule_depth -> tree_depth to next rule (what tree layer is this rule step)
+        # for each rule step, count how often items were used
+        # the rule_steps continue counting after several root takes
+        # rule_step -> {itemid -> use count}
+        item_uses = defaultdict(dict)
+
+        # a rule may have different crush roots
+        # this offset slides through the rules' devices
+        # for each root.
+        rule_device_offset = 0
+
+        # rule_step -> tree_depth to next rule (what tree layer is this rule step)
         # because "choose" steps may skip layers in the crush hierarchy
-        rule_tree_depth = dict()
+        # this is then used for the candidate checks:
+        # when checking item uses of a new trace,
+        # determines which of the trace elements to look at.
+        rule_tree_depth = list()
 
-        current_item_type = None
+        # only these traces are active due to the current "take"
+        take_traces = dict()
 
-        # gather item usages by evaluating the crush rules
+        # at which "take" in the crushrule are we?
+        take_index = -1
+        # what rule step was the last take?
+        take_rule_step = -1
+
+        # at which rule step does a take start
+        # take_index -> rule_step
+        take_rule_steps = dict()
+        # take_index -> rule_steps_taken
+        take_rule_step_count = dict()
+
+        # record which take a device selection came from
+        # osdid -> take_index
+        device_take_index = dict()
+
+
+        # basically analyze how often an item was used
+        # due to the crush rule choosing it
+        # we go through each (meaningful) step in the rule,
+        # see what it selects, and increase the item use counter.
+        # this should match the reuses_per_step we determined before.
+        #
+        # since each step may "skip down" crush tree levels, we have to remember
+        # what step used what crush level (so we can later check changes against the same level of a trace)
         for step in self.rule["steps"]:
             if step["op"].startswith("set_"):
                 # skip rule configuration steps
                 continue
 
             logging.debug(strlazy(lambda: f"processing crush step {step} with tree_depth={tree_depth}, "
-                                          f"rule_depth={rule_depth}, item_uses={item_uses}"))
+                                          f"rule_step={rule_step}, item_uses={item_uses}"))
 
             if step["op"] == "take":
-                rule_root_name = step["item_name"]
+                # "take" just defines what crush-subtree we wanna use for choosing devices next.
+                current_root_name = step["item_name"]
+                tree_depth = 0
+                take_index += 1
+                take_rule_step = rule_step
+                take_rule_steps[take_index] = rule_step
+                rule_tree_depth.append(tree_depth)
 
-                # should be known already since we fetch it the exact same way
-                assert rule_root_name in self.root_names
+                # how many devices will be selected in this root?
+                root_device_count = max_reuses[take_index][0]
+                root_osds = self.pg_osds[rule_device_offset:(rule_device_offset + root_device_count)]
 
-                # first step: try to find tracebacks for all osds that ends up in this root.
+                # generate tracebacks for all osds that ends up in this root.
                 # we collect root-traces of all acting osds of the pg we wanna check for.
-                constraining_traces = dict()
-
-                for pg_osd in self.pg_osds:
-                    trace = trace_crush_root(pg_osd, rule_root_name, self.cluster)
+                for pg_osd in root_osds:
+                    trace = trace_crush_root(pg_osd, current_root_name, self.cluster)
                     logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
-                    if trace is None:
-                        raise Exception(f"no trace found for {pg_osd} in {rule_root_name}")
+                    if trace is None or len(trace) < 2:
+                        raise Exception(f"no trace found for {pg_osd} in {current_root_name}")
                     constraining_traces[pg_osd] = trace
                     # the root was "used"
                     root_id = trace[0]["id"]
-                    root_use = item_uses[rule_depth].setdefault(root_id, 0)
-                    root_use += 1
-                    item_uses[rule_depth][root_id] = root_use
+                    root_use = item_uses[rule_step].get(root_id, 0) + 1
+                    item_uses[rule_step][root_id] = root_use
+                    device_take_index[pg_osd] = take_index
 
-                rule_tree_depth[rule_depth] = 0
-                tree_depth = 0
-                rule_depth += 1
-                current_item_type = rule_root_name
+                if not constraining_traces:
+                    raise Exception(f"no device traces captured for step {step}")
+
+                # only consider traces for the current choose step
+                take_traces = {osdid: constraining_traces[osdid] for osdid in root_osds}
+
+                # we just processed the root depth
+                rule_step += 1
 
             elif step["op"].startswith("choose"):
-                if not constraining_traces:
-                    raise Exception('no backtraces captured from rule (missing "take"?)')
-
+                # find the new tree_depth by looking how far we need to step for the choosen next bucket
                 choose_type = step["type"]
 
-                # find the new tree_depth by looking how far we need to step for the choosen next bucket
-
-                for constraining_trace in constraining_traces.values():
-                    steps_taken = self.use_item_type(constraining_trace[tree_depth:], choose_type, rule_depth, item_uses)
-                    if steps_taken is None:
+                steps_taken = -1
+                for constraining_trace in take_traces.values():
+                    # cut each trace at the current tree depth
+                    # in that part of the trace, walk forward until we can "choose" the the item we're looking for.
+                    # how many steps we took is then returned.
+                    used_steps = self.use_item_type(item_uses, constraining_trace[tree_depth:], choose_type, rule_step)
+                    if used_steps is None:
                         raise Exception(f"could not find item type {choose_type} "
                                         f"requested by rule step {step}")
+                    if steps_taken != -1 and used_steps != steps_taken:
+                        raise Exception(f"for trace {constraining_trace} we needed {used_steps} steps "
+                                        f"to reach {choose_type}, "
+                                        f"but for the previous trace we took {steps_taken} steps!")
+                    steps_taken = used_steps
 
-                # how many layers we went down the tree
-                rule_tree_depth[rule_depth] = tree_depth + steps_taken
+                # how many layers we went down the tree, i.e. how many entries in each trace did we proceed
                 tree_depth += steps_taken
-                rule_depth += 1
-                current_item_type = choose_type
+                # at what crush hierarchy layer are we now?
+                rule_tree_depth.append(tree_depth)
+                rule_step += 1
 
             elif step["op"] == "emit":
-                # we've not yet reached osd level, so step down further
-                for constraining_trace in constraining_traces.values():
-                    steps_taken = self.use_item_type(constraining_trace[tree_depth:], "osd", rule_depth, item_uses)
-                    if steps_taken is None:
+                # we may not have reached osd tree level, so we step down further
+                # if we have reached it already, we'll take 0 steps.
+                steps_taken = -1
+                for constraining_trace in take_traces.values():
+                    used_steps = self.use_item_type(item_uses, constraining_trace[tree_depth:], "osd", rule_step)
+                    if used_steps is None:
                         raise Exception(f"could not find trace steps down to osd"
                                         f"requested by rule step {step}")
+                    if steps_taken != -1 and used_steps != steps_taken:
+                        raise Exception(f"for trace {constraining_trace} we needed {used_steps} steps "
+                                        f"to reach {choose_type}, "
+                                        f"but for the previous trace we took {steps_taken} steps!")
+                    steps_taken = used_steps
 
-                rule_tree_depth[rule_depth] = tree_depth + steps_taken
-                tree_depth += steps_taken
-                rule_depth += 1
+                rule_tree_depth.append(tree_depth + steps_taken)
+                take_rule_step_count[take_index] = rule_step - take_rule_steps[take_index] + 1
 
-                # sanity checks lol
-                assert len(rule_tree_depth) == rule_depth
-                assert len(item_uses) == rule_depth
-                for idx, step_reuses in enumerate(reuses_per_step):
-                    for item, uses in item_uses[idx].items():
+                rule_step += 1
+                emit = True
+
+                # we now emitted this many devices - so we shift what device
+                # of the pg we're looking at now.
+                rule_device_offset += root_device_count
+
+                # did we enter remember the tree depth for each rule step?
+                assert len(rule_tree_depth) == rule_step
+                # did we remember how often items were reused in a rule step?
+                assert len(item_uses) == rule_step, f"len({item_uses=}) != ({rule_step=})"
+
+                # this take must have as many steps as the max-reuse list has items
+                assert take_rule_step_count[take_index] == len(max_reuses[take_index]),\
+                        f"{take_rule_step_count[take_index]} != {len(max_reuses[take_index])}"
+
+                # check, for the current take, if collected item uses respect the max_reuses_per_step
+                for idx, step_reuses in enumerate(max_reuses[take_index]):
+                    for item, uses in item_uses[take_rule_step + idx].items():
                         # uses may be <= since crush rules can emit more osds than the pool size needs
                         if uses > step_reuses:
                             print(f"rule:\n{pformat(self.rule)}")
-                            print(f"reuses: {reuses_per_step}")
+                            print(f"at take: {take_index}")
+                            print(f"reuses: {max_reuses}")
                             print(f"item_uses: {pformat(item_uses)}")
                             print(f"constraining_traces: {pformat(constraining_traces)}")
-                            raise Exception(f"during emit, rule step {idx} item {item} was used {uses} > {step_reuses} expected")
-
-                # only one emit supported so far
-                if emit == True:
-                    raise Exception("multiple emits in crush rule not yet supported")
-
-                emit = True
+                            raise Exception(f"during emit, rule take {take_index} at step "
+                                            f"{take_rule_step + idx} item {item} was used {uses} > {step_reuses} expected")
 
             else:
                 raise Exception(f"unknown crush operation encountered: {step['op']}")
 
         if not emit:
-            raise Exception("uuh no emit seen?")
+            raise Exception("no emit in crush rule processed")
 
-        if not constraining_traces:
-            raise Exception("no tree traces gathered?")
-
-        assert len(rule_tree_depth) == rule_depth
-        assert len(item_uses) == rule_depth
+        # we should have processed exactly pool-size many devices
+        assert rule_device_offset == self.pool_size
+        assert rule_device_offset == len(constraining_traces)
+        # for each rule step there should be a tree depth entry
+        assert len(rule_tree_depth) == rule_step
+        # for each rule step, we should have registered item usages
+        assert len(item_uses) == rule_step
+        # we should have processed all takes, hence all per-take reuse constraints
+        assert (take_index + 1) == len(max_reuses), f"{take_index + 1} != {len(max_reuses)}"
 
         self.constraining_traces = constraining_traces  # osdid->crush-root-trace
-        self.rule_tree_depth = rule_tree_depth  # rulestepid->tree_depth
-        self.reuses_per_step = reuses_per_step  # rulestepid->allowed_item_reuses
-        self.item_uses = item_uses  # rulestepid->{item->use_count}
+        self.rule_tree_depth = rule_tree_depth  # rule_step->tree_depth
+        self.max_reuses = max_reuses  # take_index->rule_step->allowed_item_reuses
+        self.item_uses = item_uses  # rule_step->{item->use_count}
+        self.device_take_index = device_take_index  # osdid->take_index
+        self.take_rule_steps = take_rule_steps  # take_index -> rule_step of take beginning
+        self.take_rule_step_count = take_rule_step_count  # take_index -> rule_step_count
 
         logging.debug(strlazy(lambda: f"crush check preparation done: rule_tree_depth={rule_tree_depth} item_uses={item_uses}"))
 
@@ -1203,26 +1416,33 @@ class PGMoveChecker:
             logging.debug(strlazy(lambda: f"   crush invalid: osd.{new_osd} not in same crush root"))
             return False
 
-        # TODO: figure out the crush root for the old_osd, and use it for new_osd too
-        # for now, just assume there's only one root per rule...
-        assert len(self.root_names) == 1
-        old_osd_root = next(iter(self.root_names))
-
-        # create trace for the replacement candidate
-        new_trace = trace_crush_root(new_osd, old_osd_root, self.cluster)
-        logging.debug(strlazy(lambda: f"   trace for {new_osd}: {new_trace}"))
-
-        if new_trace is None:
-            # probably not a compatible device class
-            logging.debug(f"   crush: no trace found for {new_osd}")
-            return False
-
         # the trace we no longer consider (since we replace the osd)
         old_trace = self.constraining_traces[old_osd]
 
+        # what root name is the old osd in?
+        # the new one needs to be under the same root.
+        root_name = self.osd_roots[old_osd]
+
+        # which "take" was the old osd in - we need to respect the same "take"
+        take_index = self.device_take_index[old_osd]
+
+        # create trace for the replacement candidate
+        new_trace = trace_crush_root(new_osd, root_name, self.cluster)
+
+        if new_trace is None:
+            # should never be tried as candidate
+            raise Exception(f"no trace found for {new_osd} up to {root_name}")
+
+        logging.debug(strlazy(lambda: f"   trace for old osd.{old_osd}: {old_trace}"))
+        logging.debug(strlazy(lambda: f"   trace for new osd.{new_osd}: {new_trace}"))
+
         overuse = False
-        for stepid, tree_stepwidth in self.rule_tree_depth.items():
-            use_max_allowed = self.reuses_per_step[stepid]
+
+        # perform the crush steps again, checking for item reusages on each layer.
+        step_start = self.take_rule_steps[take_index]
+        step_count = self.take_rule_step_count[take_index]
+        for idx, tree_stepwidth in enumerate(self.rule_tree_depth[step_start:step_start + step_count]):
+            use_max_allowed = self.max_reuses[take_index][idx]
 
             # as we would remove the old osd trace,
             # the item would no longer be occupied in the new trace
@@ -1232,7 +1452,7 @@ class PGMoveChecker:
 
             # how often is new_item used now?
             # if not used at all, it's not in the dict.
-            uses = self.item_uses[stepid].get(new_item, 0)
+            uses = self.item_uses[step_start + idx].get(new_item, 0)
 
             # we wanna use the new item now.
             # the use count doesn't increase when we already use the item on the current level
@@ -1301,10 +1521,11 @@ class PGMappings:
 
     def __init__(self,
                  cluster,
-                 enabled_crushclasses,
+                 enabled_crushclasses=None,
                  only_poolids=None,
                  osdused_method=OSDUsedMethod.SHARDSUM,
-                 pg_choice_method=PGChoiceMethod.LARGEST):
+                 pg_choice_method=PGChoiceMethod.LARGEST,
+                 disable_simulation=False):
         # the "real" devices, just used for their "fixed" properties like
         # device size
         self.cluster = cluster
@@ -1317,6 +1538,10 @@ class PGMappings:
 
         # consider only this set of pool ids for pgs
         self.only_poolids: Optional[set] = only_poolids
+
+        # all crush classes if none given
+        if not enabled_crushclasses:
+            enabled_crushclasses = cluster.crushclass_osds.keys()
 
         osd_candidates = set()
         for crushclass in enabled_crushclasses:
@@ -1348,6 +1573,11 @@ class PGMappings:
             acting_osds = pginfo["acting"]
             for osdid in acting_osds:
                 self.osd_pgs_acting[osdid].add(pg)
+
+        # don't prepare as much if we don't want to simulate movements.
+        self.disable_simulation = disable_simulation
+        if disable_simulation:
+            return
 
         # pg->[(osd_from, osd_to), ...]
         self.remaps = dict()
@@ -1455,13 +1685,14 @@ class PGMappings:
                 osd_fs_used -= self.cluster.get_pg_shardsize(pg)
 
             self.osd_utilizations[osdid] = osd_fs_used
-            logging.debug(strlazy(lambda: (
-                f"estimated {'osd.%s' % osdid: <8} weight={osd['weight']:.4f} "
-                f"#acting={len(self.osd_pgs_acting[osdid]):<3} "
-                f"acting={pformatsize(osd['device_used'], 3)}={0 if osd['device_size'] == 0 else ((100 * osd['device_used']) / osd['device_size']):.03f}% "
-                f"#up={len(self.osd_pgs_up[osdid]):<3} "
-                f"up={pformatsize(osd_fs_used, 3)}={0 if osd['device_size'] == 0 else ((100 * osd_fs_used) / osd['device_size']):.03f}% "
-                f"size={pformatsize(osd['device_size'], 3)}")))
+            if False:
+                logging.debug(strlazy(lambda: (
+                    f"estimated {'osd.%s' % osdid: <8} weight={osd['weight']:.4f} "
+                    f"#acting={len(self.osd_pgs_acting[osdid]):<3} "
+                    f"acting={pformatsize(osd['device_used'], 3)}={0 if osd['device_size'] == 0 else ((100 * osd['device_used']) / osd['device_size']):.03f}% "
+                    f"#up={len(self.osd_pgs_up[osdid]):<3} "
+                    f"up={pformatsize(osd_fs_used, 3)}={0 if osd['device_size'] == 0 else ((100 * osd_fs_used) / osd['device_size']):.03f}% "
+                    f"size={pformatsize(osd['device_size'], 3)}")))
 
     def apply_remap(self, pg, osd_from, osd_to):
         """
@@ -1543,19 +1774,20 @@ class PGMappings:
         """
         return self.osd_utilizations[osdid]
 
-    @lru_cache(maxsize=2**18)
-    def get_osd_usage(self, osdid, add_size=0):
+    def get_osd_usage_size(self, osdid, add_size=0):
         """
-        returns the occupied OSD space, by estimating the placed shards.
+        returns the occupied space on an osd.
 
-        another variant is add to the used data amount with add_size.
+        can be calculated by two variants:
+        - by estimating the placed shards.
+          - either by summing up all shards
+          - or by subtracting moved-away shards from the allocated space
+        - add to the used data amount with add_size.
         """
-        osd_size = self.cluster.get_osd_size(osdid)
-
-        if osd_size == 0:
-            raise Exception(f"getting relative usage of osd.{osdid} which has size 0 impossible")
-
-        if self.osdused_method == OSDUsedMethod.DELTA:
+        if self.disable_simulation:
+            # basically "delta", but without pending pg moves
+            used = self.cluster.osds[osdid]['device_used']
+        elif self.osdused_method == OSDUsedMethod.DELTA:
             used = self.get_osd_space_allocated(osdid)
         elif self.osdused_method == OSDUsedMethod.SHARDSUM:
             used = self.get_osd_shardsize_sum(osdid)
@@ -1564,11 +1796,24 @@ class PGMappings:
 
         used += add_size
 
-        # logging.debug(f"{osdid} {pformatsize(used)}/{pformatsize(osd_size)} = {used/osd_size * 100:.2f}%")
+        return used
+
+    @lru_cache(maxsize=2**18)
+    def get_osd_usage(self, osdid, add_size=0):
+        """
+        returns the occupied OSD space in percent.
+        """
+        osd_size = self.cluster.get_osd_size(osdid)
+
+        if osd_size == 0:
+            raise Exception(f"getting relative usage of osd.{osdid} which has size 0 impossible")
+
+        used = self.get_osd_usage_size(osdid, add_size)
 
         # make it relative
         used /= osd_size
         used *= 100
+        # logging.debug(f"{osdid} {pformatsize(used)}/{pformatsize(osd_size)} = {used/osd_size * 100:.2f}%")
 
         return used
 
@@ -1666,9 +1911,9 @@ class PGMappings:
 
         return resulting_upmaps
 
-    def osd_pool_pg_count(self, osdid):
+    def osd_pool_pg_shard_count(self, osdid):
         """
-        return {pool -> pg_count} for an OSD
+        return {pool -> pg_shard_count} for an OSD
         """
         ret = defaultdict(lambda: 0)
         for pg in self.get_osd_pgs_up(osdid):
@@ -1676,50 +1921,148 @@ class PGMappings:
 
         return ret
 
-    def get_pool_max_avail(self, poolid):
+    def get_pool_max_avail_weight(self, poolid):
         """
         given a pool id, predict how much space is available with the current mapping.
-        similar to what `ceph df` tries to estimate
+        similar how `ceph df` calculates available pool size
+
+        approach using just crush weights.
+        this calculates maximum available space if the pool hat infinity many pgs.
         """
 
-        # TODO missing implementation details!
-
         pool = self.cluster.pools[poolid]
+        blowup_rate = pool['blowup_rate']
         pool_size = pool['size']
-        pool_pg_num = pool['pg_num']
-        pool_crushrule = self.cluster.crushrules[pool['crush_rule']]
+
+        # scale by objects_there/objects_expected
+        if pool['num_object_copies'] > 0:
+            blowup_rate *= (pool['num_object_copies'] - pool['num_objects_degraded']) / pool['num_object_copies']
 
         # cf. PGMap::get_rule_avail
-        # (rootname, ruleweight)
-        rootweights = rootweights_from_rule(pool_crushrule, pool_size)
-        rootweightsum = sum(rootweights.values())
-        osdid_candidates = set()
-        for root_name in rootweights.keys():
-            osdid_candidates |= self.cluster.candidates_for_root(root_name)
+        # {osdid -> osd_weight_probability=[selectionweight/allcandidateweights]}
+        osdid_candidates = self.cluster.candidates_for_pool(poolid)
 
-        avail = -1
+        # how much space is available in a pool?
+        # this is determined by the "fullest" osd:
+        # we try for each osd how much it can take,
+        # given its selection probabiliy (due to its weight)
+        min_avail = -1
+        for osdid, osdweight in osdid_candidates.items():
+            # since we will adjust weight below, we need the raw device size
+            device_size = self.cluster.get_osd_device_size(osdid)
+            # shrink the device size by configured cluster full_ratio
+            device_size *= self.cluster.full_ratio
+
+            used_size = self.get_osd_usage_size(osdid)
+            usable = device_size - used_size
+            # how much space will be occupied on this osd by the pool?
+            # for that, take the amount of current osd weight into account,
+            # relative to whole pool weight possible for all osds.
+            # how much of the whole distribution will be "this" osd.
+            weighted_usable = usable / (osdweight * blowup_rate)
+
+            #print(
+            #    f"usable on {osdid:>4}: "
+            #    f"size={pformatsize(device_size):>5} "
+            #    f"used={pformatsize(used_size):>8} "
+            #    f"usable={pformatsize(usable):>7} "
+            #    f"blowup={blowup_rate:>7} "
+            #    f"weight={osdweight:>7} "
+            #    f"weighted={pformatsize(weighted_usable, 2):>7} "
+            #)
+
+            if min_avail < 0 or weighted_usable < min_avail:
+                min_avail = weighted_usable
+        pool_avail = min_avail
+
+        return pool_avail
+
+    def get_pool_max_avail_pgs(self, poolid):
+        """
+        given a pool id, predict how much space is available with the current mapping.
+
+        uses the current pg distribution on an osd and hence
+        free_osd_space * (pool_pg_num / ((count(pool_pgs) on this osd) * blowup_rate))
+
+        this calculates maximum for the current pg placement.
+        """
+
+        pool = self.cluster.pools[poolid]
+        pool_pg_num = pool['pg_num']
+        pool_size = pool['size']
+        blowup_rate = pool['blowup_rate']
+        num_shards = pool_pg_num * pool_size
+
+        osdid_candidates = self.cluster.candidates_for_pool(poolid).keys()
+
+        # how much space is available in a pool?
+        # we try for each osd how much it can take,
+        # given its selection probabiliy (due to pg distributions)
+        min_avail = -1
         for osdid in osdid_candidates:
+            # raw device size as reported by osd
+            device_size = self.cluster.get_osd_device_size(osdid)
+            # shrink the device size by configured cluster full_ratio
+            device_size *= self.cluster.full_ratio
 
-            # calculation for `ceph df` max_avail:
-            # weight = (crushweight[osdid] / deviceclass[osdid]_crushsum) * (rootweights[deviceclass_of[osdid]] / rootweightsum)
-            #
-            # better (since actual pg placement counts, not just hypothetical crush weights):
-            # how many pgs of the given pool are on that osd
-            # idea: have weight = (osd_weight * osd_pool_pg_count) / (osdid_candidates_crushweightsum * pool_pg_count)
-            # TODO: include rule rootweights!
-            osd_pool_pg_count = self.osd_pool_pg_count(osdid)[poolid]
-            weight = (osd_pool_pg_count / sum_crushweight_osds_in_pool) / (pool_pg_num * pool_size / osdid_candidates_crushweightsum )
+            used_size = self.get_osd_usage_size(osdid)
+            usable = device_size - used_size
 
-            unusable = osd_device_size[osdid] * (1.0 - full_ratio)
-            devavail = max(0, osd_stats[osdid].kb_avail - unusable)
-            # scale up device-available with it's fraction of the whole pool's crush weight
-            proj = devavail / weight
-            if proj < avail or avail < 0:
-                avail = proj
+            # how much space will be occupied on this osd by the pool?
+            # for that, take the amount of current osd weight into account,
+            # relative to whole pool weight possible for all osds.
+            # how much of the whole distribution will be "this" osd.
+            pool_pg_shards_on_osd = self.osd_pool_pg_shard_count(osdid)[poolid]
+            if pool_pg_shards_on_osd == 0:
+                # no pg of this pool is on this osd.
+                # so this osd won't be filled up by this pool.
+                continue
 
-        # scale down for replica/ec-usage
-        max_avail = (avail / pool_use_rate)
-        return max_avail
+            # this is the "real" size prediction of an osd:
+            # (usable_on_osd * pool_usable_rate) / osd_probability_for_getting_data_of_pool
+
+            placement_probability = pool_pg_shards_on_osd / num_shards
+            predicted_usable = usable / (placement_probability * blowup_rate)
+
+            if min_avail < 0 or predicted_usable < min_avail:
+                min_avail = predicted_usable
+
+            if False:
+                print(
+                    f"usable on {osdid:>4}: "
+                    f"size={pformatsize(device_size):>5} "
+                    f"used={pformatsize(used_size):>8} "
+                    f"usable={pformatsize(usable):>7} "
+                    f"raw_blowup={blowup_rate:>7} "
+                    f"on_osd={pool_pg_shards_on_osd:>4} "
+                    f"probability={placement_probability:>7} "
+                    f"weighted={pformatsize(predicted_usable, 2):>7} "
+                )
+
+
+        if min_avail < 0:
+            raise Exception(f"no pg of {poolid=} mapped on any osd to use space")
+
+        return min_avail
+
+    def get_pool_max_avail(self, poolid):
+        """
+        calculate how many bytes can be stored in this pool at current
+        pg distribution.
+        """
+
+        # good when we want to know if we had n->\inf many pgs
+        byweight = self.get_pool_max_avail_weight(poolid)
+        # good when we want to predict about the current pg placement
+        bypgs = self.get_pool_max_avail_pgs(poolid)
+        if False:
+            print(
+                f"on {poolid}: original={pformatsize(self.cluster.pools[poolid]['store_avail'])} "
+                f"weight={pformatsize(byweight, 2)} "
+                f"pg={pformatsize(bypgs, 2)} "
+            )
+        return bypgs
+
 
 
 class PGShardProps:
@@ -1781,9 +2124,6 @@ class PGCandidates:
     """
     Generate movement candidates to empty the given osd.
     """
-
-    def get_properties(self, pgid):
-        return self.pg_properties[pgid]
 
     def __init__(self, pg_mappings, osd, only_poolids, pg_choice_method):
         up_pgs = pg_mappings.get_osd_pgs_up(osd)
@@ -1895,6 +2235,9 @@ class PGCandidates:
         """
         return self.pg_candidates
 
+    def get_properties(self, pgid):
+        return self.pg_properties[pgid]
+
     def get_size(self, pg):
         return self.pg_properties[pg].size
 
@@ -1980,8 +2323,8 @@ def balance(args, cluster):
             pool = cluster.pools[poolid]
             pool_size = pool['size']
             pool_crushrule = cluster.crushrules[pool['crush_rule']]
-            for root_name in root_uses_from_rule(pool_crushrule, pool_size).keys():
-                for osdid in cluster.candidates_for_root(root_name):
+            for root_name in root_uses_from_rule(pool_crushrule, pool_size)[0].keys():
+                for osdid in cluster.candidates_for_root(root_name).keys():
                     enabled_crushclasses.add(cluster.osds[osdid]['crush_class'])
 
     # we'll do all the optimizations in this mapping state
@@ -2083,7 +2426,7 @@ def balance(args, cluster):
             # for better pg candidate selection.
             pg_candidates = pg_mappings.get_pg_move_candidates(osd_from)
 
-            from_osd_pg_count = pg_mappings.osd_pool_pg_count(osd_from)
+            from_osd_pg_count = pg_mappings.osd_pool_pg_shard_count(osd_from)
 
             from_osd_satisfied_pools = set()
 
@@ -2102,18 +2445,18 @@ def balance(args, cluster):
                 pg_pool = pool_from_pg(move_pg)
 
                 if pg_pool in from_osd_satisfied_pools:
-                    logging.debug("SKIP pg %s since pool=%s-pgs are already below expected on osd.%s", move_pg, pg_pool, osd_from)
+                    logging.debug("SKIP pg %s from osd.%s since pool=%s-pgs are already below expected", move_pg, osd_from, pg_pool)
                     continue
 
                 if pg_pool in unsuccessful_pools:
-                    logging.debug("SKIP pg %s since pool (%s) can't be balanced more", move_pg, pg_pool)
+                    logging.debug("SKIP pg %s from osd.%s since pool (%s) can't be balanced more", move_pg, osd_from, pg_pool)
                     continue
 
                 logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
-                pool_pg_count_ideal = cluster.pool_pg_count_ideal(pg_pool, try_pg_move.get_osd_candidates())
-                from_osd_pg_count_ideal = pool_pg_count_ideal * cluster.get_osd_size(osd_from)
+                pool_pg_shard_count_ideal = cluster.pool_pg_shard_count_ideal(pg_pool, try_pg_move.get_osd_candidates())
+                from_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_from)
 
                 # only move the pg if the source osd has more PGs of the pool than average
                 # otherwise the regular balancer will fill this OSD again
@@ -2163,8 +2506,8 @@ def balance(args, cluster):
                     # where the weighted pg count of this pool is already good
                     # otherwise the balancer will move a pg on the osd_from of this pool somewhere else
                     # i.e. don't be the +1
-                    to_osd_pg_count = pg_mappings.osd_pool_pg_count(osd_to)
-                    to_osd_pg_count_ideal = pool_pg_count_ideal * cluster.get_osd_size(osd_to)
+                    to_osd_pg_count = pg_mappings.osd_pool_pg_shard_count(osd_to)
+                    to_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_to)
                     if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal and not to_osd_pg_count_ideal < 1.0:
                         logging.debug(strlazy(lambda:
                                       f" BAD => osd.{osd_to} already has too many of pool={pg_pool} "
@@ -2307,9 +2650,14 @@ def show(args, cluster):
             if len(crush_class) > maxcrushclasslen:
                 maxcrushclasslen = len(crush_class)
 
+        if args.show_max_avail:
+            maxavail_hdr = f" {'maxavail': >8}"
+        else:
+            maxavail_hdr = ""
+
         poolname = 'name'.ljust(maxpoolnamelen)
         print()
-        print(f"{'poolid': >6} {poolname} {'type': <7} {'size': >5} {'min': >3} {'pg_num': >6} {'stored': >7} {'used': >7} {'avail': >7} {'shrdsize': >8} crush")
+        print(f"{'poolid': >6} {poolname} {'type': <7} {'size': >5} {'min': >3} {'pg_num': >6} {'stored': >7} {'used': >7} {'avail': >7}{maxavail_hdr} {'shrdsize': >8} crush")
 
         # default, sort by pool id
         sort_func = lambda x: x[0]
@@ -2347,10 +2695,24 @@ def show(args, cluster):
             used_sum += poolprops['used']
             stored = pformatsize(poolprops['stored'])  # used data excl metadata
             used = pformatsize(poolprops['used'])  # raw usage incl metastuff
-            avail = pformatsize(poolprops['store_avail'])
+
+            if args.show_max_avail or not args.original_avail_prediction:
+                mappings = PGMappings(cluster, disable_simulation=True)
+
+            if not args.original_avail_prediction:
+                avail = pformatsize(mappings.get_pool_max_avail_pgs(poolid))
+            else:
+                avail = pformatsize(poolprops['store_avail'])
+
+            if args.show_max_avail:
+                maxavail = pformatsize(mappings.get_pool_max_avail_weight(poolid))
+                maxavail = f" {maxavail: >8}"
+            else:
+                maxavail = ""
+
             shard_size = pformatsize(poolprops['pg_shard_size_avg'])
             rootweights_pp = ",".join(rootweights_ppl)
-            print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7} {shard_size: >8} {crushruleid}:{crushrulename} {rootweights_pp: >12}")
+            print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7}{maxavail} {shard_size: >8} {crushruleid}:{crushrulename} {rootweights_pp: >12}")
 
         for crushroot in stored_sum_class.keys():
             crushclass_usage = ""
@@ -2678,6 +3040,7 @@ def main():
 
         else:
             raise Exception(f"unknown mode: {args.mode}")
+
 
 if __name__ == "__main__":
     main()

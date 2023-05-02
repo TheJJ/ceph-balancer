@@ -20,8 +20,9 @@ import datetime
 from enum import Enum
 from collections import defaultdict
 from functools import lru_cache
+from itertools import chain, zip_longest
 from pprint import pformat, pprint
-from typing import Optional
+from typing import Optional, Callable
 
 
 def parse_args():
@@ -101,13 +102,18 @@ def parse_args():
                           help=('how is the osd usage predicted during simulation? default: %(default)s. '
                                 "delta=adjust the builtin osd usage report by in-move pg deltas, more accurate but doesn't account pending data deletion. "
                                 "shardsum=estimate the usage by summing up all pg shardsizes, doesn't account PG metadata."))
+    balancep.add_argument('--osdfrom', choices=["fullest", "limiting", "alternate"], default="alternate",
+                          help=('how to determine the source osd for a movement? default: %(default)s. '
+                                "fullest=start with the fullest osd (by percent of device size). "
+                                "limiting=start with the fullest osd that actually limits the usable pool space. "
+                                "alternate=alternate between limiting and fullest devices"))
     balancep.add_argument('--ensure-optimal-moves', action='store_true',
                           help='make sure that only movements which win full shardsizes are done')
     balancep.add_argument('--ensure-variance-decrease', action='store_true',
                           help='make sure that only movements which decrease the fill rate variance are performed')
-    balancep.add_argument('--max-full-move-attempts', type=int, default=1,
-                          help=("when the fullest osd can't be emptied more, "
-                                "try this many more osds in descending fullness order."))
+    balancep.add_argument('--max-move-attempts', type=int, default=2,
+                          help=("current source osd can't be emptied more, "
+                                "try this many more other osds candidates to empty. default: %(default)s"))
     balancep.add_argument('--source-osds',
                           help="only consider these osds as movement source, separated by ','")
 
@@ -184,6 +190,15 @@ class OSDUsedMethod(Enum):
     # estimate the usage by summing up all pg shardsizes,
     # doesn't account PG metadata.
     SHARDSUM = 2
+
+
+class OSDFromChoiceMethod(Enum):
+    """
+    how to choose a osd to move data from
+    """
+    FULLEST = 1  # use the fullest osd
+    LIMITING = 2  # use devices limiting the pool available space
+    ALTERNATE = 3 # alternate between limiting and fullest devices
 
 
 class PGChoiceMethod(Enum):
@@ -441,6 +456,9 @@ class ClusterState:
         # osdid -> osdinfo
         self.osds = dict()
 
+        # osdid -> device size in bytes
+        self.osd_devsize = dict()
+
         # osds used by a pool:
         # pool_id -> {osdid}
         self.pool_osds_up = defaultdict(set)
@@ -612,6 +630,7 @@ class ClusterState:
                 "crush_weight": osd["crush_weight"],
                 "status": osd["status"],
             }
+            self.osd_devsize[id] = osd["kb"] * 1024
 
 
         # gather which pgs are on what osd
@@ -801,20 +820,13 @@ class ClusterState:
                 continue
             yield osdid
 
-    def get_osd_device_size(self, osdid):
-        """
-        return the raw OSD device size
-        """
-
-        return self.osds[osdid]['device_size']
-
     def get_osd_weighted_size(self, osdid):
         """
         return the weighted OSD device size
         """
 
         osd = self.osds[osdid]
-        size = osd['device_size']
+        size = self.osd_devsize[osdid]
         weight = osd['weight']
 
         return size * weight
@@ -837,7 +849,7 @@ class ClusterState:
         """
 
         if self.osdsize_method == OSDSizeMethod.DEVICE:
-            osd_size = self.get_osd_device_size(osdid)
+            osd_size = self.osd_devsize[osdid]
         elif self.osdsize_method == OSDSizeMethod.WEIGHTED:
             osd_size = self.get_osd_weighted_size(osdid)
         elif self.osdsize_method == OSDSizeMethod.CRUSH:
@@ -1506,15 +1518,11 @@ class PGMoveChecker:
         var = statistics.variance(osds_used)
         return var
 
-    def filter_candidates(self, osdids):
+    def filter_candidate(self, osdid):
         """
-        given an iterator of osd ids, return only those
-        entries that are in the same crush root
+        given an an osd id, is it a candidate for moving this pg?
         """
-        for osdid in osdids:
-            if osdid not in self.osd_candidates:
-                continue
-            yield osdid
+        return osdid in self.osd_candidates
 
 
 class PGMappings:
@@ -1525,11 +1533,13 @@ class PGMappings:
 
     def __init__(self,
                  cluster,
-                 enabled_crushclasses=None,
-                 only_poolids=None,
-                 osdused_method=OSDUsedMethod.SHARDSUM,
-                 pg_choice_method=PGChoiceMethod.LARGEST,
-                 disable_simulation=False):
+                 only_crushclasses: Optional[set] = None,
+                 only_poolids: Optional[set] = None,
+                 osdused_method = OSDUsedMethod.SHARDSUM,
+                 osd_from_choice_method = OSDFromChoiceMethod.ALTERNATE,
+                 pg_choice_method = PGChoiceMethod.LARGEST,
+                 disable_simulation = False):
+
         # the "real" devices, just used for their "fixed" properties like
         # device size
         self.cluster = cluster
@@ -1537,21 +1547,17 @@ class PGMappings:
         # how to simulate the osd usage
         self.osdused_method = osdused_method
 
+        # how to select a osd where we then can move a pg from
+        self.osd_from_choice_method = osd_from_choice_method
+
         # how to select pgs to move around
         self.pg_choice_method = pg_choice_method
 
-        # consider only this set of pool ids for pgs
-        self.only_poolids: Optional[set] = only_poolids
+        # consider only these crushclasses
+        self.only_crushclasses = only_crushclasses or cluster.crushclass_osds.keys()
 
-        # all crush classes if none given
-        if not enabled_crushclasses:
-            enabled_crushclasses = cluster.crushclass_osds.keys()
-
-        # filter osd candidates by weight, and remove weight=0
-        # all possible osd candidates where we can map to (due to crush class)
-        self.osd_candidates = set()
-        for crushclass in enabled_crushclasses:
-            self.osd_candidates.update(self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True))
+        # which pools are candidates for mapping changes
+        self.pool_candidates = set()
 
         # up state: osdid -> {pg, ...}
         self.osd_pgs_up = defaultdict(set)
@@ -1563,12 +1569,21 @@ class PGMappings:
         # up pg mapping: pgid -> [up_osd, ...]
         self.pg_mappings = dict()
 
+        # osdid -> poolid -> count of shards
+        # is updated for each move!
+        self.osd_pool_up_shard_count = defaultdict(lambda: defaultdict(lambda: 0))
+
+        # osdid -> sum size of all shards on the osd
+        self.osd_shardsize_sum = defaultdict(lambda: 0)
+
         for pg, pginfo in self.cluster.pgs.items():
             up_osds = pginfo["up"]
             self.pg_mappings[pg] = list(up_osds)
 
             for osdid in up_osds:
                 self.osd_pgs_up[osdid].add(pg)
+                self.osd_pool_up_shard_count[osdid][pool_from_pg(pg)] += 1
+                self.osd_shardsize_sum[osdid] += self.cluster.get_pg_shardsize(pg)
 
             acting_osds = pginfo["acting"]
             for osdid in acting_osds:
@@ -1581,10 +1596,69 @@ class PGMappings:
 
         # pg->[(osd_from, osd_to), ...]
         self.remaps = dict()
+        # {osd we used to move from}
+        self.from_osds_used = set()
+
+        # collect crushclasses from all enabled pools
+        self.enabled_crushclasses = cluster.crushclass_osds.keys()
+        self.pool_candidates = cluster.pools.keys()
+
+        # if we have pool id restrictions
+        if only_poolids:
+            # only keep crushclasses used in the given pools
+            self.enabled_crushclasses = set()
+            for poolid in only_poolids:
+                pool = cluster.pools[poolid]
+                pool_size = pool['size']
+                pool_crushrule = cluster.crushrules[pool['crush_rule']]
+                for root_name in root_uses_from_rule(pool_crushrule, pool_size)[0].keys():
+                    for osdid in cluster.candidates_for_root(root_name).keys():
+                        self.enabled_crushclasses.add(cluster.osd_crushclass[osdid])
+
+            self.pool_candidates = only_poolids
+
+        # if we have a crushclass restriction, figure out which pools can be affected.
+        # this further reduces the pool candidates
+        if only_crushclasses:
+            pool_crush_candidates = set()
+
+            # figure out which pools are affected by these crushclasses
+            for poolid, poolprops in cluster.pools.items():
+                rootweights = rootweights_from_rule(cluster.crushrules[poolprops['crush_rule']], poolprops["size"])
+
+                # crush root names used in that pool
+                crushroots = rootweights.keys()
+                for crushroot in rootweights.keys():
+                    # cut deviceclass from crush root name -> default~hdd -> get class hdd
+                    classsplit = crushroot.split('~')
+                    if len(classsplit) == 2:
+                        rootname, deviceclass = classsplit
+                        if deviceclass in only_crushclasses:
+                            pool_crush_candidates.add(poolid)
+                    else:
+                        # no explicit device class given in crush rule
+                        # -> check if any of this root's candidate's osd crushclass matches the enabled ones
+                        for osdid in cluster.candidates_for_root(crushroot):
+                            if cluster.osd_crushclass[osdid] in only_crushclasses:
+                                pool_crush_candidates.add(poolid)
+                                break
+
+            # filter the pool candidates by the crush constraint.
+            self.pool_candidates &= pool_crush_candidates
+            self.enabled_crushclasses &= only_crushclasses
+
+        # collect all possible osd candidates for discovered crushclasses remove weight=0
+        # which we can consider for moving from/to
+        self.osd_candidates = set()
+        for crushclass in self.enabled_crushclasses:
+            self.osd_candidates.update(self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True))
 
         # osdid -> used kb, based on the osd-level utilization report
+        # so we can simulate movements.
+        # this only contains the candidates active due to their crushclass.
         self.osd_utilizations = dict()
-        for osdid, osd in self.cluster.osds.items():
+        for osdid in self.osd_candidates:
+            osd = self.cluster.osds[osdid]
             # this is the current "acting" size.
             # and the parts of not-yet-fully-transferred up pgs
             osd_fs_used = osd['device_used']
@@ -1720,20 +1794,41 @@ class PGMappings:
         self.osd_utilizations[osd_from] -= shard_size
         self.osd_utilizations[osd_to] += shard_size
 
-        self.get_osd_shardsize_sum.cache_clear()
+        self.osd_shardsize_sum[osd_from] -= shard_size
+        self.osd_shardsize_sum[osd_to] += shard_size
+
+        poolid = pool_from_pg(pg)
+        self.osd_pool_up_shard_count[osd_from][poolid] -= 1
+        self.osd_pool_up_shard_count[osd_to][poolid] += 1
+
         self.get_osd_usage.cache_clear()
+        self.get_osd_usage_size.cache_clear()
         self.get_osd_space_allocated.cache_clear()
-        self.osd_pool_pg_shard_count.cache_clear()
+        self.get_pool_max_avail_pgs_limit.cache_clear()
+        self.get_pool_max_avail_weight.cache_clear()
 
         # insert a new mapping tracker
         self.remaps.setdefault(pg, []).append((osd_from, osd_to))
 
-    def get_osd_usages(self):
+        self.from_osds_used.add(osd_from)
+
+    def get_enabled_crushclasses(self):
+        """
+        osds of which crushclasses are we gonna touch?
+        """
+        return self.enabled_crushclasses
+
+    def get_potentially_affected_pools(self):
+        """
+        returns set(poolid) for pools that may be adjusted through changes in the mappings
+        """
+        return self.pool_candidates
+
+    def get_osd_usages(self, add_size=0):
         """
         calculate {osdid -> usage percent}
         """
-        # if an osd has a weight of 0, it's 100% full.
-        return {osdid: self.get_osd_usage(osdid) for osdid in self.osd_candidates}
+        return {osdid: self.get_osd_usage(osdid, add_size) for osdid in self.osd_candidates}
 
     def get_osd_usages_asc(self):
         """
@@ -1743,7 +1838,7 @@ class PGMappings:
         return list(sorted(self.get_osd_usages().items(), key=lambda osd: osd[1]))
 
     def get_mapping(self, pg):
-        return list(self.pg_mappings[pg])
+        return self.pg_mappings[pg]
 
     def get_osd_pgs_up(self, osdid):
         return self.osd_pgs_up[osdid]
@@ -1752,20 +1847,106 @@ class PGMappings:
         return self.osd_pgs_acting[osdid]
 
     def get_pg_move_candidates(self, osdid):
-        return PGCandidates(self, osdid, only_poolids=self.only_poolids, pg_choice_method=self.pg_choice_method)
+        return PGCandidates(self, osdid,
+                            pool_candidates=self.pool_candidates,
+                            pg_choice_method=self.pg_choice_method)
 
-    @lru_cache(maxsize=2**18)
+    def get_osd_from_candidates(self):
+        """
+        generate source candidates to move a pg from.
+
+        method: fullest
+        use the relatively fullest osd.
+
+        method: limiting
+        first, use the limiting osds from predicted pool usage,
+        then continue with the relatively fullest osds.
+
+        method: limit_hybrid:
+        pick from limiting, then fullest, then limiting, etc.
+        """
+
+        alternate = False
+        pool_limit = False
+        fullest_osd = False
+
+        if self.osd_from_choice_method == OSDFromChoiceMethod.LIMITING:
+            pool_limit = True
+            fullest_osd = True
+        elif self.osd_from_choice_method == OSDFromChoiceMethod.FULLEST:
+            fullest_osd = True
+        elif self.osd_from_choice_method == OSDFromChoiceMethod.ALTERNATE:
+            alternate = True
+            pool_limit = True
+            fullest_osd = True
+        else:
+            raise Exception(f"unknown OSDFromChoiceMethod: {self.osd_from_choice_method}")
+
+        emitted = set()
+
+        def limiting_osds():
+            # [(limiting_osdid, usage), ]
+            limiting_osds = list()
+            for poolid in self.pool_candidates:
+                # all limiting osds
+                osdid = self.get_pool_max_avail_pgs_limit(poolid)[1]
+                limiting_osds.append((osdid, self.get_osd_usage(osdid)))
+
+            for osdid, usage in sorted(limiting_osds, key=lambda x: x[1], reverse=True):
+                yield osdid, usage
+
+        def fullest_osds():
+            for osdid, usage in sorted(self.get_osd_usages().items(),
+                                       key=lambda osd: osd[1],
+                                       reverse=True):
+                yield osdid, usage
+
+        iterators = list()
+        if pool_limit:
+            iterators.append(limiting_osds())
+
+        if fullest_osd:
+            iterators.append(fullest_osds())
+
+        if alternate:
+            def alternator(iterators):
+                for value in zip_longest(*iterators):
+                    for elem in value:
+                        if elem is not None:
+                            yield elem
+            iterators = [alternator(iterators)]
+
+        for osdid, usage in chain(*iterators):
+            if osdid in emitted:
+                continue
+            emitted.add(osdid)
+            yield osdid, usage
+
+
+    def get_osd_target_candidates(self, move_pg: Optional[str] = None):
+        """
+        generate target candidates to move a pg to.
+
+        method: emptiest
+        use the relatively emptiest osd.
+        """
+
+        move_pg_shardsize = 0
+        if move_pg:
+            move_pg_shardsize = self.cluster.get_pg_shardsize(move_pg)
+
+        # emit empty first
+        for osdid, usage in sorted(self.get_osd_usages(add_size=move_pg_shardsize).items(),
+                                   key=lambda osd: osd[1],
+                                   reverse=False):
+            yield osdid, usage
+
     def get_osd_shardsize_sum(self, osdid):
         """
         calculate the osd usage by summing all the mapped (up) PGs shardsizes
         -> we can calculate a future size
         """
-        used = 0
-
-        for pg in self.osd_pgs_up[osdid]:
-            used += self.cluster.get_pg_shardsize(pg)
-
-        return used
+        return self.osd_shardsize_sum[osdid]
 
     @lru_cache(maxsize=2**18)
     def get_osd_space_allocated(self, osdid):
@@ -1775,6 +1956,7 @@ class PGMappings:
         """
         return self.osd_utilizations[osdid]
 
+    @lru_cache(maxsize=2**18)
     def get_osd_usage_size(self, osdid, add_size=0):
         """
         returns the occupied space on an osd.
@@ -1818,12 +2000,12 @@ class PGMappings:
 
         return used
 
-    def get_cluster_variance(self, crushclasses):
+    def get_cluster_variance(self):
         """
         get {crushclass -> variance} for given mapping
         """
         variances = dict()
-        for crushclass in crushclasses:
+        for crushclass in self.get_enabled_crushclasses():
             osd_usages = list()
             for osdid in self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
                 osd_usages.append(self.get_osd_usage(osdid))
@@ -1837,7 +2019,6 @@ class PGMappings:
             variances[crushclass] = class_variance
 
         return variances
-
 
     def get_upmaps(self):
         """
@@ -1912,17 +2093,7 @@ class PGMappings:
 
         return resulting_upmaps
 
-    @lru_cache(maxsize=2**18)
-    def osd_pool_pg_shard_count(self, osdid):
-        """
-        return {pool -> pg_shard_count} for an OSD
-        """
-        ret = defaultdict(lambda: 0)
-        for pg in self.osd_pgs_up[osdid]:
-            ret[pool_from_pg(pg)] += 1
-
-        return ret
-
+    @lru_cache(maxsize=2**16)
     def get_pool_max_avail_weight(self, poolid):
         """
         given a pool id, predict how much space is available with the current mapping.
@@ -1951,7 +2122,7 @@ class PGMappings:
         min_avail = -1
         for osdid, osdweight in osdid_candidates.items():
             # since we will adjust weight below, we need the raw device size
-            device_size = self.cluster.get_osd_device_size(osdid)
+            device_size = self.cluster.osd_devsize[osdid]
             # shrink the device size by configured cluster full_ratio
             device_size *= self.cluster.full_ratio
 
@@ -1979,6 +2150,7 @@ class PGMappings:
 
         return pool_avail
 
+    @lru_cache(maxsize=2**16)
     def get_pool_max_avail_pgs_limit(self, poolid):
         """
         given a pool id, predict how much space is available with the current mapping.
@@ -2007,7 +2179,7 @@ class PGMappings:
 
         for osdid in osdid_candidates:
             # raw device size as reported by osd
-            device_size = self.cluster.get_osd_device_size(osdid)
+            device_size = self.cluster.osd_devsize[osdid]
             # shrink the device size by configured cluster full_ratio
             device_size *= self.cluster.full_ratio
 
@@ -2018,7 +2190,7 @@ class PGMappings:
             # for that, take the amount of current osd weight into account,
             # relative to whole pool weight possible for all osds.
             # how much of the whole distribution will be "this" osd.
-            pool_pg_shards_on_osd = self.osd_pool_pg_shard_count(osdid)[poolid]
+            pool_pg_shards_on_osd = self.osd_pool_up_shard_count[osdid][poolid]
             if pool_pg_shards_on_osd == 0:
                 # no pg of this pool is on this osd.
                 # so this osd won't be filled up by this pool.
@@ -2053,7 +2225,7 @@ class PGMappings:
         return min_avail, limiting_osd
 
     def get_pool_max_avail_pgs(self, poolid):
-        return self.get_pool_max_avail_pgs(poolid)[0]
+        return self.get_pool_max_avail_pgs_limit(poolid)[0]
 
     def get_pool_max_avail(self, poolid):
         """
@@ -2072,7 +2244,6 @@ class PGMappings:
                 f"pg={pformatsize(bypgs, 2)} "
             )
         return bypgs
-
 
 
 class PGShardProps:
@@ -2135,7 +2306,7 @@ class PGCandidates:
     Generate movement candidates to empty the given osd.
     """
 
-    def __init__(self, pg_mappings, osd, only_poolids, pg_choice_method):
+    def __init__(self, pg_mappings, osd, pool_candidates, pg_choice_method):
         up_pgs = pg_mappings.get_osd_pgs_up(osd)
         acting_pgs = pg_mappings.get_osd_pgs_acting(osd)
         remapped_pgs = up_pgs - acting_pgs
@@ -2148,7 +2319,7 @@ class PGCandidates:
         # we can move up pgs away - they are on the osd or planned to be on it.
         for pgid in up_pgs:
             pg_pool = pool_from_pg(pgid)
-            if only_poolids and pg_pool not in only_poolids:
+            if pool_candidates and pg_pool not in pool_candidates:
                 continue
 
             self.pg_candidates.append(pgid)
@@ -2165,6 +2336,7 @@ class PGCandidates:
 
         # reorder potential pg_candidates by configurable approaches
         pg_walk_anchor = None
+
         # TODO: move these choice methods also into the PGShardProps comparison function
         if pg_choice_method == PGChoiceMethod.AUTO:
             # choose the PG choice method based on
@@ -2172,7 +2344,7 @@ class PGCandidates:
 
             # if we could move there, most balance would be created.
             # use this to guess the shard size to move.
-            best_target_osd, best_target_osd_usage = pg_mappings.get_osd_usages()[-1]
+            best_target_osd, best_target_osd_usage = next(pg_mappings.get_osd_target_candidates())
 
             for idx, pg_candidate in enumerate(pg_candidates_desc):
                 pg_candidate_size = self.pg_properties[pg_candidate].size
@@ -2304,6 +2476,15 @@ def balance(args, cluster):
     else:
         raise Exception(f"unknown osd usage rate method {args.osdused!r}")
 
+    if args.osdfrom == "fullest":
+        osdfrom_method = OSDFromChoiceMethod.FULLEST
+    elif args.osdfrom == "limiting":
+        osdfrom_method = OSDFromChoiceMethod.LIMITING
+    elif args.osdfrom == "alternate":
+        osdfrom_method = OSDFromChoiceMethod.ALTERNATE
+    else:
+        raise Exception(f"unknown osd usage rate method {args.osdused!r}")
+
     if args.pg_choice == "largest":
         pg_choice_method = PGChoiceMethod.LARGEST
     elif args.pg_choice == "median":
@@ -2313,37 +2494,12 @@ def balance(args, cluster):
     else:
         raise Exception(f"unknown osd usage rate method {args.pg_choice!r}")
 
-    # poolid for all that can be balanced due to their candidates osds having their contents moved around
-    pools_affected_by_balance = cluster.pools.keys()
-
-    enabled_crushclasses = cluster.crushclass_osds.keys()
-
+    only_crushclasses = None
     if args.only_crushclass and not (args.only_pool or args.only_poolid):
-        enabled_crushclasses = {cls.strip() for cls in args.only_crushclass.split(",") if cls.strip()}
-        logging.info(f"only considering crushclasses {enabled_crushclasses}")
+        only_crushclasses = {cls.strip() for cls in args.only_crushclass.split(",") if cls.strip()}
+        logging.info(f"only considering crushclasses {only_crushclasses}")
 
-        # figure out which pools are affected by these crushclasses
-        for poolid, poolprops in cluster.pools.items():
-            rootweights = rootweights_from_rule(cluster.crushrules[poolprops['crush_rule']], poolprops["size"])
-
-            # crush root names used in that pool
-            crushroots = rootweights.keys()
-            for crushroot in rootweights.keys():
-                # cut deviceclass from crush root name -> default~hdd -> get class hdd
-                classsplit = crushroot.split('~')
-                if len(classsplit) == 2:
-                    rootname, deviceclass = classsplit
-                    if deviceclass in enabled_crushclasses:
-                        pools_affected_by_balance.add(poolid)
-                else:
-                    # no explicit device class given in crush rule
-                    # -> check if any of this root's candidate's osd crushclass matches the enabled ones
-                    for osdid in cluster.candidates_for_root(crushroot):
-                        if cluster.osd_crushclass[osdid] in enabled_crushclasses:
-                            pools_affected_by_balance.add(poolid)
-                            break
-
-    only_poolids = set()
+    only_poolids = None
     if args.only_poolid:
         only_poolids = {int(pool) for pool in args.only_poolid.split(",") if pool.strip()}
 
@@ -2355,23 +2511,17 @@ def balance(args, cluster):
         if args.only_crushclass:
             logging.info(f"  ignoring the only-crushclass option since explicit pools were given.")
 
-        pools_affected_by_balance = only_poolids
-
-        # collect crushclasses from all enabled pools
-        enabled_crushclasses = set()
-        for poolid in only_poolids:
-            pool = cluster.pools[poolid]
-            pool_size = pool['size']
-            pool_crushrule = cluster.crushrules[pool['crush_rule']]
-            for root_name in root_uses_from_rule(pool_crushrule, pool_size)[0].keys():
-                for osdid in cluster.candidates_for_root(root_name).keys():
-                    enabled_crushclasses.add(cluster.osd_crushclass[osdid])
 
     # we'll do all the optimizations in this mapping state
-    pg_mappings = PGMappings(cluster, enabled_crushclasses,
+    pg_mappings = PGMappings(cluster,
+                             only_crushclasses=only_crushclasses,
                              only_poolids=only_poolids,
                              osdused_method=osdused_method,
+                             osd_from_choice_method=osdfrom_method,
                              pg_choice_method=pg_choice_method)
+
+    # poolids for all that can be balanced due to their candidates osds having their contents moved around
+    pools_affected_by_balance = pg_mappings.get_potentially_affected_pools()
 
     # to restrict source osds
     source_osds = None
@@ -2384,13 +2534,8 @@ def balance(args, cluster):
     found_remap_size_sum = 0
     force_finish = False
 
-    # start by taking the fullest OSD
-    # this is updated when we do move a pg
-    osd_usages_asc = pg_mappings.get_osd_usages_asc()
-    print_osd_usages(osd_usages_asc)
-
     logging.info("current OSD fill rate per crushclasses:")
-    for crushclass in enabled_crushclasses:
+    for crushclass in pg_mappings.get_enabled_crushclasses():
         usages = list()
         for osdid in cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
             usages.append(pg_mappings.get_osd_usage(osdid))
@@ -2402,7 +2547,7 @@ def balance(args, cluster):
         crushclass_usage = cluster.crushclasses_usage[crushclass]
         logging.info(f"  {crushclass}: average={fillaverage:.2f}%, median={fillmedian:.2f}%, without_placement_constraints={crushclass_usage:.2f}%")
 
-    init_cluster_variance = pg_mappings.get_cluster_variance(enabled_crushclasses)
+    init_cluster_variance = pg_mappings.get_cluster_variance()
     cluster_variance = init_cluster_variance
 
     logging.info("cluster variance for crushclasses:")
@@ -2410,6 +2555,7 @@ def balance(args, cluster):
         logging.info(f"  {crushclass}: {variance:.3f}")
 
     # TODO: track these min-max values per crushclass
+    osd_usages_asc = pg_mappings.get_osd_usages_asc()
     init_osd_min, init_osd_min_used = osd_usages_asc[0]
     init_osd_max, init_osd_max_used = osd_usages_asc[-1]
     osd_min = init_osd_min
@@ -2421,18 +2567,15 @@ def balance(args, cluster):
 
     init_pool_avail = dict()
 
-    logging.debug(strlazy(lambda: f"currently usable space:"))
+    logging.debug("currently usable space, caused by osd")
+    logging.debug(strlazy(lambda: f"  {'pool'.ljust(cluster.max_poolname_len)} {'size': >8} {'osd': >6}"))
     for poolid in pools_affected_by_balance:
         poolname = cluster.pools[poolid]['name'].ljust(cluster.max_poolname_len)
-        avail = pg_mappings.get_pool_max_avail_pgs(poolid)
-        init_pool_avail[poolid] = avail
-        logging.debug(strlazy(lambda: f"  {poolname} {pformatsize(avail, 2): >8}"))
+        avail, limit_osd = pg_mappings.get_pool_max_avail_pgs_limit(poolid)
+        init_pool_avail[poolid] = (avail, limit_osd)
+        logging.debug(strlazy(lambda: f"  {poolname} {pformatsize(avail, 2): >8} {limit_osd: >6}"))
 
     while True:
-        for osdid, usage in osd_usages_asc:
-            if usage >= 100:
-                logging.info(f"osd.{osdid} has calculated usage >= 100%: {usage:.4f}%")
-
         if found_remap_count >= args.max_pg_moves:
             logging.info("enough remaps found")
             break
@@ -2448,18 +2591,19 @@ def balance(args, cluster):
         last_attempt = -1
 
         # try to move the biggest pg from the fullest disk to the next suiting smaller disk
-        for osd_from, osd_from_used_percent in reversed(osd_usages_asc):
+        for osd_from, osd_from_used_percent in pg_mappings.get_osd_from_candidates():
             if found_remap or force_finish:
                 break
 
+            # filter only-allowed source osds
             if source_osds is not None:
                 if osd_from not in source_osds:
                     continue
 
             source_attempts += 1
 
-            if source_attempts > args.max_full_move_attempts:
-                logging.info(f"in descending full-order, couldn't empty osd.{last_attempt}, so we're done. "
+            if source_attempts > args.max_move_attempts:
+                logging.info(f"couldn't empty osd.{last_attempt}, so we're done. "
                              f"if you want to try more often, set --max-full-move-attempts=$nr, this may unlock "
                              f"more balancing possibilities.")
                 force_finish = True
@@ -2475,7 +2619,7 @@ def balance(args, cluster):
             # for better pg candidate selection.
             pg_candidates = pg_mappings.get_pg_move_candidates(osd_from)
 
-            from_osd_pg_count = pg_mappings.osd_pool_pg_shard_count(osd_from)
+            from_osd_pg_count = pg_mappings.osd_pool_up_shard_count[osd_from]
 
             from_osd_satisfied_pools = set()
 
@@ -2487,7 +2631,6 @@ def balance(args, cluster):
             #       even better, we can integrate the PGMoveChecker directly, and thus calculate
             #       target OSD candidates _within_ the pg candidate generation.
             for move_pg_idx, move_pg in enumerate(pg_candidates.get_candidates()):
-                move_pg_shardsize = pg_candidates.get_size(move_pg)
                 if found_remap or force_finish:
                     break
 
@@ -2501,6 +2644,7 @@ def balance(args, cluster):
                     logging.debug("SKIP pg %s from osd.%s since pool (%s) can't be balanced more", move_pg, osd_from, pg_pool)
                     continue
 
+                move_pg_shardsize = pg_candidates.get_size(move_pg)
                 logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
@@ -2542,10 +2686,12 @@ def balance(args, cluster):
                 # check variance for this crush root
                 variance_before = try_pg_move.get_placement_variance()
 
-                # try the least full osd that's allowed by crush
-                to_candidates = list(try_pg_move.filter_candidates(osd[0] for osd in osd_usages_asc))
-                for osd_to_idx, osd_to in enumerate(to_candidates):
-                    logging.debug("TRY-1 move %s osd.%s => osd.%s (%s/%s)", move_pg, osd_from, osd_to, osd_to_idx+1, len(to_candidates))
+                for osd_to, osd_to_usage in pg_mappings.get_osd_target_candidates(move_pg):
+                    logging.debug("TRY-1 move %s osd.%s => osd.%s", move_pg, osd_from, osd_to)
+
+                    if not try_pg_move.filter_candidate(osd_to):
+                        # e.g. crushclass doesn't match.
+                        continue
 
                     if osd_to == osd_from:
                         logging.debug(" BAD move to source OSD makes no sense")
@@ -2555,7 +2701,7 @@ def balance(args, cluster):
                     # where the weighted pg count of this pool is already good
                     # otherwise the balancer will move a pg on the osd_from of this pool somewhere else
                     # i.e. don't be the +1
-                    to_osd_pg_count = pg_mappings.osd_pool_pg_shard_count(osd_to)
+                    to_osd_pg_count = pg_mappings.osd_pool_up_shard_count[osd_to]
                     to_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_to)
                     if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal and not to_osd_pg_count_ideal < 1.0:
                         logging.debug(strlazy(lambda:
@@ -2610,6 +2756,7 @@ def balance(args, cluster):
 
                     new_mapping_pos = None
 
+                    # for logging below
                     prev_pg_mapping = cluster.pg_osds_up[move_pg]
                     new_pg_mapping = list()
                     for idx, osdid in enumerate(prev_pg_mapping):
@@ -2618,13 +2765,14 @@ def balance(args, cluster):
                             new_mapping_pos = idx
                         new_pg_mapping.append(osdid)
 
+                    # record the mapping
                     pg_mappings.apply_remap(move_pg, osd_from, osd_to)
 
-                    # refresh our global osd usage mapping
+                    # what's the min/max osd now?
                     osd_usages_asc = pg_mappings.get_osd_usages_asc()
                     osd_min, osd_min_used = osd_usages_asc[0]
                     osd_max, osd_max_used = osd_usages_asc[-1]
-                    cluster_variance = pg_mappings.get_cluster_variance(enabled_crushclasses)
+                    cluster_variance = pg_mappings.get_cluster_variance()
 
                     # TODO: calculate win rate so we can predict the total free storage then
                     #       so we know how much actual free space our movement brought!
@@ -2682,21 +2830,27 @@ def balance(args, cluster):
     # poolid -> (prev, new, gained space)
     space_won = dict()
     for poolid in pools_affected_by_balance:
-        prev_avail = init_pool_avail[poolid]
+        prev_avail, prev_limit_osd = init_pool_avail[poolid]
         new_avail = pg_mappings.get_pool_max_avail_pgs(poolid)
         gain = new_avail - prev_avail
         if gain > 0:
-            space_won[poolid] = (prev_avail, avail, gain)
+            space_won[poolid] = (prev_avail, new_avail, gain)
+        else:
+            limit_used = prev_limit_osd in pg_mappings.from_osds_used
+            if limit_used:
+                logging.info(f"gain == 0 even though we moved from {prev_limit_osd}")
 
     if space_won:
         logging.info(strlazy(lambda: f"new usable space:"))
         poolnameheader = 'pool name'.ljust(cluster.max_poolname_len)
         logging.info(strlazy(lambda: f"{poolnameheader} {'previous': >8}   {'new': >8}   {'gain': >8}"))
 
-        for poolid, (prev_avail, agail, gain) in space_won.items():
+        for poolid, (prev_avail, new_avail, gain) in space_won.items():
             poolname = cluster.pools[poolid]['name'].ljust(cluster.max_poolname_len)
             logging.info(strlazy(lambda: (f"  {poolname} {pformatsize(prev_avail, 2): >8} "
-                                          f"-> {pformatsize(avail, 2): >8} => {pformatsize(gain, 2): >8}")))
+                                          f"-> {pformatsize(new_avail, 2): >8} => {pformatsize(gain, 2): >8}")))
+    else:
+        logging.info(strlazy(lambda: f"done. this probably gain any space since no limiting osd is affected"))
 
     # print what we have been waiting for :)
     for pg, upmaps in pg_mappings.get_upmaps().items():
@@ -2959,7 +3113,7 @@ def showremapped(args, cluster):
             pg_move_status[pg] = {
                 "state": state,
                 "objs_total": objs_total,
-                "objs_todo": objs_total - objs_to_restore,
+                "objs_pending": objs_total - objs_to_restore,
                 "size": pg_move_size,
                 "sizepp": pg_move_size_pp,
                 "progress": progress,
@@ -3016,10 +3170,10 @@ def showremapped(args, cluster):
 
             for pg, to_osd in actions["to"].items():
                 pgstatus = pg_move_status[pg]
-                print(f"  ->{pg: <6} {pgstatus['state']} {pgstatus['sizepp']: >6} {osdid: >4}->{to_osd: <4} {pgstatus['objs_todo']} of {pgstatus['objs_total']}, {pgstatus['progress']:.1f}%")
+                print(f"  ->{pg: <6} {pgstatus['state']} {pgstatus['sizepp']: >6} {osdid: >4}->{to_osd: <4} {pgstatus['objs_pending']} of {pgstatus['objs_total']}, {pgstatus['progress']:.1f}%")
             for pg, from_osd in actions["from"].items():
                 pgstatus = pg_move_status[pg]
-                print(f"  <-{pg: <6} {pgstatus['state']} {pgstatus['sizepp']: >6} {osdid: >4}<-{from_osd: <4} {pgstatus['objs_todo']} of {pgstatus['objs_total']}, {pgstatus['progress']:.1f}%")
+                print(f"  <-{pg: <6} {pgstatus['state']} {pgstatus['sizepp']: >6} {osdid: >4}<-{from_osd: <4} {pgstatus['objs_pending']} of {pgstatus['objs_total']}, {pgstatus['progress']:.1f}%")
             print()
 
     else:
@@ -3027,10 +3181,10 @@ def showremapped(args, cluster):
             state = pgmoveinfo['state']
             move_size_pp = pgmoveinfo['sizepp']
             objs_total = pgmoveinfo['objs_total']
-            objs_todo = pgmoveinfo['objs_todo']
+            objs_pending = pgmoveinfo['objs_pending']
             progress = pgmoveinfo['progress']
             move_actions = ';'.join(pgmoveinfo['moves'])
-            print(f"pg {pg: <6} {state} {move_size_pp: >6}: {objs_todo} of {objs_total}, {progress:.1f}%, {move_actions}")
+            print(f"pg {pg: <6} {state} {move_size_pp: >6}: {objs_pending} of {objs_total}, {progress:.1f}%, {move_actions}")
 
 
 def poolosddiff(args, cluster):
@@ -3093,6 +3247,12 @@ def main():
 
         if args.mode == 'balance':
             balance(args, state)
+
+            #import cProfile
+            #from pstats import SortKey
+            #with cProfile.Profile() as pr:
+            #    balance(args, state)
+            #    pr.print_stats(SortKey.CUMULATIVE)
 
         elif args.mode == 'show':
             show(args, state)

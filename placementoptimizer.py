@@ -19,6 +19,7 @@ import subprocess
 import datetime
 from enum import Enum
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import lru_cache
 from itertools import chain, zip_longest
 from pprint import pformat, pprint
@@ -1823,13 +1824,6 @@ class PGMappings:
         """
         return {osdid: self.get_osd_usage(osdid, add_size) for osdid in self.osd_candidates}
 
-    def get_osd_usages_asc(self):
-        """
-        return [(osdid, usage in percent)] sorted ascendingly by usage
-        """
-        # from this mapping, calculate the weighted osd size,
-        return list(sorted(self.get_osd_usages().items(), key=lambda osd: osd[1]))
-
     def get_mapping(self, pg):
         return self.pg_mappings[pg]
 
@@ -2270,9 +2264,10 @@ class PGShardProps:
         """
         the "least" pg props entry is the one we try first.
         """
-        # TODO: smarter selection of pg movement candidates
+        # TODO: smarter selection of pg movement candidates -> create weighted "score" to sort by
         # [x] order pgs by size, from big to small
         # [ ] order pgs by pg's num_omap_bytes
+        # [ ] order pgs by object count?
         # [x] prefer pgs that are remapped (up != acting)
         # [x] prefer pgs that don't have upmaps already to minimize "distance" to crush mapping
         # TODO: for those, change the move loops: loop src, loop dst, loop candidate pgs.
@@ -2429,6 +2424,134 @@ class PGCandidates:
     def __len__(self):
         return len(self.pg_candidates)
 
+@dataclass
+class CrushclassUsage:
+    fill_average: float
+    usage_percent: float
+    osd_min: int
+    osd_min_used: float
+    osd_median: int
+    osd_median_used: float
+    osd_max: int
+    osd_max_used: float
+
+
+class UsageAnalysis:
+    def __init__(self, pg_mappings: PGMappings):
+        cluster = pg_mappings.cluster
+
+        self.pg_mappings = pg_mappings
+
+        # cluster utilization
+        self.cluster_variance = pg_mappings.get_cluster_variance()
+        self.max_poolname_len = cluster.max_poolname_len
+
+        # poolids for all that can be balanced due to their candidates osds having their contents moved around
+        self.pools_affected_by_balance = pg_mappings.get_potentially_affected_pools()
+
+        # pool utilization
+        self.pool_avail = dict()
+        for poolid in self.pools_affected_by_balance:
+            poolname = cluster.pools[poolid]['name'].ljust(cluster.max_poolname_len)
+            avail, limit_osd = pg_mappings.get_pool_max_avail_pgs_limit(poolid)
+            self.pool_avail[poolid] = (poolname, avail, limit_osd)
+
+        # per-crushclass osd usages
+        self.crushclass_usages = dict()
+        for crushclass in pg_mappings.get_enabled_crushclasses():
+            cc_osd_usages = dict()
+            for osdid in cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
+                cc_osd_usages[osdid] = pg_mappings.get_osd_usage(osdid)
+
+            # osd size utilization
+            osd_min, osd_min_used = min(cc_osd_usages.items(), key=lambda x: x[1])
+            osd_median, osd_median_used = sorted(cc_osd_usages.items(), key=lambda x: x[1])[len(cc_osd_usages) // 2]
+            osd_max, osd_max_used = max(cc_osd_usages.items(), key=lambda x: x[1])
+
+            self.crushclass_usages[crushclass] = CrushclassUsage(
+                statistics.mean(cc_osd_usages.values()),
+                cluster.crushclasses_usage[crushclass],
+                osd_min, osd_min_used,
+                osd_median, osd_median_used,
+                osd_max, osd_max_used
+            )
+
+
+    def log(self):
+        logging.info("cluster variance for crushclasses:")
+        for crushclass, variance in self.cluster_variance.items():
+            logging.info(f"  {crushclass: >15}: {variance:.3f}")
+
+        logging.debug("usable space, caused by osd")
+        logging.debug(strlazy(lambda: f"  {'pool'.ljust(self.max_poolname_len)} {'size': >8} {'osd': >6}"))
+        for poolname, avail, limit_osd in self.pool_avail.values():
+            logging.debug(strlazy(lambda: f"  {poolname} {pformatsize(avail, 2): >8} {limit_osd: >6}"))
+
+        logging.info("OSD fill rate by crushclass:")
+        for crushclass, usage in self.crushclass_usages.items():
+            logging.info(f"  {crushclass}: average={usage.fill_average:3.2f}%, "
+                         f"unconstrained={usage.usage_percent:3.2f}%")
+            logging.info(f"      min osd.{usage.osd_min: <5} {usage.osd_min_used:3.3f}%")
+            logging.info(f"   median osd.{usage.osd_median: <5} {usage.osd_median_used:3.3f}%")
+            logging.info(f"      max osd.{usage.osd_max: <5} {usage.osd_max_used:3.3f}%")
+
+
+    def log_compare_with(self, ana_new: "UsageAnalysis"):
+        if not isinstance(ana_new, UsageAnalysis):
+            raise Exception("can only compare with other analysis")
+
+        logging.info("OSD fill rate by crushclass:")
+        logging.info(f"                      OLD                         NEW")
+        for crushclass, old_usage in self.crushclass_usages.items():
+            new_usage = ana_new.crushclass_usages[crushclass]
+            old_variance = self.cluster_variance[crushclass]
+            new_variance = ana_new.cluster_variance[crushclass]
+
+            logging.info(f"  {crushclass}:")
+            logging.info(f"      raw           {old_usage.usage_percent:7.3f}%"
+                         f"                    {new_usage.usage_percent:7.3f}%")
+            logging.info(f"      avg           {old_usage.fill_average:7.3f}%"
+                         f"                    {new_usage.fill_average:7.3f}%")
+            logging.info(f" variance          {old_variance:8.3f} "
+                         f"                   {new_variance:8.3f}")
+            logging.info(f"      min osd.{old_usage.osd_min: <5} {old_usage.osd_min_used:7.3f}%"
+                         f"          osd.{new_usage.osd_min: <5} {new_usage.osd_min_used:7.3f}%")
+            logging.info(f"   median osd.{old_usage.osd_median: <5} {old_usage.osd_median_used:7.3f}%"
+                         f"          osd.{new_usage.osd_median: <5} {new_usage.osd_median_used:7.3f}%")
+            logging.info(f"      max osd.{old_usage.osd_max: <5} {old_usage.osd_max_used:7.3f}%"
+                         f"          osd.{new_usage.osd_max: <5} {new_usage.osd_max_used:7.3f}%")
+
+        logging.info("")
+        logging.info(strlazy(lambda: f"new usable space:"))
+
+        # poolid -> (prev, new, gained space)
+        space_won = dict()
+        for poolid in self.pools_affected_by_balance:
+            _, prev_avail, prev_limit_osd = self.pool_avail[poolid]
+            poolname, new_avail, new_limit_osd = ana_new.pool_avail[poolid]
+            gain = new_avail - prev_avail
+            space_won[poolid] = (poolname, prev_avail, new_avail, gain)
+
+            if gain < 0:
+                change = self.pg_mappings.osd_size_change.get(prev_limit_osd)
+                if change is not None:
+                    change_newlimit = self.pg_mappings.osd_size_change.get(new_limit_osd)
+                    if change_newlimit is not None:
+                        change_newlimit_f = f"changed by {pformatsize(change_newlimit, 2)} overall"
+                    else:
+                        change_newlimit_f = "was not touched not at all"
+                    logging.info(f"pool {poolname} lost {pformatsize(gain, 2)} while we changed limiting osd.{prev_limit_osd} "
+                                f"by {pformatsize(change, 2)}, "
+                                f"now limited by osd.{new_limit_osd} (which {change_newlimit_f})")
+
+        poolnameheader = 'pool name'.ljust(self.max_poolname_len)
+        logging.info(strlazy(lambda: f"  {poolnameheader} {'id': >4} {'previous': >8}    {'new': >8}    {'change': >8}"))
+
+        for poolid, (poolname, prev_avail, new_avail, gain) in space_won.items():
+            poolname = poolname.ljust(self.max_poolname_len)
+            logging.info(strlazy(lambda: (f"  {poolname} {poolid: >4} {pformatsize(prev_avail, 2): >8} "
+                                        f"-> {pformatsize(new_avail, 2): >8} => {pformatsize(gain, 2): >8}")))
+
 
 def A001057():
     """
@@ -2523,9 +2646,6 @@ def balance(args, cluster):
                              osd_from_choice_method=osdfrom_method,
                              pg_choice_method=pg_choice_method)
 
-    # poolids for all that can be balanced due to their candidates osds having their contents moved around
-    pools_affected_by_balance = pg_mappings.get_potentially_affected_pools()
-
     # to restrict source osds
     source_osds = None
     if args.source_osds:
@@ -2537,46 +2657,9 @@ def balance(args, cluster):
     found_remap_size_sum = 0
     force_finish = False
 
-    logging.info("current OSD fill rate per crushclasses:")
-    for crushclass in pg_mappings.get_enabled_crushclasses():
-        usages = list()
-        for osdid in cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
-            usages.append(pg_mappings.get_osd_usage(osdid))
-
-        # fillaverage: calculated current osd usage
-        # crushclassusage: used percent of all space provided by this crushclass
-        fillaverage = statistics.mean(usages)
-        fillmedian = statistics.median(usages)
-        crushclass_usage = cluster.crushclasses_usage[crushclass]
-        logging.info(f"  {crushclass}: average={fillaverage:.2f}%, median={fillmedian:.2f}%, without_placement_constraints={crushclass_usage:.2f}%")
-
-    init_cluster_variance = pg_mappings.get_cluster_variance()
-    cluster_variance = init_cluster_variance
-
-    logging.info("cluster variance for crushclasses:")
-    for crushclass, variance in init_cluster_variance.items():
-        logging.info(f"  {crushclass}: {variance:.3f}")
-
-    # TODO: track these min-max values per crushclass
-    osd_usages_asc = pg_mappings.get_osd_usages_asc()
-    init_osd_min, init_osd_min_used = osd_usages_asc[0]
-    init_osd_max, init_osd_max_used = osd_usages_asc[-1]
-    osd_min = init_osd_min
-    osd_min_used = init_osd_min_used
-    osd_max = init_osd_max
-    osd_max_used = init_osd_max_used
-    logging.info(f"min osd.{init_osd_min} {init_osd_min_used:.3f}%")
-    logging.info(f"max osd.{init_osd_max} {init_osd_max_used:.3f}%")
-
-    init_pool_avail = dict()
-
-    logging.debug("currently usable space, caused by osd")
-    logging.debug(strlazy(lambda: f"  {'pool'.ljust(cluster.max_poolname_len)} {'size': >8} {'osd': >6}"))
-    for poolid in pools_affected_by_balance:
-        poolname = cluster.pools[poolid]['name'].ljust(cluster.max_poolname_len)
-        avail, limit_osd = pg_mappings.get_pool_max_avail_pgs_limit(poolid)
-        init_pool_avail[poolid] = (avail, limit_osd)
-        logging.debug(strlazy(lambda: f"  {poolname} {pformatsize(avail, 2): >8} {limit_osd: >6}"))
+    init_analysis = UsageAnalysis(pg_mappings)
+    init_analysis.log()
+    analysis = None
 
     while True:
         if found_remap_count >= args.max_pg_moves:
@@ -2770,12 +2853,6 @@ def balance(args, cluster):
                     # record the mapping
                     pg_mappings.apply_remap(move_pg, osd_from, osd_to)
 
-                    # what's the min/max osd now?
-                    osd_usages_asc = pg_mappings.get_osd_usages_asc()
-                    osd_min, osd_min_used = osd_usages_asc[0]
-                    osd_max, osd_max_used = osd_usages_asc[-1]
-                    cluster_variance = pg_mappings.get_cluster_variance()
-
                     # TODO: calculate win rate so we can predict the total free storage then
                     #       so we know how much actual free space our movement brought!
                     if new_variance > variance_before:
@@ -2790,11 +2867,9 @@ def balance(args, cluster):
                     logging.debug(strlazy(lambda: f"    pg {move_pg} was on {list_highlight(prev_pg_mapping, new_mapping_pos, 31)}"))
                     logging.debug(strlazy(lambda: f"    pg {move_pg} now on {list_highlight(new_pg_mapping, new_mapping_pos, 32)}"))
                     logging.info(f"    => variance new={new_variance} {variance_op} {variance_before}=old")
-                    logging.info(f"    new min osd.{osd_min} {osd_min_used:.3f}%")
-                    logging.info(f"        max osd.{osd_max} {osd_max_used:.3f}%")
-                    logging.info(f"    new cluster variance:")
-                    for crushclass, variance in cluster_variance.items():
-                        logging.info(f"      {crushclass}: {variance:.3f}")
+
+                    analysis = UsageAnalysis(pg_mappings)
+                    analysis.log()
 
                     found_remap = True
                     found_remap_count += 1
@@ -2811,56 +2886,15 @@ def balance(args, cluster):
                     unsuccessful_pools.add(pg_pool)
 
     # show results!
-    print_osd_usages(osd_usages_asc)
     logging.info(80*"-")
     logging.info(f"generated {found_remap_count} remaps.")
     logging.info(f"total movement size: {pformatsize(found_remap_size_sum)}.")
     logging.info(80*"-")
-    logging.info("old cluster variance per crushclass:")
-    for crushclass, variance in init_cluster_variance.items():
-        logging.info(f"  {crushclass}: {variance:.3f}")
-    logging.info(f"old min osd.{init_osd_min} {init_osd_min_used:.3f}%")
-    logging.info(f"old max osd.{init_osd_max} {init_osd_max_used:.3f}%")
+
+    if analysis:
+        init_analysis.log_compare_with(analysis)
+
     logging.info(80*"-")
-    logging.info(f"new min osd.{osd_min} {osd_min_used:.3f}%")
-    logging.info(f"new max osd.{osd_max} {osd_max_used:.3f}%")
-    logging.info(f"new cluster variance:")
-    for crushclass, variance in cluster_variance.items():
-        logging.info(f"  {crushclass}: {variance:.3f}")
-    logging.info(80*"-")
-
-    # poolid -> (prev, new, gained space)
-    space_won = dict()
-    for poolid in pools_affected_by_balance:
-        prev_avail, prev_limit_osd = init_pool_avail[poolid]
-        new_avail, new_limit_osd = pg_mappings.get_pool_max_avail_pgs_limit(poolid)
-        gain = new_avail - prev_avail
-        poolname = cluster.pools[poolid]['name']
-        space_won[poolid] = (poolname, prev_avail, new_avail, gain)
-
-        if gain < 0:
-            change = pg_mappings.osd_size_change.get(prev_limit_osd)
-            if change is not None:
-                change_newlimit = pg_mappings.osd_size_change.get(new_limit_osd)
-                if change_newlimit is not None:
-                    change_newlimit_f = f"changed by {pformatsize(change_newlimit, 2)} overall"
-                else:
-                    change_newlimit_f = "was not touched not at all"
-                logging.info(f"pool {poolname} lost {pformatsize(gain, 2)} while we changed limiting osd.{prev_limit_osd} "
-                             f"by {pformatsize(change, 2)}, "
-                             f"now limited by osd.{new_limit_osd} (which {change_newlimit_f})")
-
-    if space_won:
-        logging.info(strlazy(lambda: f"new usable space:"))
-        poolnameheader = 'pool name'.ljust(cluster.max_poolname_len)
-        logging.info(strlazy(lambda: f"{poolnameheader}  {'poolid': >4} {'previous': >8}    {'new': >8}    {'usable': >8}"))
-
-        for poolid, (poolname, prev_avail, new_avail, gain) in space_won.items():
-            poolname = poolname.ljust(cluster.max_poolname_len)
-            logging.info(strlazy(lambda: (f"  {poolname} {poolid: >4} {pformatsize(prev_avail, 2): >8} "
-                                          f"-> {pformatsize(new_avail, 2): >8} => {pformatsize(gain, 2): >8}")))
-    else:
-        logging.info(strlazy(lambda: f"done. this probably gain any space since no limiting osd is affected"))
 
     # print what we have been waiting for :)
     for pg, upmaps in pg_mappings.get_upmaps().items():

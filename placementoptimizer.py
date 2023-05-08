@@ -464,8 +464,8 @@ class ClusterState:
         self.pool_osds_up = defaultdict(set)
         self.pool_osds_acting = defaultdict(set)
 
-        # all crush bucket root ids
-        self.bucket_roots = list()
+        # crush root name -> (bucket_tree, child bucket_ids)
+        self.bucket_roots = dict()
 
         # what full percentage OSDs no longer accept data
         self.full_ratio = self.state["osd_dump"]["full_ratio"]
@@ -740,7 +740,7 @@ class ClusterState:
         # populare all bucket roots
         for root_bucket_id in bucket_root_ids:
             bucket_tree, bucket_ids = bucket_fill(root_bucket_id, bucket_info)
-            self.bucket_roots.append((bucket_tree, bucket_ids))
+            self.bucket_roots[bucket_tree['name']] = (bucket_tree, bucket_ids)
 
         del bucket_info
 
@@ -751,13 +751,12 @@ class ClusterState:
         returns {osdid: osdweight}
         """
 
-        for root_bucket, try_root_ids in self.bucket_roots:
-            if root_bucket["name"] == root_name:
-                root_ids = try_root_ids
-                break
+        root_data = self.bucket_roots.get(root_name)
 
-        if not root_ids:
-            raise Exception(f"crush root {root} not known?")
+        if not root_data:
+            raise Exception(f"crush root {root_name} not known?")
+
+        _, root_ids = root_data
 
         ret = dict()
 
@@ -806,6 +805,52 @@ class ClusterState:
             osd_weights[osdid] /= crush_sum
 
         return osd_weights
+
+
+    @lru_cache(maxsize=2 ** 14)
+    def trace_crush_root(self, osdid, root_name):
+        """
+        in the given root, trace back all items from the osd up to the root
+        """
+        found = False
+        root_data = self.bucket_roots.get(root_name)
+
+        if not root_data:
+            raise Exception(f"crush root {root_name} not known?")
+
+        _, root_ids = root_data
+
+        try_node_in_root = root_ids.get(osdid)
+        if try_node_in_root is None:
+            # osd is not part of this root, i.e. wrong device class
+            return None
+
+        node_id = try_node_in_root["id"]
+        assert node_id == osdid
+
+        # walk from leaf (osd) to the tree root
+        bottomup = list()
+        while True:
+            if node_id is None:
+                # we reached the root
+                break
+
+            bottomup.append({
+                "id": node_id,
+                "type_name": root_ids[node_id]["type_name"],
+            })
+
+            if root_ids[node_id]["name"] == root_name:
+                found = True
+                break
+
+            node_id = root_ids[node_id]["parent"]
+
+        if not found:
+            raise Exception(f"could not find a crush-path from osd={osdid} to {root_name!r}")
+
+        topdown = list(reversed(bottomup))
+        return topdown
 
 
     def get_crushclass_osds(self, crushclass, skip_zeroweight : bool = False):
@@ -896,54 +941,6 @@ class ClusterState:
 
 
 
-@lru_cache(maxsize=2 ** 14)
-def trace_crush_root(osd, root_name, cluster):
-    """
-    in the given root, trace back all items from the osd up to the root
-    """
-    found = False
-    for root_bucket, try_root_ids in cluster.bucket_roots:
-        if root_bucket["name"] == root_name:
-            root_ids = try_root_ids
-            break
-
-    if not root_ids:
-        raise Exception(f"crush root {root_name} not known?")
-
-    try_node_in_root = root_ids.get(osd)
-    if try_node_in_root is None:
-        # osd is not part of this root, i.e. wrong device class
-        return None
-
-    node_id = try_node_in_root["id"]
-    assert node_id == osd
-
-    # walk from leaf (osd) to the tree root
-    bottomup = list()
-    while True:
-        if node_id is None:
-            # we reached the root
-            break
-
-        bottomup.append({
-            "id": node_id,
-            "type_name": root_ids[node_id]["type_name"],
-        })
-
-        if root_ids[node_id]["name"] == root_name:
-            found = True
-            break
-
-        node_id = root_ids[node_id]["parent"]
-
-    if not found:
-        raise Exception(f"could not find a crush-path from osd={osd} to {root_name!r}")
-
-    topdown = list(reversed(bottomup))
-    return topdown
-
-
-
 def root_uses_from_rule(rule, pool_size):
     """
     rule: crush rule id
@@ -951,56 +948,47 @@ def root_uses_from_rule(rule, pool_size):
 
     return {root_name: choice_count}, [root_for_first_emitted_osd, next_root, ...]
     for the given crush rule.
-
-    the choose-step nums are processed in order:
-    val ==0: remaining_pool_size
-    val < 0: remaining_pool_size - val
-    val > 0: val
     """
-    chosen = 0
-
     # rootname -> number of chooses for this root
     root_usages = defaultdict(int)
     root_order = list()
 
-    root_candidate = None
-    root_chosen = None
-    root_use_num = None
+    chosen = 0
+    root_name = None
+    root_choice_count = None
 
     for step in rule["steps"]:
         if step["op"] == "take":
-            root_candidate = step["item_name"]
+            # new root take
+            root_name = step["item_name"]
+            root_choice_count = 1
+            num = 1
 
         elif step["op"].startswith("choose"):
-            # TODO: maybe "osd" type can be renamed? then we need to fetch it dynamically
-            if root_candidate and (step["op"].startswith("chooseleaf")
-                                   or step["type"] == "osd"):
-                root_chosen = root_candidate
-                root_use_num = step["num"]
+            num = step["num"]
 
         elif step["op"] == "emit":
-            if root_chosen:
-                if root_use_num == 0:
-                    root_use_num = pool_size
-                elif root_use_num < 0:
-                    root_use_num = pool_size - root_use_num
-                elif root_use_num > 0:
-                    pass  # so we use root_use_num
 
+            if root_choice_count is not None:
                 # limit to pool size
-                root_use_num = min(pool_size - chosen, root_use_num)
-                root_usages[root_chosen] += root_use_num
-
-                root_order.extend([root_chosen] * root_use_num)
-
-                chosen += root_use_num
-                root_candidate = None
-                root_chosen = None
-                root_use_num = None
+                root_choice_count = min(pool_size - chosen, root_choice_count)
+                root_usages[root_name] += root_choice_count
+                root_order.extend([root_name] * root_choice_count)
+                chosen += root_choice_count
                 if chosen == pool_size:
                     break
 
-    if not root_usages:
+            num = 1
+
+        else:
+            continue
+
+        if num <= 0:
+            num += pool_size
+
+        root_choice_count *= num
+
+    if not root_usages or chosen == 0:
         raise Exception(f"rule chooses no roots")
 
     return root_usages, root_order
@@ -1060,7 +1048,6 @@ def get_max_reuses(rule, pool_size):
         reuses_for_take.append(fanout_cum)
 
         if num <= 0:
-            numprev = 0
             num += pool_size
 
         fanout_cum *= num
@@ -1089,27 +1076,30 @@ class PGMoveChecker:
         self.pool_size = self.pool["size"]
         self.rule = self.cluster.crushrules[self.pool['crush_rule']]
 
-        logging.debug(strlazy(lambda: (f"movecheck for pg {move_pg} (poolsize={self.pool_size})")))
+        logging.debug(strlazy(lambda: (f"movecheck for pg {move_pg} on {self.pg_osds} (poolsize={self.pool_size})")))
 
         # crush root names and usages for this pg
         root_uses, root_order = root_uses_from_rule(self.rule, self.pool_size)
+
+        if len(root_order) != len(self.pg_osds):
+            raise Exception(f"not as many roots as shards! {root_order=} osds={self.pg_osds}")
 
         # map osd -> crush root name
         self.osd_roots = dict()
         for osdid, root in zip(self.pg_osds, root_order):
             self.osd_roots[osdid] = root
 
-        # all available placement osds for this crush root
-        self.osd_candidates = set()
+        # root_name -> osdid candidates -> weight
+        self.osd_candidates = dict()
         for root_name in root_uses.keys():
-            for osdid in self.cluster.candidates_for_root(root_name).keys():
-                self.osd_candidates.add(osdid)
+            self.osd_candidates[root_name] = self.cluster.candidates_for_root(root_name)
 
-    def get_osd_candidates(self):
+    def get_osd_candidates(self, osd_from) -> list[int]:
         """
         return all possible candidate OSDs for the PG to relocate.
         """
-        return self.osd_candidates
+        root_name = self.osd_roots[osd_from]
+        return self.osd_candidates[root_name]
 
     @staticmethod
     def use_item_type(item_uses, trace, item_type, rule_step):
@@ -1241,7 +1231,7 @@ class PGMoveChecker:
         # a rule may have different crush roots
         # this offset slides through the rules' devices
         # for each root.
-        rule_device_offset = 0
+        devices_chosen = 0
 
         # rule_step -> tree_depth to next rule (what tree layer is this rule step)
         # because "choose" steps may skip layers in the crush hierarchy
@@ -1295,13 +1285,14 @@ class PGMoveChecker:
                 rule_tree_depth.append(tree_depth)
 
                 # how many devices will be selected in this root?
-                root_device_count = max_reuses[take_index][0]
-                root_osds = self.pg_osds[rule_device_offset:(rule_device_offset + root_device_count)]
+                # maximum is gonna be the pool size anyway
+                root_device_count = min(self.pool_size - devices_chosen, max_reuses[take_index][0])
+                root_osds = self.pg_osds[devices_chosen:(devices_chosen + root_device_count)]
 
                 # generate tracebacks for all osds that ends up in this root.
                 # we collect root-traces of all acting osds of the pg we wanna check for.
                 for pg_osd in root_osds:
-                    trace = trace_crush_root(pg_osd, current_root_name, self.cluster)
+                    trace = self.cluster.trace_crush_root(pg_osd, current_root_name)
                     logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
                     if trace is None or len(trace) < 2:
                         raise Exception(f"no trace found for {pg_osd} in {current_root_name}")
@@ -1369,7 +1360,7 @@ class PGMoveChecker:
 
                 # we now emitted this many devices - so we shift what device
                 # of the pg we're looking at now.
-                rule_device_offset += root_device_count
+                devices_chosen += root_device_count
 
                 # did we enter remember the tree depth for each rule step?
                 assert len(rule_tree_depth) == rule_step
@@ -1400,8 +1391,8 @@ class PGMoveChecker:
             raise Exception("no emit in crush rule processed")
 
         # we should have processed exactly pool-size many devices
-        assert rule_device_offset == self.pool_size
-        assert rule_device_offset == len(constraining_traces)
+        assert devices_chosen == self.pool_size, f"{devices_chosen=} != poolsize={self.pool_size}"
+        assert devices_chosen == len(constraining_traces)
         # for each rule step there should be a tree depth entry
         assert len(rule_tree_depth) == rule_step
         # for each rule step, we should have registered item usages
@@ -1428,10 +1419,6 @@ class PGMoveChecker:
             logging.debug(strlazy(lambda: f"   crush invalid: osd.{new_osd} in {self.pg_osds}"))
             return False
 
-        if new_osd not in self.osd_candidates:
-            logging.debug(strlazy(lambda: f"   crush invalid: osd.{new_osd} not in same crush root"))
-            return False
-
         # the trace we no longer consider (since we replace the osd)
         old_trace = self.constraining_traces[old_osd]
 
@@ -1439,14 +1426,17 @@ class PGMoveChecker:
         # the new one needs to be under the same root.
         root_name = self.osd_roots[old_osd]
 
+        if new_osd not in self.osd_candidates[root_name]:
+            raise Exception(f"target osd.{new_osd} not in same crush root as source")
+
         # which "take" was the old osd in - we need to respect the same "take"
         take_index = self.device_take_index[old_osd]
 
         # create trace for the replacement candidate
-        new_trace = trace_crush_root(new_osd, root_name, self.cluster)
+        new_trace = self.cluster.trace_crush_root(new_osd, root_name)
 
         if new_trace is None:
-            # should never be tried as candidate
+            # new_osd should never be tried as candidate if it's not part of root_name
             raise Exception(f"no trace found for {new_osd} up to {root_name}")
 
         logging.debug(strlazy(lambda: f"   trace for old osd.{old_osd}: {old_trace}"))
@@ -1495,18 +1485,27 @@ class PGMoveChecker:
 
         osd_from -> osd_to: how would the variance look, if
                             we had moved data.
+        if only osd_from given: restrict the osd candidates to that source osd's crush tree.
         """
 
-        if osd_from or osd_to:
+        simulate_move = False
+        if osd_from and osd_to:
+            simulate_move = True
             pg_shardsize = self.cluster.get_pg_shardsize(self.pg)
 
+        if osd_from is not None:
+            candidates = self.get_osd_candidates(osd_from)
+        else:
+            candidates = itertools.chain(*self.osd_candidates.values())
+
         osds_used = list()
-        for osd in self.osd_candidates:
+        for osd in candidates:
             delta = 0
-            if osd == osd_from:
-                delta = -pg_shardsize
-            elif osd == osd_to:
-                delta = pg_shardsize
+            if simulate_move:
+                if osd == osd_from:
+                    delta = -pg_shardsize
+                elif osd == osd_to:
+                    delta = pg_shardsize
 
             if self.cluster.osds[osd]['weight'] == 0 or self.cluster.osds[osd]['crush_weight'] == 0:
                 # relative usage of weight 0 is impossible
@@ -1517,12 +1516,6 @@ class PGMoveChecker:
 
         var = statistics.variance(osds_used)
         return var
-
-    def filter_candidate(self, osdid):
-        """
-        given an an osd id, is it a candidate for moving this pg?
-        """
-        return osdid in self.osd_candidates
 
 
 class PGMappings:
@@ -1596,8 +1589,8 @@ class PGMappings:
 
         # pg->[(osd_from, osd_to), ...]
         self.remaps = dict()
-        # {osd we used to move from}
-        self.from_osds_used = set()
+        # {osd we moved data to/from: amount moved}
+        self.osd_size_change = defaultdict(lambda: 0)
 
         # collect crushclasses from all enabled pools
         self.enabled_crushclasses = cluster.crushclass_osds.keys()
@@ -1797,6 +1790,9 @@ class PGMappings:
         self.osd_shardsize_sum[osd_from] -= shard_size
         self.osd_shardsize_sum[osd_to] += shard_size
 
+        self.osd_size_change[osd_from] -= shard_size
+        self.osd_size_change[osd_to] += shard_size
+
         poolid = pool_from_pg(pg)
         self.osd_pool_up_shard_count[osd_from][poolid] -= 1
         self.osd_pool_up_shard_count[osd_to][poolid] += 1
@@ -1809,9 +1805,6 @@ class PGMappings:
 
         # insert a new mapping tracker
         self.remaps.setdefault(pg, []).append((osd_from, osd_to))
-
-        self.from_osds_used.add(osd_from)
-
     def get_enabled_crushclasses(self):
         """
         osds of which crushclasses are we gonna touch?
@@ -1923,9 +1916,14 @@ class PGMappings:
             yield osdid, usage
 
 
-    def get_osd_target_candidates(self, move_pg: Optional[str] = None):
+    def get_osd_target_candidates(self,
+                                  osd_candidates: Optional[dict] = None,
+                                  move_pg: Optional[str] = None):
         """
         generate target candidates to move a pg to.
+
+        if given a pg to be moved, add that to the size estimation
+        so we sort candidates by fullness "after" the move.
 
         method: emptiest
         use the relatively emptiest osd.
@@ -1935,8 +1933,13 @@ class PGMappings:
         if move_pg:
             move_pg_shardsize = self.cluster.get_pg_shardsize(move_pg)
 
+        # {osdid: usage_in_percent}
+        # either the supplied candidates, or all possible
+        osdids = osd_candidates or self.osd_candidates
+        candidates = ((osdid, self.get_osd_usage(osdid, add_size=move_pg_shardsize)) for osdid in osdids)
+
         # emit empty first
-        for osdid, usage in sorted(self.get_osd_usages(add_size=move_pg_shardsize).items(),
+        for osdid, usage in sorted(candidates,
                                    key=lambda osd: osd[1],
                                    reverse=False):
             yield osdid, usage
@@ -2604,7 +2607,7 @@ def balance(args, cluster):
 
             if source_attempts > args.max_move_attempts:
                 logging.info(f"couldn't empty osd.{last_attempt}, so we're done. "
-                             f"if you want to try more often, set --max-full-move-attempts=$nr, this may unlock "
+                             f"if you want to try more often, set --max-move-attempts=$nr, this may unlock "
                              f"more balancing possibilities.")
                 force_finish = True
                 continue
@@ -2620,7 +2623,6 @@ def balance(args, cluster):
             pg_candidates = pg_mappings.get_pg_move_candidates(osd_from)
 
             from_osd_pg_count = pg_mappings.osd_pool_up_shard_count[osd_from]
-
             from_osd_satisfied_pools = set()
 
             # now try to move the candidates to their possible destination
@@ -2648,7 +2650,8 @@ def balance(args, cluster):
                 logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
-                pool_pg_shard_count_ideal = cluster.pool_pg_shard_count_ideal(pg_pool, try_pg_move.get_osd_candidates())
+                osd_to_candidates = try_pg_move.get_osd_candidates(osd_from)
+                pool_pg_shard_count_ideal = cluster.pool_pg_shard_count_ideal(pg_pool, osd_to_candidates)
                 from_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_from)
 
                 # only move the pg if the source osd has more PGs of the pool than average
@@ -2666,7 +2669,7 @@ def balance(args, cluster):
 
                 # pre-filter PGs to rule out those that will for sure not gain any space
                 pg_small_enough = False
-                for osd_to in try_pg_move.get_osd_candidates():
+                for osd_to in osd_to_candidates:
                     target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
 
                     # check if the target osd will be used less than the source
@@ -2684,18 +2687,17 @@ def balance(args, cluster):
                 try_pg_move.prepare_crush_check()
 
                 # check variance for this crush root
-                variance_before = try_pg_move.get_placement_variance()
+                variance_before = try_pg_move.get_placement_variance(osd_from)
 
-                for osd_to, osd_to_usage in pg_mappings.get_osd_target_candidates(move_pg):
-                    logging.debug("TRY-1 move %s osd.%s => osd.%s", move_pg, osd_from, osd_to)
-
-                    if not try_pg_move.filter_candidate(osd_to):
-                        # e.g. crushclass doesn't match.
-                        continue
+                for osd_to, osd_to_usage in pg_mappings.get_osd_target_candidates(osd_to_candidates, move_pg):
+                    if not osd_to in osd_to_candidates:
+                        # e.g. target osd not a candidate
+                        raise Exception("tried non-candidate target osd")
 
                     if osd_to == osd_from:
-                        logging.debug(" BAD move to source OSD makes no sense")
                         continue
+
+                    logging.debug("TRY-1 move %s osd.%s => osd.%s", move_pg, osd_from, osd_to)
 
                     # in order to not fight the regular balancer, don't move the PG to a disk
                     # where the weighted pg count of this pool is already good
@@ -2831,23 +2833,31 @@ def balance(args, cluster):
     space_won = dict()
     for poolid in pools_affected_by_balance:
         prev_avail, prev_limit_osd = init_pool_avail[poolid]
-        new_avail = pg_mappings.get_pool_max_avail_pgs(poolid)
+        new_avail, new_limit_osd = pg_mappings.get_pool_max_avail_pgs_limit(poolid)
         gain = new_avail - prev_avail
-        if gain > 0:
-            space_won[poolid] = (prev_avail, new_avail, gain)
-        else:
-            limit_used = prev_limit_osd in pg_mappings.from_osds_used
-            if limit_used:
-                logging.info(f"gain == 0 even though we moved from {prev_limit_osd}")
+        poolname = cluster.pools[poolid]['name']
+        space_won[poolid] = (poolname, prev_avail, new_avail, gain)
+
+        if gain < 0:
+            change = pg_mappings.osd_size_change.get(prev_limit_osd)
+            if change is not None:
+                change_newlimit = pg_mappings.osd_size_change.get(new_limit_osd)
+                if change_newlimit is not None:
+                    change_newlimit_f = f"changed by {pformatsize(change_newlimit, 2)} overall"
+                else:
+                    change_newlimit_f = "was not touched not at all"
+                logging.info(f"pool {poolname} lost {pformatsize(gain, 2)} while we changed limiting osd.{prev_limit_osd} "
+                             f"by {pformatsize(change, 2)}, "
+                             f"now limited by osd.{new_limit_osd} (which {change_newlimit_f})")
 
     if space_won:
         logging.info(strlazy(lambda: f"new usable space:"))
         poolnameheader = 'pool name'.ljust(cluster.max_poolname_len)
-        logging.info(strlazy(lambda: f"{poolnameheader} {'previous': >8}   {'new': >8}   {'gain': >8}"))
+        logging.info(strlazy(lambda: f"{poolnameheader}  {'poolid': >4} {'previous': >8}    {'new': >8}    {'usable': >8}"))
 
-        for poolid, (prev_avail, new_avail, gain) in space_won.items():
-            poolname = cluster.pools[poolid]['name'].ljust(cluster.max_poolname_len)
-            logging.info(strlazy(lambda: (f"  {poolname} {pformatsize(prev_avail, 2): >8} "
+        for poolid, (poolname, prev_avail, new_avail, gain) in space_won.items():
+            poolname = poolname.ljust(cluster.max_poolname_len)
+            logging.info(strlazy(lambda: (f"  {poolname} {poolid: >4} {pformatsize(prev_avail, 2): >8} "
                                           f"-> {pformatsize(new_avail, 2): >8} => {pformatsize(gain, 2): >8}")))
     else:
         logging.info(strlazy(lambda: f"done. this probably gain any space since no limiting osd is affected"))

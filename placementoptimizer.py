@@ -2656,6 +2656,7 @@ def balance(args, cluster):
     # size of found remaps
     found_remap_size_sum = 0
     force_finish = False
+    found_remap = False
 
     init_analysis = UsageAnalysis(pg_mappings)
     init_analysis.log()
@@ -2669,11 +2670,11 @@ def balance(args, cluster):
         if force_finish:
             break
 
+        if found_remap or found_remap_count == 0:
+            source_attempts = 0
+
         found_remap = False
-
         unsuccessful_pools = set()
-
-        source_attempts = 0
         last_attempt = -1
 
         # try to move the biggest pg from the fullest disk to the next suiting smaller disk
@@ -2716,7 +2717,7 @@ def balance(args, cluster):
             #       even better, we can integrate the PGMoveChecker directly, and thus calculate
             #       target OSD candidates _within_ the pg candidate generation.
             for move_pg_idx, move_pg in enumerate(pg_candidates.get_candidates()):
-                if found_remap or force_finish:
+                if found_remap:
                     break
 
                 pg_pool = pool_from_pg(move_pg)
@@ -2884,6 +2885,10 @@ def balance(args, cluster):
                     # but if we still end up here, it means the choices for moves are really
                     # becoming tight.
                     unsuccessful_pools.add(pg_pool)
+
+                # end of to-loop
+            # end of pg loop
+        # end of from-loop
 
     # show results!
     logging.info(80*"-")

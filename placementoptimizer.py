@@ -19,7 +19,6 @@ import subprocess
 import datetime
 from enum import Enum
 from collections import defaultdict
-from dataclasses import dataclass
 from functools import lru_cache
 from itertools import chain, zip_longest
 from pprint import pformat, pprint
@@ -549,7 +548,7 @@ class ClusterState:
                 blowup_rate = pool["size"]
 
             else:
-                raise Exception(f"unknown {pool_type=}")
+                raise Exception(f"unknown pool_type={pool_type}")
 
             self.pools[id].update({
                 "erasure_code_profile": ec_profile if pool_type == "ec" else None,
@@ -1083,7 +1082,7 @@ class PGMoveChecker:
         root_uses, root_order = root_uses_from_rule(self.rule, self.pool_size)
 
         if len(root_order) != len(self.pg_osds):
-            raise Exception(f"not as many roots as shards! {root_order=} osds={self.pg_osds}")
+            raise Exception(f"not as many roots as shards! root_order={root_order} osds={self.pg_osds}")
 
         # map osd -> crush root name
         self.osd_roots = dict()
@@ -1095,9 +1094,11 @@ class PGMoveChecker:
         for root_name in root_uses.keys():
             self.osd_candidates[root_name] = self.cluster.candidates_for_root(root_name)
 
-    def get_osd_candidates(self, osd_from) -> list[int]:
+    def get_osd_candidates(self, osd_from):
         """
         return all possible candidate OSDs for the PG to relocate.
+
+        returns [osdid, ...]
         """
         root_name = self.osd_roots[osd_from]
         return self.osd_candidates[root_name]
@@ -1366,7 +1367,7 @@ class PGMoveChecker:
                 # did we enter remember the tree depth for each rule step?
                 assert len(rule_tree_depth) == rule_step
                 # did we remember how often items were reused in a rule step?
-                assert len(item_uses) == rule_step, f"len({item_uses=}) != ({rule_step=})"
+                assert len(item_uses) == rule_step, f"len(item_uses{item_uses}) != (rule_step={rule_step})"
 
                 # this take must have as many steps as the max-reuse list has items
                 assert take_rule_step_count[take_index] == len(max_reuses[take_index]),\
@@ -1392,7 +1393,7 @@ class PGMoveChecker:
             raise Exception("no emit in crush rule processed")
 
         # we should have processed exactly pool-size many devices
-        assert devices_chosen == self.pool_size, f"{devices_chosen=} != poolsize={self.pool_size}"
+        assert devices_chosen == self.pool_size, f"devices_chosen={devices_chosen} != poolsize={self.pool_size}"
         assert devices_chosen == len(constraining_traces)
         # for each rule step there should be a tree depth entry
         assert len(rule_tree_depth) == rule_step
@@ -2217,7 +2218,7 @@ class PGMappings:
 
 
         if min_avail < 0:
-            raise Exception(f"no pg of {poolid=} mapped on any osd to use space")
+            raise Exception(f"no pg of poolid={poolid} mapped on any osd to use space")
 
         return min_avail, limiting_osd
 
@@ -2424,16 +2425,29 @@ class PGCandidates:
     def __len__(self):
         return len(self.pg_candidates)
 
-@dataclass
+
+# should be a @dataclass, but that needs py3.7
 class CrushclassUsage:
-    fill_average: float
-    usage_percent: float
-    osd_min: int
-    osd_min_used: float
-    osd_median: int
-    osd_median_used: float
-    osd_max: int
-    osd_max_used: float
+
+    def __init__(self,
+                 fill_average,
+                 usage_percent,
+                 osd_min,
+                 osd_min_used,
+                 osd_median,
+                 osd_median_used,
+                 osd_max,
+                 osd_max_used):
+
+        self.fill_average: float = fill_average
+        self.usage_percent: float = usage_percent
+        self.osd_min: int = osd_min
+        self.osd_min_used: float = osd_min_used
+        self.osd_median: int = osd_median
+        self.osd_median_used: float = osd_median_used
+        self.osd_max: int = osd_max
+        self.osd_max_used: float = osd_max_used
+
 
 
 class UsageAnalysis:

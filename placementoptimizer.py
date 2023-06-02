@@ -307,7 +307,8 @@ class ClusterState:
     # to detect if imported state files are incompatible
     STATE_VERSION = 1
 
-    def __init__(self, statefile, osdsize_method: OSDSizeMethod = OSDSizeMethod.CRUSH):
+    def __init__(self, statefile: Optional[str] = None,
+                 osdsize_method: OSDSizeMethod = OSDSizeMethod.CRUSH):
         self.state = dict()
         self.load(statefile)
 
@@ -3290,8 +3291,6 @@ def main():
     log_setup(args.verbose - args.quiet)
 
     if args.mode == 'gather':
-        if args.statefile:
-            raise Exception("in gather mode, a state file can't be used as source")
         state = ClusterState()
         state.dump(args.output_file)
 

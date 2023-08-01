@@ -430,18 +430,12 @@ class ClusterState:
                 out.seek(return_pos)
 
 
-        # 12 byte compat header
         # 1+1+4 byte old header
-        writeb(b'\x08', 'osdmap_compat_struct_v') # old u8 struct_v
-        writeb(b'\x07', 'osdmap_compat_struct_compat') # old u8 struct_compat
-        writeb(struct.pack('<I', 0), 'osdmap_compat_struct_len') # old struct_len: u32
+        osdmap_compat_struct = StructVersion(out, 8, 7, 'osdmap_compat')
 
         # 1+1+4 byte new header
-        writeb(b'\x09', 'osdmap_struct_v') # u8 struct_v. bumped to 9 in d414f0b43a69f3c2db8e454d795be881496237c
-        writeb(b'\x01', 'osdmap_struct_compat') # u8 struct_compat version (ensure v >= compat_version)
-        # struct size
-        osdmap_size_start_pos = out.tell()
-        writeb(struct.pack('<I', 0xaaaaaaaa), 'osdmap_struct_len') # struct_len u32
+        # struct_v bumped to 9 in d414f0b43a69f3c2db8e454d795be881496237c
+        osdmap_struct = StructVersion(out, 9, 1, 'osdmap')
 
         # fsid: 16 byte uuid
         writeb(uuid.UUID(self.state['osd_dump']['fsid']).bytes, 'fsid')
@@ -567,9 +561,39 @@ class ClusterState:
             writeb(struct.pack('<I', pool['hit_set_search_last_n']), 'hit_set_search_last_n')
 
             # pool_opts_t opts
-            writeb(struct.pack('<BBI', 2, 1, 4), 'pool_opts_t_ver') # ver, compatver, structlen
-            # fake pool_opts_t map<u32, boost:variant...> (len(pool['options']))
-            writeb(struct.pack('<I', 0), 'pool_opts_t_len')
+            pool_opts_struct = StructVersion(out, 2, 1, f'pool_{pool["pool"]}_pool_opts_t')
+            # pool_opts_t map<u32, boost:variant...> (len(pool['options']))
+            # u32 options_len
+            writeb(struct.pack('<I', len(pool['options'])), 'pool_opts_t_len')
+            option_ids = {
+                'compression_mode': 6,
+                'compression_algorithm': 7,
+                'pg_num_min': 15,
+            }
+            # sort option keys by option id
+            for key_name, value in sorted(pool['options'].items(),
+                                          key=lambda e: option_ids[e[0]]):
+                key_id = option_ids[key_name]
+                writeb(struct.pack('<i', key_id), f'pool_opts_t_key:{key_name}')
+
+                # only support string values for now
+                val_type = type(value)
+                val_type_id = {
+                    str: 0,    # std::string
+                    int: 1,    # int64_t
+                    float: 2,  # double
+                }[val_type]
+                writeb(struct.pack('<i', val_type_id), f'pool_opts_t_val_type')
+                if val_type_id == 0:
+                    value_b = value.encode()
+                    writeb(struct.pack('<I', len(value_b)), 'pool_opts_t_value_str_len')
+                    writeb(value_b, 'pool_opts_t_str_value')
+                elif val_type_id == 1:
+                    writeb(struct.pack('<q', value), 'pool_opts_t_value_int')
+                else:
+                    raise Exception("unhandled option value type")
+
+            pool_opts_struct.write_len()
 
             # u32 last_force_op_resend_prenautilus
             writeb(struct.pack('<I', int(pool['last_force_op_resend_prenautilus'])), 'last_force_op_resend_prenautilus')
@@ -646,8 +670,9 @@ class ClusterState:
 
         # crush
 
+        osdmap_struct.write_len()
+        osdmap_compat_struct.write_len()
         # todo: add u32 crc
-        # todo: update struct_len of new header to ensure correct length
 
         with open(output_file, "wb") as hdl:
             hdl.write(out.getbuffer())

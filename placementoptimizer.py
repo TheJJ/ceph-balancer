@@ -9,14 +9,18 @@ GPLv3 or later
 
 
 import argparse
+import binascii
+import datetime
 import itertools
+import io
 import json
 import logging
 import lzma
 import shlex
 import statistics
+import struct
 import subprocess
-import datetime
+import uuid
 from enum import Enum
 from collections import defaultdict
 from functools import lru_cache
@@ -37,7 +41,7 @@ def parse_args():
                            "device=device_size, weighted=devsize*weight, crush=crushweight*weight"))
 
     sp = cli.add_subparsers(dest='mode')
-    sp.required=True
+    sp.required = True
 
     statep = argparse.ArgumentParser(add_help=False)
     statep.add_argument("--state", "-s", help="load cluster state from this jsonfile")
@@ -126,6 +130,13 @@ def parse_args():
                            help="compare to this pool which osds are involved")
 
     sp.add_parser('repairstats', parents=[statep])
+
+    osdmapp = sp.add_parser('osdmap', help="compatibility with ceph osd maps")
+    osdmapsp = osdmapp.add_subparsers(dest='osdmapmode')
+    osdmapsp.required = True
+
+    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep], help="create osdmap files")
+    osdmapexportsp.add_argument("output_file", help="osdmap filename to save to")
 
     args = cli.parse_args()
     return args
@@ -233,6 +244,24 @@ def pformatsize(size_bytes, commaplaces=1):
 
     return "%.1fB" % size_bytes
 
+def cephtime_to_datetime(cephtime: str):
+    """
+    converts a ceph dump timestamp to python datetime.
+    """
+    # we have to insert a : in the timezone part so python is happy...
+    cephtime_with_fixed_timezone = cephtime[:-2] + ":" + cephtime[-2:]
+    return datetime.datetime.fromisoformat(cephtime_with_fixed_timezone)
+
+def datetime_to_osdmaptime(when: datetime.datetime):
+    ns = when.time().microsecond * 1000
+    ts = when.timestamp()
+    sec = int(ts // 1)
+    # since osdmap stores real nanoseconds, we can't produce perfect results
+    # to reduce confusion when comparing diffs, mark the broken nanoseconds
+    return struct.pack("<II", sec, ns | 0xffff)
+
+def cephtime_to_osdmaptime(when: str):
+    return datetime_to_osdmaptime(cephtime_to_datetime(when))
 
 # definition from `struct pg_pool_t`:
 #  enum {
@@ -366,7 +395,263 @@ class ClusterState:
         with lzma.open(output_file, "wt") as hdl:
             json.dump(self.state, hdl, indent='\t')
 
-        logging.warn(f"cluster state saved to {output_file}")
+        logging.warning(f"cluster state saved to {output_file}")
+
+
+    def export_osdmap(self, output_file):
+        logging.info(f"exporting cluster state as osdmap to {output_file}...")
+
+        out = io.BytesIO()
+
+        def writeb(data, name=None):
+            print(f"[{out.tell():>10x}] {binascii.hexlify(data)} {'<- %s' % name if name else ''}")
+            out.write(data)
+
+        class StructVersion:
+            def __init__(self, stream, struct_v, compat_v, name=None):
+                self.stream = stream
+                self.name = name or "struct"
+
+                # 1+1+4 byte compat header
+                writeb(struct.pack('<B', struct_v), f'{self.name}_struct_v')
+                writeb(struct.pack('<B', compat_v), f'{self.name}_compat_v')
+
+                self.len_field_pos = stream.tell()
+                # struct_len: u32
+                # fill the len hole with dummy data
+                writeb(struct.pack('<I', 0xbbbbbbbb), f'{self.name}_len_dummy')
+
+            def write_len(self):
+                struct_len = self.stream.tell() - self.len_field_pos - 4
+                assert struct_len >= 0
+                return_pos = self.stream.tell()
+                out.seek(self.len_field_pos)
+                writeb(struct.pack('<I', struct_len), f'{self.name}_len_update')
+                out.seek(return_pos)
+
+
+        # 12 byte compat header
+        # 1+1+4 byte old header
+        writeb(b'\x08', 'osdmap_compat_struct_v') # old u8 struct_v
+        writeb(b'\x07', 'osdmap_compat_struct_compat') # old u8 struct_compat
+        writeb(struct.pack('<I', 0), 'osdmap_compat_struct_len') # old struct_len: u32
+
+        # 1+1+4 byte new header
+        writeb(b'\x09', 'osdmap_struct_v') # u8 struct_v. bumped to 9 in d414f0b43a69f3c2db8e454d795be881496237c
+        writeb(b'\x01', 'osdmap_struct_compat') # u8 struct_compat version (ensure v >= compat_version)
+        # struct size
+        osdmap_size_start_pos = out.tell()
+        writeb(struct.pack('<I', 0xaaaaaaaa), 'osdmap_struct_len') # struct_len u32
+
+        # fsid: 16 byte uuid
+        writeb(uuid.UUID(self.state['osd_dump']['fsid']).bytes, 'fsid')
+
+        # epoch: u32
+        writeb(struct.pack('<I', self.state['osd_dump']['epoch']), 'epoch')
+
+        # created: utime_t
+        writeb(cephtime_to_osdmaptime(self.state['osd_dump']['created']), 'created') # u32 sec, u32 nsec
+        # modified: utime_t
+        writeb(cephtime_to_osdmaptime(self.state['osd_dump']['modified']), 'modified') # u32 sec, u32 nsec
+
+        # pools: map<int64, pg_pool_t> (u32 map.size())
+        writeb(struct.pack('<I', len(self.state['osd_dump']['pools'])), 'pools_map_len')
+        for pool in self.state['osd_dump']['pools']:
+            # s64 pool id for map
+            writeb(struct.pack('<q', pool['pool']), 'pool_id')
+
+            # start pg_pool_t
+            # 1+1+4 byte compat header:
+            # u8 struct_v, u8 compat_v
+            pg_pool_t_struct = StructVersion(out, 29, 5, f'pg_pool_t_{pool["pool"]}')
+
+            # u8 type
+            writeb(struct.pack('<B', pool['type']), 'type')
+            # u8 size;
+            writeb(struct.pack('<B', pool['size']), 'size')
+            # u8 crush_rule;
+            writeb(struct.pack('<B', pool['crush_rule']), 'crush_rule')
+            # u8 object_hash;
+            writeb(struct.pack('<B', pool['object_hash']), 'object_hash')
+
+            # u32 pg_num;
+            writeb(struct.pack('<I', pool['pg_num']), 'pg_num')
+            # missing u32 pgp_num, reuse pg_num
+            writeb(struct.pack('<I', pool['pg_num']), 'pgp_num')
+            # legacy u32 lpg_num = 0; # localized pgs
+            writeb(struct.pack('<I', 0), 'lpg_num')
+            # legacy u32 lpgp_num = 0;
+            writeb(struct.pack('<I', 0), 'lpgp_num')
+            # u32 last_change; # epoch
+            writeb(struct.pack('<I', int(pool["last_change"])), 'last_change')
+
+            # u64 snapid_t snap_seq
+            writeb(struct.pack('<Q', pool['snap_seq']), 'snap_seq')
+            # u32 snap_epoch
+            writeb(struct.pack('<I', pool['snap_epoch']), 'snap_epoch')
+            # fake map<snapid_t, pool_snap_info_t>
+            writeb(struct.pack('<I', 0), 'snap_info_map_len')
+            # fake interval_set<snapid_t> removed_snaps
+            writeb(struct.pack('<I', 0), 'removed_snap_set_len')
+
+            # u64 auid
+            writeb(struct.pack('<Q', pool["auid"]), 'auid')
+            # u64 flags
+            writeb(struct.pack('<Q', pool["flags"]), 'flags')
+            # legacy u32 crash_replay_interval
+            writeb(struct.pack('<I', 0), 'crash_replay_interval')
+
+            # u8 min_size;
+            writeb(struct.pack('<B', pool['min_size']), 'min_size')
+
+            # u64 quota_max_bytes
+            writeb(struct.pack('<Q', pool["quota_max_bytes"]), 'quota_max_bytes')
+            # u64 quota_max_objects
+            writeb(struct.pack('<Q', pool["quota_max_objects"]), 'quota_max_objects')
+
+            # fake set<u64> tiers;
+            writeb(struct.pack('<I', 0), "tiers")
+            # fake s64 tier_of
+            writeb(struct.pack('<q', -1), "tier_of")
+            # fake u8 cache_mode. 0=none
+            writeb(struct.pack('<B', 0), "cache_mode")
+            # fake s64 read_tier
+            writeb(struct.pack('<q', -1), "read_tier")
+            # fake s64 write_tier
+            writeb(struct.pack('<q', -1), "write_tier")
+            # legacy map<std::string, std::string> properties;
+            writeb(struct.pack('<I', 0), 'properties old')
+            # fake hit_set_params
+            writeb(struct.pack('<BBI', 1, 1, 1), 'hit_set_compat_ver') # ver, compatver, structlen
+            writeb(struct.pack('<B', 0), 'hit_set_param_none') # hitset::params::type_none
+            # u32 hit_set_period
+            writeb(struct.pack('<I', pool['hit_set_period']), 'hit_set_period')
+            # u32 hit_set_count
+            writeb(struct.pack('<I', pool['hit_set_count']), 'hit_set_count')
+            # u32 stripe_width
+            writeb(struct.pack('<I', pool['stripe_width']), 'stripe_width')
+            # u64 target_max_bytes
+            writeb(struct.pack('<Q', pool['target_max_bytes']), 'target_max_bytes')
+            # u64 target_max_objects
+            writeb(struct.pack('<Q', pool['target_max_objects']), 'target_max_objs')
+            # u32 cache_target_dirty_ratio_micro
+            writeb(struct.pack('<I', pool['cache_target_dirty_ratio_micro']), 'cache_target_dirty_ratio')
+            # u32 cache_target_full_ratio_micro
+            writeb(struct.pack('<I', pool['cache_target_full_ratio_micro']), 'cache_target_full_ratio')
+            # u32 cache_min_flush_age
+            writeb(struct.pack('<I', pool['cache_min_flush_age']), 'cache_min_flush_age')
+            # u32 cache_min_evict_age
+            writeb(struct.pack('<I', pool['cache_min_evict_age']), 'cache_min_evict_age')
+
+            # string erasure_code_profile
+            writeb(struct.pack('<I', len(pool['erasure_code_profile'].encode())) + pool['erasure_code_profile'].encode(), 'ec_profile_name')
+
+            # u32 last_force_op_resend_preluminous
+            writeb(struct.pack('<I', int(pool['last_force_op_resend_preluminous'])), 'last_force_op_resend_preluminous')
+            # u32 min_read_recency_for_promote
+            writeb(struct.pack('<I', pool['min_read_recency_for_promote']), 'min_read_recency_for_promote')
+            # u64 expected_num_objects
+            writeb(struct.pack('<Q', pool['expected_num_objects']), 'expected_num_objects')
+            # u32 cache_target_dirty_high_ratio_micro
+            writeb(struct.pack('<I', pool['cache_target_dirty_high_ratio_micro']), 'cache_target_dirty_high_ratio_micro')
+            # u32 min_write_recency_for_promote
+            writeb(struct.pack('<I', pool['min_write_recency_for_promote']), 'min_write_recency_for_promote')
+            # bool(u8) use_gmt_hitset
+            writeb(struct.pack('<B', int(pool['use_gmt_hitset'])), 'use_gmt_hitset')
+            # bool(u8) fast_read
+            writeb(struct.pack('<B', int(pool['fast_read'])), 'fast_read')
+
+            # u32 hit_set_grade_decay_rate
+            writeb(struct.pack('<I', pool['hit_set_grade_decay_rate']), 'hit_set_grade_decay_rate')
+            # u32 hit_set_search_last_n
+            writeb(struct.pack('<I', pool['hit_set_search_last_n']), 'hit_set_search_last_n')
+
+            # pool_opts_t opts
+            writeb(struct.pack('<BBI', 2, 1, 4), 'pool_opts_t_ver') # ver, compatver, structlen
+            # fake pool_opts_t map<u32, boost:variant...> (len(pool['options']))
+            writeb(struct.pack('<I', 0), 'pool_opts_t_len')
+
+            # u32 last_force_op_resend_prenautilus
+            writeb(struct.pack('<I', int(pool['last_force_op_resend_prenautilus'])), 'last_force_op_resend_prenautilus')
+
+            # map<string, string> application_metadata
+            writeb(struct.pack('<I', len(pool['application_metadata'])), 'application_metadata')
+            for app, appdata in pool['application_metadata'].items():
+                writeb(struct.pack('<I', len(app.encode())), f'app_{app}_len')
+                writeb(app.encode(), f'app_{app}_name')
+
+                writeb(struct.pack('<I', len(appdata)), f'app_{app}_kv_count')
+                for key, val in appdata.items():
+                    writeb(struct.pack('<I', len(key.encode())), f'app_{app}_key_{key}_len')
+                    writeb(key.encode(), f'app_{app}_key_{key}')
+                    writeb(struct.pack('<I', len(val.encode())), f'app_{app}_val_{key}_len')
+                    writeb(val.encode(), f'app_{app}_val_{key}')
+
+            # utime_t create_time
+            writeb(cephtime_to_osdmaptime(pool['create_time']), 'create_time')
+
+            # u32 pg_num_target
+            writeb(struct.pack('<I', pool['pg_num_target']), 'pg_num_target')
+            # missing u32 pgp_num_target - reuse pg_num_target.
+            writeb(struct.pack('<I', pool['pg_num_target']), 'pgp_num_target')
+            # u32 pg_num_pending
+            writeb(struct.pack('<I', pool['pg_num_pending']), 'pg_num_pending')
+            # fake u32 pg_num_dec_last_epoch_started
+            writeb(struct.pack('<I', 0), 'pg_num_dec_last_epoch_started')
+            # fake u32 pg_num_dec_last_epoch_clean
+            writeb(struct.pack('<I', 0), 'pg_num_dec_last_epoch_clean')
+            # u32 last_force_op_resend
+            writeb(struct.pack('<I', int(pool['last_force_op_resend'])), 'last_force_op_resend')
+            # u8 pg_autoscale_mode:
+            autoscale_mode_id = {'off': 0, 'warn': 1, 'on': 2}[pool['pg_autoscale_mode']]
+            writeb(struct.pack('<B', autoscale_mode_id), 'pg_autoscale_mode')
+
+            # pg_merge_meta_t last_pg_merge_meta
+            writeb(struct.pack('<BBI', 1, 1, 0x35), 'pg_merge_meta_t_ver') # ver, compatver, structlen (53)
+            merge_meta = pool['last_pg_merge_meta']
+            # pg_t source_pgid
+            # u8 v=1, pool, seed, 'was preferred' (sic)
+            srcpool, srcseed = merge_meta['source_pgid'].split('.')
+            writeb(struct.pack('<BQIi', 1, int(srcpool), int(srcseed, 16), -1), 'merge_meta_source_pgid')
+
+            # u32 ready_epoch
+            writeb(struct.pack('<I', merge_meta['ready_epoch']), 'merge_meta_ready_epoch')
+            # u32 last_epoch_started
+            writeb(struct.pack('<I', merge_meta['last_epoch_started']), 'merge_meta_last_epoch_started')
+            # u32 last_epoch_clean
+            writeb(struct.pack('<I', merge_meta['last_epoch_clean']), 'merge_meta_last_epoch_clean')
+
+            # eversion_t source_version u64 version, u32 epoch
+            epoch, version = merge_meta['source_version'].split("'")
+            writeb(struct.pack('<QI', int(version), int(epoch)), 'merge_meta_source_version')
+            # eversion_t target_version u64 version, u32 epoch
+            epoch, version = merge_meta['target_version'].split("'")
+            writeb(struct.pack('<QI', int(version), int(epoch)), 'merge_meta_target_version')
+
+            pg_pool_t_struct.write_len()
+
+        # pool_name: map<int64, std::string>
+        # pool_max: int32
+
+        # flags: uint32
+
+        # max_osd: int32
+
+        # osd_state: vector<uint32>
+        # osd_weight: vector<uint32>
+        # osd_addrs->client_addrs: vector<sharedptr<entity_addrvec_t>>
+        # pg_temp: PGTempMap
+        # primary_temp: map<pg_t, int32_t>
+        # osd_primary_affinity: vector<uint32>
+
+        # crush
+
+        # todo: add u32 crc
+        # todo: update struct_len of new header to ensure correct length
+
+        with open(output_file, "wb") as hdl:
+            hdl.write(out.getbuffer())
+        logging.warning(f"cluster state exported as osdmap to {output_file}")
 
 
     @lru_cache(maxsize=2**17)
@@ -1021,7 +1306,9 @@ def get_max_reuses(rule, pool_size):
     one list entry per root take.
     take_index -> take_step -> max_reuses
     -> e.g. [[4, 2, 1, 1], [2, 1, 1]]
-       for [[root, rack, server, osd], [otherroot, server, osd]]
+       for pool_size = 6,
+           [[take root, choose2 rack, choose2 server, choose1 osd],
+            [take otherroot, choose2 server, choose1 osd]]
     """
 
     reuses = []
@@ -3327,6 +3614,12 @@ def main():
 
         elif args.mode == 'repairstats':
             repairstats(args, state)
+
+        elif args.mode == "osdmap":
+            if args.osdmapmode == "export":
+                state.export_osdmap(args.output_file)
+            else:
+                raise Exception(f"unknown osdmap mode {args.osdmapmode!r}")
 
         else:
             raise Exception(f"unknown mode: {args.mode}")

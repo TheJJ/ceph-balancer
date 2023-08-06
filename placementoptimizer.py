@@ -799,9 +799,26 @@ class ClusterState:
 
                 osd_entity_addr_t_struct.write_len()
 
-        # pg_temp: PGTempMap
+        # pg_temp: PGTempMap: btree_map<pg_t, ceph_le32*>
+        writeb(struct.pack('<I', len(self.state['osd_dump']['pg_temp'])), 'osd_pg_temp_len')
+        for pg_temp in self.state['osd_dump']['pg_temp']:
+            raise Exception("pg_temp serialization not implemented")
+
         # primary_temp: map<pg_t, int32_t>
+        writeb(struct.pack('<I', len(self.state['osd_dump']['primary_temp'])), 'osd_primary_temp_len')
+        for primary_temp in self.state['osd_dump']['primary_temp']:
+            # pg_t for primary remap
+            # u8 v=1, pool, seed, 'was preferred' (sic)
+            srcpool, srcseed = primary_temp["pgid"].split('.')
+            writeb(struct.pack('<BQIi', 1, int(srcpool), int(srcseed, 16), -1), 'osd_primary_temp_pgid')
+
+            writeb(struct.pack('<i', primary_temp["osd"]), f'osd_primary_temp_osdid')
+
         # osd_primary_affinity: vector<uint32>
+        writeb(struct.pack('<I', len(self.state['osd_dump']['osds'])), 'osd_primary_affinity')
+        for osdmetadata in self.state['osd_dump']['osds']:
+            primary_affinity = (osdmetadata["primary_affinity"] * 0x10000) // 1
+            writeb(struct.pack('<I', primary_affinity), f'osd_primary_affinity_{osdmetadata["osd"]}')
 
         # crush
 
@@ -818,9 +835,10 @@ class ClusterState:
         osdmap_client_struct.write_len()
 
         # extended osd-only data
-        osdmap_extended_struct = StructVersion(out, 0xef, 1, 'osdmap_extended')
-
-        osdmap_extended_struct.write_len()
+        # osd_xinfo
+        #osdmap_extended_struct = StructVersion(out, 0xxxx, 1, 'osdmap_extended')
+        #
+        #osdmap_extended_struct.write_len()
 
         osdmap_struct.write_len()
 

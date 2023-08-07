@@ -479,14 +479,13 @@ class ClusterState:
             print(f"[{out.tell():>10x}] {binascii.hexlify(data)} {'<- %s' % name if name else ''}")
             out.write(data)
 
-        class StructVersion:
-            def __init__(self, stream, struct_v, compat_v, name=None):
+        class StructLength:
+            """
+            write a u32 length field and remember its position.
+            """
+            def __init__(self, stream, name=None):
                 self.stream = stream
                 self.name = name or "struct"
-
-                # 1+1+4 byte compat header
-                writeb(struct.pack('<B', struct_v), f'{self.name}_struct_v')
-                writeb(struct.pack('<B', compat_v), f'{self.name}_compat_v')
 
                 self.len_field_pos = stream.tell()
                 # struct_len: u32
@@ -501,6 +500,19 @@ class ClusterState:
                 writeb(struct.pack('<I', struct_len), f'{self.name}_len_update')
                 out.seek(return_pos)
 
+        class StructVersion(StructLength):
+            """
+            like StructLength, but with additional version header fields.
+            """
+            def __init__(self, stream, struct_v, compat_v, name=None):
+                name = name or "struct"
+
+                # 1+1+4 byte compat header
+                writeb(struct.pack('<B', struct_v), f'{name}_struct_v')
+                writeb(struct.pack('<B', compat_v), f'{name}_compat_v')
+
+                # length field
+                super().__init__(stream, name)
 
         # 1+1+4 byte outer osdmap struct header
         osdmap_struct = StructVersion(out, 8, 7, 'osdmap')
@@ -821,6 +833,194 @@ class ClusterState:
             writeb(struct.pack('<I', primary_affinity), f'osd_primary_affinity_{osdmetadata["osd"]}')
 
         # crush
+        # in ceph, this is a separate buffer list.
+        # but for better debugging n stuff, we just use our present export stream.
+        # substream_length: u32
+        crush_substream = StructLength(out, "crush")
+
+        # crush_magic: u32 (but defined as u64?)
+        writeb(struct.pack('<I', 0x00010000), 'crush_magic')
+
+        # max_buckets: s32
+        buckets = self.state['crush_dump']['buckets']
+        buckets_by_id = dict()
+        min_bucket_id = 0
+        for bucket in buckets:
+            bucket_id = bucket["id"]
+            buckets_by_id[bucket_id] = bucket
+            if bucket_id < min_bucket_id:
+                min_bucket_id = bucket_id
+        # the dump loops for (i=-1, i > -max_buckets-1, i--)
+        # and dumps id=i
+        max_buckets = -min_bucket_id
+        # xxx dirty hack: my cluster's osdmap has 256 max_buckets although only -174 is used.
+        # but to equalize the output, lets force it... can probably be removed,
+        # but it doesn't hurt, we just allocate nonexistent bucket memory,
+        # which is used when buckets are created.
+        if max_buckets == 174:
+            max_buckets = 256
+
+        writeb(struct.pack('<i', max_buckets), 'crush_max_buckets')
+
+        # max_rules: u32
+        rules = self.state['crush_dump']['rules']
+        rules_by_id = dict()
+        max_rule_id = 0
+        for rule in rules:
+            rule_id = rule["rule_id"]
+            rules_by_id[rule_id] = rule
+            if rule_id > max_rule_id:
+                max_rule_id = rule_id
+        max_rules = max_rule_id + 1
+        writeb(struct.pack('<i', max_rules), 'crush_max_rules')
+
+        # max_devices: s32
+        devices = self.state['crush_dump']['devices']
+        max_device_id = 0
+        for device in devices:
+            if device["id"] > max_device_id:
+                max_device_id = device["id"]
+        writeb(struct.pack('<i', max_device_id + 1), 'crush_max_devices')
+
+        ## buckets
+        for bucket_idx in range(max_buckets):
+            # bucket ids are negative starting at -1
+            bucket = buckets_by_id.get(-bucket_idx-1)
+            if bucket is None:
+                # alg: u32 = 0 for nonexistent bucket
+                writeb(struct.pack('<I', 0), f'crush_bucket_idx_{bucket_idx}_missing')
+                continue
+
+            # alg: u32 - crush algorithm
+            alg_id = {
+                "uniform": 1,  # CRUSH_BUCKET_UNIFORM
+                "list": 2,  # CRUSH_BUCKET_LIST
+                "tree": 3,  # CRUSH_BUCKET_TREE
+                "straw": 4,  # CRUSH_BUCKET_STRAW
+                "straw2": 5,  # CRUSH_BUCKET_STRAW2
+            }[bucket['alg']]
+            writeb(struct.pack('<I', alg_id), f'crush_bucket_idx_{bucket_idx}_alg')
+
+            # id: s32
+            writeb(struct.pack('<i', bucket["id"]), f'crush_bucket_{bucket_id}_id')
+            # type: u16
+            writeb(struct.pack('<H', bucket["type_id"]), f'crush_bucket_{bucket_id}_type')
+            # alg: u8 - again but now as u8
+            writeb(struct.pack('<B', alg_id), f'crush_bucket_{bucket_id}_alg_repeat')
+
+            # hash: u8
+            hash_id = {
+                "rjenkins1": 0,  # CRUSH_HASH_RJENKINS1
+            }[bucket['hash']]
+            writeb(struct.pack('<B', hash_id), f'crush_bucket_{bucket_id}_hash')
+
+            # weight: u32
+            writeb(struct.pack('<I', bucket["weight"]), f'crush_bucket_{bucket_id}_weight')
+
+            # size: u32
+            writeb(struct.pack('<I', len(bucket["items"])), f'crush_bucket_{bucket_id}_items_len')
+            for item in bucket["items"]:
+                # item_id: s32
+                writeb(struct.pack('<i', item["id"]), f'crush_bucket_{bucket_id}_item')
+
+            # alg metadata (args to bucket definitions)
+            if alg_id == 5:  # CRUSH_BUCKET_STRAW_2
+                # assume encode_compat_choose_args == false, i.e. feature CRUSH_CHOOSE_ARGS is available
+                for item in bucket["items"]:
+                    # item weight: u32
+                    writeb(struct.pack('<I', item["weight"]), f'crush_bucket_{bucket_id}_item_weight')
+
+            else:
+                raise Exception(f"unsupported crush algorithm args {alg_id}")
+
+
+        ## rules
+        if max_rules > (0xff + 1):
+            raise Exception("max 255 rules supported, as rule_id is encoded as u8")
+
+        op_to_id = {
+            "noop": (0, None, None),  # CRUSH_RULE_NOOP
+            "take": (1, "item", None),  # CRUSH_RULE_TAKE arg1=which crush item to start walk
+            "choose_firstn": (2, "num", "type"), # CRUSH_RULE_CHOOSE_FIRSTN arg1=num items to pick arg2=choose type
+            "choose_indep": (3, "num", "type"), # CRUSH_RULE_CHOOSE_INDEP arg1=num items to pick arg2=choose type
+            "emit": (4, None, None),  # CRUSH_RULE_EMIT
+            "chooseleaf_firstn": (6, "num", "type"),  # CRUSH_RULE_CHOOSELEAF_FIRSTN arg1=num items to pick arg2=choose type
+            "chooseleaf_indep": (7, "num", "type"),  # CRUSH_RULE_CHOOSELEAF_INDEP arg1=num items to pick arg2=choose type
+
+            "set_choose_tries": (8, "num", None),  # CRUSH_RULE_SET_CHOOSE_TRIES override choose_total_tries
+            "set_chooseleaf_tries": (9, "num", None),  # CRUSH_RULE_SET_CHOOSELEAF_TRIES override chooseleaf_descend_once
+            # ignore 10-13, they're not json-encoded anyway.
+        }
+
+        crush_types_to_id = dict()
+        for crush_type in self.state['crush_dump']['types']:
+            crush_types_to_id[crush_type["name"]] = crush_type["type_id"]
+
+        for rule_id in range(max_rules):
+            rule = rules_by_id.get(rule_id)
+            # yes: u32
+            writeb(struct.pack('<I', 0 if rule is None else 1), f'crush_rule_{rule_id}_yes')
+            if rule is None:
+                continue
+
+            # len: u32 number of steps
+            writeb(struct.pack('<I', len(rule['steps'])), f'crush_rule_{rule_id}_steps_len')
+            # id: u8
+            writeb(struct.pack('<B', rule_id), f'crush_rule_{rule_id}_id')
+            # type: u8
+            writeb(struct.pack('<B', rule['type']), f'crush_rule_{rule_id}_type')
+            # min_size: u8 (deprecated to 1)
+            writeb(struct.pack('<B', rule.get('min_size', 1)), f'crush_rule_{rule_id}_min_size')
+            # max_size: u8 (deprecated to 1)
+            writeb(struct.pack('<B', rule.get('max_size', 100)), f'crush_rule_{rule_id}_max_size')
+
+            for step in rule['steps']:
+                op_form = op_to_id.get(step['op'])
+                if op_form is None:
+                    op_id = step.get('opcode')
+
+                    if op_id is None:
+                        raise Exception(f"unparsable step {step}")
+
+                    arg1 = step['arg1']
+                    arg2 = step['arg2']
+                else:
+                    op_id = op_form[0]
+                    arg1_name = op_form[1]
+                    if arg1_name is not None:
+                        arg1 = step[arg1_name]
+                    else:
+                        arg1 = 0
+
+                    arg2_name = op_form[2]
+                    if arg2_name is not None:
+                        if arg2_name == "type":
+                            arg2 = crush_types_to_id[step[arg2_name]]
+                        else:
+                            arg2 = step[arg2_name]
+                    else:
+                        arg2 = 0
+
+                # op: u32
+                # arg1: s32
+                # arg2: s32
+                writeb(struct.pack('<Iii', op_id, arg1, arg2), f'crush_rule_{rule_id}_op')
+
+        ## name info
+        # type_map
+        # name_map
+        # rule_name_map
+
+        ## tunables
+
+        ## device_classes
+        # devices{id: int, name: str_osd.0, class: str_deviceclass}
+
+        ## choose-args
+
+        crush_substream.write_len()
+        # end of crush
+
 
         # erasure_code_profiles: map<string, map<string, string>>
         # pg_upmap: map<pg_t, vector<s32>>

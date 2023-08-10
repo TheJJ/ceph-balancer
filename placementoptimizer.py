@@ -479,6 +479,12 @@ class ClusterState:
             print(f"[{out.tell():>10x}] {binascii.hexlify(data)} {'<- %s' % name if name else ''}")
             out.write(data)
 
+        def encode_pg_t_from_pgid(pgid):
+            # pg_t struct
+            # u8 v=1, pool, seed, 'was preferred' (sic)
+            srcpool, srcseed = pgid.split('.')
+            return struct.pack('<BQIi', 1, int(srcpool), int(srcseed, 16), -1)
+
         class StructLength:
             """
             write a u32 length field and remember its position.
@@ -650,10 +656,34 @@ class ClusterState:
             # pool_opts_t map<u32, boost:variant...> (len(pool['options']))
             # u32 options_len
             writeb(struct.pack('<I', len(pool['options'])), 'pool_opts_t_len')
+
+            # pool_opts_t::key_t
+            # and its string+arg variants: opt_mapping_t
             option_ids = {
+                'scrub_min_interval': 0,
+                'scrub_max_interval': 1,
+                'deep_scrub_interval': 2,
+                'recovery_priority': 3,
+                'recovery_op_priority': 4,
+                'scrub_priority': 5,
                 'compression_mode': 6,
                 'compression_algorithm': 7,
+                'compression_required_ratio': 8,
+                'compression_max_blob_size': 9,
+                'compression_min_blob_size': 10,
+                'csum_type': 11,
+                'csum_max_block': 12,
+                'csum_min_block': 13,
+                'fingerprint_algorithm': 14,
                 'pg_num_min': 15,
+                'target_size_bytes': 16,
+                'target_size_ratio': 17,
+                'pg_autoscale_bias': 18,
+                'read_lease_interval': 19,
+                'dedup_tier': 20,
+                'dedup_chunk_algorithm': 21,
+                'dedup_cdc_chunk_size': 22,
+                'pg_num_max': 23,
             }
             # sort option keys by option id
             for key_name, value in sorted(pool['options'].items(),
@@ -718,10 +748,7 @@ class ClusterState:
             # pg_merge_meta_t last_pg_merge_meta
             writeb(struct.pack('<BBI', 1, 1, 0x35), 'pg_merge_meta_t_ver') # ver, compatver, structlen (53)
             merge_meta = pool['last_pg_merge_meta']
-            # pg_t source_pgid
-            # u8 v=1, pool, seed, 'was preferred' (sic)
-            srcpool, srcseed = merge_meta['source_pgid'].split('.')
-            writeb(struct.pack('<BQIi', 1, int(srcpool), int(srcseed, 16), -1), 'merge_meta_source_pgid')
+            writeb(encode_pg_t_from_pgid(merge_meta['source_pgid']), 'merge_meta_source_pgid')
 
             # u32 ready_epoch
             writeb(struct.pack('<I', merge_meta['ready_epoch']), 'merge_meta_ready_epoch')
@@ -814,16 +841,20 @@ class ClusterState:
         # pg_temp: PGTempMap: btree_map<pg_t, ceph_le32*>
         writeb(struct.pack('<I', len(self.state['osd_dump']['pg_temp'])), 'osd_pg_temp_len')
         for pg_temp in self.state['osd_dump']['pg_temp']:
-            raise Exception("pg_temp serialization not implemented")
+            writeb(encode_pg_t_from_pgid(pg_temp["pgid"]), 'osd_pg_temp_pgid')
+            # the real encoding is a list of little-endian u32 entries,
+            # the first is the length, the others the osds. they're handled
+            # with a single array copy into a separate data buffer, whyever...
+            # count: u32
+            writeb(struct.pack('<I', len(pg_temp['osds'])), f'osd_pg_temp_osds_len')
+            for osdid in pg_temp['osds']:
+                # osdid: u32
+                writeb(struct.pack('<I', osdid), f'osd_pg_temp_osd')
 
         # primary_temp: map<pg_t, int32_t>
         writeb(struct.pack('<I', len(self.state['osd_dump']['primary_temp'])), 'osd_primary_temp_len')
         for primary_temp in self.state['osd_dump']['primary_temp']:
-            # pg_t for primary remap
-            # u8 v=1, pool, seed, 'was preferred' (sic)
-            srcpool, srcseed = primary_temp["pgid"].split('.')
-            writeb(struct.pack('<BQIi', 1, int(srcpool), int(srcseed, 16), -1), 'osd_primary_temp_pgid')
-
+            writeb(encode_pg_t_from_pgid(primary_temp["pgid"]), 'osd_primary_temp_pgid')
             writeb(struct.pack('<i', primary_temp["osd"]), f'osd_primary_temp_osdid')
 
         # osd_primary_affinity: vector<uint32>
@@ -841,15 +872,45 @@ class ClusterState:
         # crush_magic: u32 (but defined as u64?)
         writeb(struct.pack('<I', 0x00010000), 'crush_magic')
 
-        # max_buckets: s32
+        # which crush device classes are present?
+        # this is kind of a hack since the real IDs never show up in a json dump...
+        crush_class_ids = dict()
+        for idx, crush_class in enumerate(self.state["crush_class_osds"].keys()):
+            crush_class_ids[crush_class] = idx
+
         buckets = self.state['crush_dump']['buckets']
         buckets_by_id = dict()
+        buckets_by_name = dict()
+        # all buckets that have a device class (shadow buckets)
+        # bucket_id -> class_name
+        buckets_with_class = dict()
+        # buckets that have no device class (regular buckets)
+        # we map them their shadow buckets (by class_id)
+        # bucket_id -> {class_id -> bucket_id}
+        bucket_shadows = defaultdict(dict)
+
         min_bucket_id = 0
         for bucket in buckets:
             bucket_id = bucket["id"]
+            bucket_name = bucket["name"]
             buckets_by_id[bucket_id] = bucket
+            buckets_by_name[bucket_name] = bucket
+
             if bucket_id < min_bucket_id:
                 min_bucket_id = bucket_id
+
+        for bucket in buckets:
+            bucket_id = bucket["id"]
+            bucket_name = bucket["name"]
+            if "~" in bucket_name:
+                base_bucket_name, class_name = bucket_name.split("~")
+                class_id = crush_class_ids[class_name]
+                buckets_with_class[bucket_id] = class_id
+
+                # store what base bucket this shadow bucket is associated to.
+                base_bucket_id = buckets_by_name[base_bucket_name]["id"]
+                bucket_shadows[base_bucket_id][class_id] = bucket_id
+
         # the dump loops for (i=-1, i > -max_buckets-1, i--)
         # and dumps id=i
         max_buckets = -min_bucket_id
@@ -860,6 +921,7 @@ class ClusterState:
         if max_buckets == 174:
             max_buckets = 256
 
+        # max_buckets: s32
         writeb(struct.pack('<i', max_buckets), 'crush_max_buckets')
 
         # max_rules: u32
@@ -875,21 +937,41 @@ class ClusterState:
         writeb(struct.pack('<i', max_rules), 'crush_max_rules')
 
         # max_devices: s32
-        devices = self.state['crush_dump']['devices']
+        crush_devices = self.state['crush_dump']['devices']
+        crush_devices_with_class = dict()
+
         max_device_id = 0
-        for device in devices:
+        for device in crush_devices:
+            device_id = device["id"]
+            device_class = device.get("class")
+
+            if device_class is not None:
+                crush_devices_with_class[device_id] = device
+
+                if device_class not in crush_class_ids:
+                    # the internal device class ids never becomes visible
+                    # so we have to generate our own...
+                    # CrushWrapper::_alloc_class_id does this,
+                    # which has some additional funny undefined behavior max<s32> wraparound handling
+                    # which we happily ignore.
+                    crush_class_ids[device_class] = len(crush_class_ids)
+
             if device["id"] > max_device_id:
-                max_device_id = device["id"]
-        writeb(struct.pack('<i', max_device_id + 1), 'crush_max_devices')
+                max_device_id = device_id
+        max_devices = max_device_id + 1
+        writeb(struct.pack('<i', max_devices), 'crush_max_devices')
 
         ## buckets
         for bucket_idx in range(max_buckets):
             # bucket ids are negative starting at -1
-            bucket = buckets_by_id.get(-bucket_idx-1)
+            bucket_id = -bucket_idx - 1
+            bucket = buckets_by_id.get(bucket_id)
             if bucket is None:
                 # alg: u32 = 0 for nonexistent bucket
                 writeb(struct.pack('<I', 0), f'crush_bucket_idx_{bucket_idx}_missing')
                 continue
+
+            assert bucket_id == bucket["id"]
 
             # alg: u32 - crush algorithm
             alg_id = {
@@ -902,7 +984,7 @@ class ClusterState:
             writeb(struct.pack('<I', alg_id), f'crush_bucket_idx_{bucket_idx}_alg')
 
             # id: s32
-            writeb(struct.pack('<i', bucket["id"]), f'crush_bucket_{bucket_id}_id')
+            writeb(struct.pack('<i', bucket_id), f'crush_bucket_{bucket_id}_id')
             # type: u16
             writeb(struct.pack('<H', bucket["type_id"]), f'crush_bucket_{bucket_id}_type')
             # alg: u8 - again but now as u8
@@ -1007,22 +1089,153 @@ class ClusterState:
                 writeb(struct.pack('<Iii', op_id, arg1, arg2), f'crush_rule_{rule_id}_op')
 
         ## name info
-        # type_map
-        # name_map
-        # rule_name_map
+        # type_map: map<s32, string>
+        crush_types = self.state['crush_dump']['types']
+        writeb(struct.pack('<I', len(crush_types)), f'crush_type_map_len')
+        for crush_type in crush_types:
+            writeb(struct.pack('<i', crush_type['type_id']), f'crush_type_map_id')
+            crush_name = crush_type['name'].encode()
+            writeb(struct.pack('<I', len(crush_name)), f'crush_type_map_name_len')
+            writeb(crush_name, f'crush_type_map_name')
+
+        # name_map: map<s32, string>: crush item id -> item name
+        writeb(struct.pack('<I', len(crush_devices) + len(buckets)), f'crush_name_map_len')
+
+        # first encode buckets, start with the min id (they are negative)
+        for bucket in reversed(buckets):
+            writeb(struct.pack('<i', bucket['id']), f'crush_name_map_bucket_id')
+            bucket_name = bucket['name'].encode()
+            writeb(struct.pack('<I', len(bucket_name)), f'crush_name_map_bucket_name_len')
+            writeb(bucket_name, f'crush_name_map_bucket_name')
+
+        # continue with devices, start also start with min id
+        for device in crush_devices:
+            writeb(struct.pack('<i', device['id']), f'crush_name_map_id')
+            # todo: may have no name apparently
+            device_name = device['name'].encode()
+            writeb(struct.pack('<I', len(device_name)), f'crush_name_map_name_len')
+            writeb(device_name, f'crush_name_map_name')
+
+        # rule_name_map: map<s32, string>
+        writeb(struct.pack('<I', len(rules)), f'crush_rule_name_map_len')
+        for rule in rules:
+            writeb(struct.pack('<i', rule['rule_id']), f'crush_rule_name_map_id')
+            rule_name = rule['rule_name'].encode()
+            writeb(struct.pack('<I', len(rule_name)), f'crush_rule_name_map_name_len')
+            writeb(rule_name, f'crush_rule_name_map_name')
 
         ## tunables
+        tunables = self.state['crush_dump']['tunables']
+        # choose_local_tries: u32
+        writeb(struct.pack('<I', tunables["choose_local_tries"]), f'crush_choose_local_tries')
+        # choose_local_fallback_tries: u32
+        writeb(struct.pack('<I', tunables["choose_local_fallback_tries"]), f'crush_choose_local_fallback_tries')
+        # choose_total_tries: u32
+        writeb(struct.pack('<I', tunables["choose_total_tries"]), f'crush_choose_total_tries')
+        # chooseleaf_descend_once: u32
+        writeb(struct.pack('<I', tunables["chooseleaf_descend_once"]), f'crush_chooseleaf_descend_once')
+        # chooseleaf_vary_r: u8
+        writeb(struct.pack('<B', tunables["chooseleaf_vary_r"]), f'crush_chooseleaf_vary_r')
+        # straw_calc_version: u8
+        writeb(struct.pack('<B', tunables["straw_calc_version"]), f'crush_straw_calc_version')
+        # allowed_bucket_algs: u32
+        writeb(struct.pack('<I', tunables["allowed_bucket_algs"]), f'crush_straw_calc_version')
+        # chooseleaf_stable: u8
+        writeb(struct.pack('<B', tunables["chooseleaf_stable"]), f'crush_chooseleaf_stable')
 
         ## device_classes
-        # devices{id: int, name: str_osd.0, class: str_deviceclass}
+        # class_map: map<s32, s32>: nodeid->classid
+        # this not only contains existing devices with their class,
+        # but also shadow buckets (ie. servername~ssd)!
+        # unfortunately, the class ids are not part of any of the json dumps :(
+        # but as long as we create a sound mapping, we're good.
+        writeb(struct.pack('<I', len(crush_devices_with_class) + len(buckets_with_class)), 'crush_device_class_map_len')
+
+        # first, write shadow bucket crush classes
+        # start with the smallest bucket id (they're negative)
+        for bucket_id, device_class_id in reversed(buckets_with_class.items()):
+            writeb(struct.pack('<i', bucket_id), 'crush_bucket_class_map_id')
+            writeb(struct.pack('<i', device_class_id), 'crush_bucket_class_map_class')
+
+        # then, write device crush classes
+        for device_id, device in crush_devices_with_class.items():
+            class_id = crush_class_ids[device['class']]
+            writeb(struct.pack('<i', device_id), 'crush_device_class_map_id')
+            writeb(struct.pack('<i', class_id), 'crush_device_class_map_class')
+
+        # class_name: map<s32, string>
+        writeb(struct.pack('<I', len(crush_class_ids)), 'crush_device_class_name_map_len')
+        for class_name, class_id in crush_class_ids.items():
+            writeb(struct.pack('<i', class_id), 'crush_device_class_name_map_id')
+            class_name_raw = class_name.encode()
+            writeb(struct.pack('<I', len(class_name_raw)), 'crush_device_class_name_map_name_len')
+            writeb(class_name_raw, 'crush_device_class_map_class')
+
+        # class_bucket: map<s32, map<s32, s32>>
+        # maps what shadow buckets are associated to a regular buckets
+        # -> regular_bucket_id -> {class_id -> shadow_bucket_id}
+        writeb(struct.pack('<I', len(bucket_shadows)), 'crush_bucket_shadows_len')
+        for bucket_id, shadows in sorted(bucket_shadows.items()):
+            writeb(struct.pack('<i', bucket_id), 'crush_bucket_shadows_base_id')
+            writeb(struct.pack('<I', len(shadows)), 'crush_bucket_shadows_shadows_len')
+            for device_class_id, shadow_bucket_id in sorted(shadows.items()):
+                writeb(struct.pack('<i', device_class_id), 'crush_bucket_shadows_base_id')
+                writeb(struct.pack('<i', shadow_bucket_id), 'crush_bucket_shadows_base_id')
 
         ## choose-args
+        # replacement values for crush item weights
+        # toplevel: bucket
+        choose_args = self.state['crush_dump']['choose_args']
+        writeb(struct.pack('<I', len(choose_args)), 'crush_choose_args_len')
+        for choose_args_id, arg_map in choose_args.items():
+            writeb(struct.pack('<q', int(choose_args_id)), 'crush_choose_args_id')
+
+            writeb(struct.pack('<I', len(arg_map)), 'crush_choose_args_len')
+            for idx, arg_map_entry in enumerate(arg_map):
+                # get the array index from a bucket id
+                bucket_idx = -1 -arg_map_entry['bucket_id']
+                writeb(struct.pack('<I', len(arg_map)), 'crush_choose_args_len')
+
+                weight_set_list = arg_map_entry.get('weight_set')
+                if weight_set_list:
+                    writeb(struct.pack('<I', len(weight_set_list)), 'crush_choose_args_weight_set_positions')
+                    for weight_set in weight_set_list:
+                        writeb(struct.pack('<I', len(weight_set)), 'crush_choose_args_weight_set_len')
+                        for weight_entry in weight_set:
+                            # cf CrushWrapper::dump_choose_args
+                            weight_value = int(weight_entry * 0x10000)
+                            writeb(struct.pack('<I', weight_value), 'crush_choose_args_weight_set_entry')
+
+                else:
+                    writeb(struct.pack('<I', 0), 'crush_choose_args_weight_set_no_positions')
+
+                id_list = arg_map_entry.get('ids')
+                if id_list:
+                    writeb(struct.pack('<I', len(id_list)), 'crush_choose_args_weight_set_ids_len')
+                    for id_entry in id_list:
+                        writeb(struct.pack('<i', id_entry), 'crush_choose_args_weight_set_id')
 
         crush_substream.write_len()
         # end of crush
 
-
         # erasure_code_profiles: map<string, map<string, string>>
+        ec_profiles = self.state['osd_dump']['erasure_code_profiles']
+        writeb(struct.pack('<I', len(ec_profiles)), 'osd_ec_profiles_len')
+        for profile_name, profile_info in ec_profiles.items():
+            profile_name_raw = profile_name.encode()
+            writeb(struct.pack('<I', len(profile_name_raw)), 'osd_ec_profile_name_len')
+            writeb(profile_name_raw, 'osd_ec_profile_name_len')
+
+            writeb(struct.pack('<I', len(profile_info)), 'osd_ec_profiles_info_len')
+            for key, value in profile_info.items():
+                key_raw = key.encode()
+                writeb(struct.pack('<I', len(key_raw)), 'osd_ec_profile_info_key_len')
+                writeb(key_raw, 'osd_ec_profile_key')
+
+                value_raw = value.encode()
+                writeb(struct.pack('<I', len(value_raw)), 'osd_ec_profile_info_value_len')
+                writeb(value_raw, 'osd_ec_profile_value')
+
         # pg_upmap: map<pg_t, vector<s32>>
         # pg_upmap_items: map<pg_t, vector<pair<s32, s32>>>
         # crush_version: u32

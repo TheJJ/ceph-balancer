@@ -261,7 +261,7 @@ def datetime_to_osdmaptime(when: datetime.datetime):
     # to reduce confusion when comparing diffs, mark the broken nanoseconds
     return struct.pack("<II", sec, ns | 0xffff)
 
-def cephtime_to_osdmaptime(when: str):
+def encode_cephtime(when: str):
     return datetime_to_osdmaptime(cephtime_to_datetime(when))
 
 def encode_ipstr(ipport: str):
@@ -270,6 +270,8 @@ def encode_ipstr(ipport: str):
     elen: u32
     ss_family: u16
     sockaddr_data: u8[elen-2]
+
+    returns: ceph binary bytearray
     """
     ret = bytearray()
 
@@ -333,6 +335,17 @@ def encode_ipstr(ipport: str):
     ret.extend(sockaddr_data)
 
     return ret
+
+
+def encode_pg_t_from_pgid(pgid):
+    """
+    given: pgid (e.g. 32.af23)
+    returns: ceph binary encoding of pg_t
+    """
+    # pg_t struct
+    # u8 v=1, pool, seed, 'was preferred' (sic)
+    srcpool, srcseed = pgid.split('.')
+    return struct.pack('<BQIi', 1, int(srcpool), int(srcseed, 16), -1)
 
 
 # definition from `struct pg_pool_t`:
@@ -479,12 +492,6 @@ class ClusterState:
             print(f"[{out.tell():>10x}] {binascii.hexlify(data)} {'<- %s' % name if name else ''}")
             out.write(data)
 
-        def encode_pg_t_from_pgid(pgid):
-            # pg_t struct
-            # u8 v=1, pool, seed, 'was preferred' (sic)
-            srcpool, srcseed = pgid.split('.')
-            return struct.pack('<BQIi', 1, int(srcpool), int(srcseed, 16), -1)
-
         class StructLength:
             """
             write a u32 length field and remember its position.
@@ -534,9 +541,9 @@ class ClusterState:
         writeb(struct.pack('<I', self.state['osd_dump']['epoch']), 'epoch')
 
         # created: utime_t
-        writeb(cephtime_to_osdmaptime(self.state['osd_dump']['created']), 'created') # u32 sec, u32 nsec
+        writeb(encode_cephtime(self.state['osd_dump']['created']), 'created') # u32 sec, u32 nsec
         # modified: utime_t
-        writeb(cephtime_to_osdmaptime(self.state['osd_dump']['modified']), 'modified') # u32 sec, u32 nsec
+        writeb(encode_cephtime(self.state['osd_dump']['modified']), 'modified') # u32 sec, u32 nsec
 
         # pools: map<int64, pg_pool_t> (u32 map.size())
         pools = self.state['osd_dump']['pools']
@@ -727,7 +734,7 @@ class ClusterState:
                     writeb(val.encode(), f'app_{app}_val_{key}')
 
             # utime_t create_time
-            writeb(cephtime_to_osdmaptime(pool['create_time']), 'create_time')
+            writeb(encode_cephtime(pool['create_time']), 'create_time')
 
             # u32 pg_num_target
             writeb(struct.pack('<I', pool['pg_num_target']), 'pg_num_target')
@@ -1237,17 +1244,75 @@ class ClusterState:
                 writeb(value_raw, 'osd_ec_profile_value')
 
         # pg_upmap: map<pg_t, vector<s32>>
+        pg_upmaps = self.state['osd_dump']['pg_upmap']
+        writeb(struct.pack('<I', len(pg_upmaps)), 'osd_pg_upmap_len')
+        for pg_upmap in pg_upmaps:
+            writeb(encode_pg_t_from_pgid(pg_upmap["pgid"]), 'osd_pg_upmap_pgid')
+
+            osds = pg_upmap["osds"]
+            writeb(struct.pack('<I', len(osds)), 'osd_pg_upmap_osds_len')
+            for osdid in osds:
+                writeb(struct.pack('<i', osd), 'osd_pg_upmap_osd')
+
         # pg_upmap_items: map<pg_t, vector<pair<s32, s32>>>
+        pg_upmap_items = self.state['osd_dump']['pg_upmap_items']
+        writeb(struct.pack('<I', len(pg_upmap_items)), 'osd_pg_upmap_items_len')
+        for pg_upmap_item in pg_upmap_items:
+            writeb(encode_pg_t_from_pgid(pg_upmap_item["pgid"]), 'osd_pg_upmap_items_pgid')
+
+            mappings = pg_upmap_item['mappings']
+            writeb(struct.pack('<I', len(mappings)), 'osd_pg_upmap_items_mappings_len')
+            for mapping in mappings:
+                writeb(struct.pack('<i', mapping['from']), 'osd_pg_upmap_items_mapping_from')
+                writeb(struct.pack('<i', mapping['to']), 'osd_pg_upmap_items_mapping_to')
+
         # crush_version: u32
+        writeb(struct.pack('<I', self.state['osd_dump']['crush_version']), 'crush_version')
+
         # new_removed_snaps: map<s64, snap_interval_set_t>
+        new_removed_snaps = self.state['osd_dump']['new_removed_snaps']
+        writeb(struct.pack('<I', len(new_removed_snaps)), 'osd_new_removed_snaps_len')
+        for rem_poolsnap in new_removed_snaps:
+            pool = rem_poolsnap['pool']
+            snaps = rem_poolsnap['snaps']
+
+            writeb(struct.pack('<q', pool), 'osd_new_removed_snaps_pool')
+
+            # snap_interval_set: interval_set<snapid_t, map>
+            # == interval_set<u64, map>
+            # == map<u64, u64> (maps start -> len)
+            writeb(struct.pack('<I', len(snaps)), 'osd_new_removed_snaps_snaps_len')
+            for snap in snaps:
+                begin = snap['begin']
+                length = snap['length']
+                writeb(struct.pack('<Q', begin), 'osd_new_removed_snaps_snap_begin')
+                writeb(struct.pack('<Q', length), 'osd_new_removed_snaps_snap_length')
+
         # new_purged_snaps: map<s64, snap_interval_set_t>
+        new_purged_snaps = self.state['osd_dump']['new_purged_snaps']
+        writeb(struct.pack('<I', len(new_purged_snaps)), 'osd_new_purged_snaps_len')
+        for rem_poolsnap in new_purged_snaps:
+            pool = rem_poolsnap['pool']
+            snaps = rem_poolsnap['snaps']
+
+            writeb(struct.pack('<q', pool), 'osd_new_purged_snaps_pool')
+
+            writeb(struct.pack('<I', len(snaps)), 'osd_new_purged_snaps_snaps_len')
+            for snap in snaps:
+                begin = snap['begin']
+                length = snap['length']
+                writeb(struct.pack('<Q', begin), 'osd_new_purged_snaps_snap_begin')
+                writeb(struct.pack('<Q', length), 'osd_new_purged_snaps_snap_length')
 
         # last_up_change: utime_t
+        writeb(encode_cephtime(self.state['osd_dump']['last_up_change']), 'osd_last_up_change')
+
         # last_in_change: utime_t
+        writeb(encode_cephtime(self.state['osd_dump']['last_in_change']), 'osd_last_in_change')
 
         osdmap_client_struct.write_len()
 
-        # extended osd-only data
+        ### extended osd-only data
         # osd_xinfo
         #osdmap_extended_struct = StructVersion(out, 0xxxx, 1, 'osdmap_extended')
         #

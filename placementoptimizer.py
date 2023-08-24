@@ -1403,7 +1403,7 @@ class ClusterState:
         self.poolnames = dict()                    # poolname => poolid
         self.crushrules = dict()                   # ruleid => props
         self.crushclass_osds = defaultdict(set)    # crushclass => osdidset
-        self.crushclasses_usage = dict()           # crushclass => percent_used
+        self.crushclasses_usage = dict()           # crushclass => size props
         self.osd_crushclass = dict()               # osdid => crushclass
         self.ec_profiles = dict()                  # erasure coding profile names
 
@@ -1447,9 +1447,17 @@ class ClusterState:
             for osdid in class_osds:
                 self.osd_crushclass[osdid] = crush_class
 
-            # there's more stats, but raw is probably ok
             class_df_stats = self.state["df_dump"]["stats_by_class"][crush_class]
-            self.crushclasses_usage[crush_class] = class_df_stats["total_used_raw_ratio"] * 100
+
+            # there's more stats, but raw is probably ok
+            # cf. the ceph df output lists this at the top.
+            # TODO: does this exclude the full-ratio lost space? it appears so?
+            self.crushclasses_usage[crush_class] = {
+                'size': class_df_stats["total_bytes"],  # sum of all devices in that class
+                'avail': class_df_stats["total_avail_bytes"],
+                'used': class_df_stats["total_used_raw_bytes"],
+                'percent_used': class_df_stats["total_used_raw_ratio"] * 100,
+            }
 
         # longest poolname's length
         self.max_poolname_len = 0
@@ -1483,7 +1491,7 @@ class ClusterState:
         for pool in self.state["df_dump"]["pools"]:
             id = pool["id"]
             self.pools[id].update({
-                "stored": pool["stats"]["stored"],  # actually stored data
+                "stored": pool["stats"]["stored"],  # usable data size without redundancy
                 "objects": pool["stats"]["objects"],  # number of pool objects
                 "used": pool["stats"]["bytes_used"],  # including redundant data
                 "store_avail": pool["stats"]["max_avail"],  # available storage amount
@@ -3540,7 +3548,7 @@ class UsageAnalysis:
 
             self.crushclass_usages[crushclass] = CrushclassUsage(
                 statistics.mean(cc_osd_usages.values()),
-                cluster.crushclasses_usage[crushclass],
+                cluster.crushclasses_usage[crushclass]['percent_used'],
                 osd_min, osd_min_used,
                 osd_median, osd_median_used,
                 osd_max, osd_max_used
@@ -4002,6 +4010,17 @@ def show(args, cluster):
             if len(crush_class) > maxcrushclasslen:
                 maxcrushclasslen = len(crush_class)
 
+        print()
+        crushclasscolumnlen = max(maxcrushclasslen, len('class'))
+        crushclassheader = 'class'.ljust(crushclasscolumnlen)
+        print(f"{crushclassheader} {'size': >7} {'avail': >7} {'used': >7} {'%used': >7}")
+        for crushclass, usage in cluster.crushclasses_usage.items():
+            crushclassname = crushclass.ljust(crushclasscolumnlen)
+            size = pformatsize(usage['size'], 2)
+            avail = pformatsize(usage['avail'], 2)
+            used = pformatsize(usage['used'], 2)
+            print(f"{crushclassname} {size: >7} {avail: >7} {used: >7} {usage['percent_used']: >6.02f}%")
+
         if args.show_max_avail:
             maxavail_hdr = f" {'maxavail': >8}"
         else:
@@ -4045,17 +4064,18 @@ def show(args, cluster):
             pg_num = poolprops['pg_num']
             stored_sum += poolprops['stored']
             used_sum += poolprops['used']
-            stored = pformatsize(poolprops['stored'])  # used data excl metadata
-            used = pformatsize(poolprops['used'])  # raw usage incl metastuff
+            # TODO: maybe add poolprops['num_omap_bytes'] to stored?
+            stored = pformatsize(poolprops['stored'], 2)  # used data without redundancy
+            used = pformatsize(poolprops['used'], 2)  # raw usage incl redundancy
 
             # predicted pool free space - either our or ceph's original size prediction
             if args.original_avail_prediction:
-                avail = pformatsize(poolprops['store_avail'])
+                avail = pformatsize(poolprops['store_avail'], 2)
             else:
-                avail = pformatsize(mappings.get_pool_max_avail_pgs(poolid))
+                avail = pformatsize(mappings.get_pool_max_avail_pgs(poolid), 2)
 
             if args.show_max_avail:
-                maxavail = pformatsize(mappings.get_pool_max_avail_weight(poolid))
+                maxavail = pformatsize(mappings.get_pool_max_avail_weight(poolid), 2)
                 maxavail = f" {maxavail: >8}"
             else:
                 maxavail = ""
@@ -4065,11 +4085,17 @@ def show(args, cluster):
             print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7}{maxavail} {shard_size: >8} {crushruleid}:{crushrulename} {rootweights_pp: >12}")
 
         for crushroot in stored_sum_class.keys():
-            crushclass_usage = ""
             crush_tree_class = crushroot.split("~")
             if len(crush_tree_class) >= 2:
+                # it's a shadow-tree - df dump provides stats for deviceclass usage directly
                 crush_class = crush_tree_class[1]
-                crushclass_usage = f"{cluster.crushclasses_usage[crush_class]:.3f}%"
+                crushclass_usage = f"{cluster.crushclasses_usage[crush_class]['percent_used']:.3f}%"
+            else:
+                # it's a regular tree -> we need to figure out what crushclasses the rule uses
+                # and combine the device-class usages
+                # maybe usage=sum[all root's classes](rootweight*crushclass_usage[crush_class])
+                # or max(same stuff) since only the fullest device counts again?
+                crushclass_usage = ""
 
             print(f"{crushroot: <14}    {' ' * maxpoolnamelen} {' ' * 13} "
                   f"{pformatsize(stored_sum_class[crushroot], 2): >7} "

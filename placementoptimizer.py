@@ -1661,45 +1661,6 @@ class ClusterState:
                 "coding_chunks": int(ec_spec["m"]),
             }
 
-
-        for pool in self.state["df_dump"]["pools"]:
-            id = pool["id"]
-            self.pools[id].update({
-                "stored": pool["stats"]["stored"],  # usable data size without redundancy
-                "objects": pool["stats"]["objects"],  # number of pool objects
-                "used": pool["stats"]["bytes_used"],  # including redundant data
-                "store_avail": pool["stats"]["max_avail"],  # available storage amount
-                "percent_used": pool["stats"]["percent_used"],
-                "quota_bytes": pool["stats"]["quota_bytes"],
-                "quota_objects": pool["stats"]["quota_objects"],
-            })
-
-
-        for pool in self.state["pool_dump"]:
-            id = pool["pool_id"]
-            pool_type = pool_repl_type(pool["type"])
-            ec_profile = pool["erasure_code_profile"]
-
-            pg_shard_size_avg = self.pools[id]["stored"] / self.pools[id]["pg_num"]
-
-            if pool_type == "ec":
-                profile = self.ec_profiles[ec_profile]
-                pg_shard_size_avg /= profile["data_chunks"]
-                blowup_rate = profile["data_chunks"] / (profile["data_chunks"] + profile["coding_chunks"])
-
-            elif pool_type == "repl":
-                blowup_rate = pool["size"]
-
-            else:
-                raise Exception(f"unknown pool_type={pool_type}")
-
-            self.pools[id].update({
-                "erasure_code_profile": ec_profile if pool_type == "ec" else None,
-                "repl_type": pool_type,
-                "pg_shard_size_avg": pg_shard_size_avg,
-                "blowup_rate": blowup_rate,
-            })
-
         for pool_stat in self.state["pg_dump"]["pg_map"]["pool_stats"]:
             id = pool_stat["poolid"]
 
@@ -1710,8 +1671,57 @@ class ClusterState:
                 "num_objects_misplaced": pool_stat["stat_sum"]["num_objects_misplaced"],
                 "num_omap_bytes": pool_stat["stat_sum"]["num_omap_bytes"],
                 "num_omap_keys": pool_stat["stat_sum"]["num_omap_keys"],
+                # this is just without omap without redundancy
                 "num_bytes": pool_stat["stat_sum"]["num_bytes"],
             })
+
+        for pooldf in self.state["df_dump"]["pools"]:
+            id = pooldf["id"]
+            pool = self.pools[id]
+
+            pool.update({
+                "stored": pooldf["stats"]["stored"],  # stored_data + stored_omap without redundancy
+                "objects": pooldf["stats"]["objects"],  # number of pool objects
+                # data_bytes_used + omap_bytes_used including redundancy of data + omap
+                "used": pooldf["stats"]["bytes_used"],
+                # available storage amount according to ceph's internal calculation
+                "store_avail": pooldf["stats"]["max_avail"],
+                "percent_used": pooldf["stats"]["percent_used"],
+                "quota_bytes": pooldf["stats"]["quota_bytes"],
+                "quota_objects": pooldf["stats"]["quota_objects"],
+            })
+
+        for poolmeta in self.state["pool_dump"]:
+            id = poolmeta["pool_id"]
+            pool = self.pools[id]
+
+            pool_type = pool_repl_type(poolmeta["type"])
+            ec_profile = poolmeta["erasure_code_profile"]
+
+            pg_shard_size_avg = pool["stored"] / pool["pg_num"]
+
+            if pool_type == "ec":
+                profile = self.ec_profiles[ec_profile]
+                pg_shard_size_avg /= profile["data_chunks"]
+                blowup_rate = profile["data_chunks"] / (profile["data_chunks"] + profile["coding_chunks"])
+
+            elif pool_type == "repl":
+                blowup_rate = poolmeta["size"]
+
+            else:
+                raise Exception(f"unknown pool_type={pool_type}")
+
+            pool.update({
+                "erasure_code_profile": ec_profile if pool_type == "ec" else None,
+                "repl_type": pool_type,
+                "pg_shard_size_avg": pg_shard_size_avg,
+                "blowup_rate": blowup_rate,
+            })
+
+            # apparently ceph 17.2.5 reports the same value for stored & used due to some bug?
+            if pool['stored'] == pool['used']:
+                # TODO: when ec supports omap, we may need to blowup omap differently.
+                pool['used'] *= blowup_rate
 
         # create osd base structure
         for osd in self.state["osd_df_dump"]["nodes"]:
@@ -1726,6 +1736,8 @@ class ClusterState:
                 "crush_weight": osd["crush_weight"],
                 "status": osd["status"],
             }
+            # "internal_metadata": osd["statfs"]["internal_metadata"]
+
             self.osd_devsize[id] = osd["kb"] * 1024
 
         # adjustments to the crush mappings

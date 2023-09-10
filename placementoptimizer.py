@@ -3452,7 +3452,7 @@ class PGMappings:
         return ret
 
     @lru_cache(maxsize=2**16)
-    def get_pool_max_avail_weight(self, poolid):
+    def get_pool_max_avail_weight(self, poolid, negative_ok: bool = False):
         """
         given a pool id, predict how much space is available with the current mapping.
         similar how `ceph df` calculates available pool size
@@ -3477,7 +3477,8 @@ class PGMappings:
         # this is determined by the "fullest" osd:
         # we try for each osd how much it can take,
         # given its selection probabiliy (due to its weight)
-        min_avail = -1
+        min_avail = 0
+        limiting_osd = None
         for osdid, osdweight in osdid_candidates.items():
             # since we will adjust weight below, we need the raw device size
             device_size = self.cluster.osd_devsize[osdid]
@@ -3492,24 +3493,28 @@ class PGMappings:
             # how much of the whole distribution will be "this" osd.
             weighted_usable = usable / (osdweight * blowup_rate)
 
-            #print(
-            #    f"usable on {osdid:>4}: "
-            #    f"size={pformatsize(device_size):>5} "
-            #    f"used={pformatsize(used_size):>8} "
-            #    f"usable={pformatsize(usable):>7} "
-            #    f"blowup={blowup_rate:>7} "
-            #    f"weight={osdweight:>7} "
-            #    f"weighted={pformatsize(weighted_usable, 2):>7} "
-            #)
+            if False:
+                print(
+                    f"usable on {osdid:>4}: "
+                    f"size={pformatsize(device_size):>5} "
+                    f"used={pformatsize(used_size):>8} "
+                    f"usable={pformatsize(usable):>7} "
+                    f"blowup={blowup_rate:>7} "
+                    f"weight={osdweight:>7} "
+                    f"weighted={pformatsize(weighted_usable, 2):>7} "
+                )
 
-            if min_avail < 0 or weighted_usable < min_avail:
+            if limiting_osd is None or weighted_usable < min_avail:
                 min_avail = weighted_usable
-        pool_avail = min_avail
+                limiting_osd = osdid
 
-        return pool_avail
+        if not negative_ok and min_avail < 0:
+            min_avail = 0
+
+        return min_avail, limiting_osd
 
     @lru_cache(maxsize=2**16)
-    def get_pool_max_avail_pgs_limit(self, poolid):
+    def get_pool_max_avail_pgs_limit(self, poolid, negative_ok: bool = False):
         """
         given a pool id, predict how much space is available with the current mapping.
 
@@ -3532,8 +3537,8 @@ class PGMappings:
         # how much space is available in a pool?
         # we try for each osd how much it can take,
         # given its selection probabiliy (due to pg distributions)
-        min_avail = -1
-        limiting_osd = -1
+        min_avail = 0
+        limiting_osd = None
 
         for osdid in osdid_candidates:
             # raw device size as reported by osd
@@ -3560,7 +3565,7 @@ class PGMappings:
             placement_probability = pool_pg_shards_on_osd / num_shards
             predicted_usable = usable / (placement_probability * blowup_rate)
 
-            if min_avail < 0 or predicted_usable < min_avail:
+            if limiting_osd is None or predicted_usable < min_avail:
                 min_avail = predicted_usable
                 limiting_osd = osdid
 
@@ -3570,15 +3575,19 @@ class PGMappings:
                     f"size={pformatsize(device_size):>5} "
                     f"used={pformatsize(used_size):>8} "
                     f"usable={pformatsize(usable):>7} "
-                    f"raw_blowup={blowup_rate:>7} "
+                    f"raw_blowup={blowup_rate:8.03f} "
                     f"on_osd={pool_pg_shards_on_osd:>4} "
                     f"probability={placement_probability:>7} "
                     f"weighted={pformatsize(predicted_usable, 2):>7} "
                 )
 
-
-        if min_avail < 0:
+        if limiting_osd is None:
             raise Exception(f"no pg of poolid={poolid} mapped on any osd to use space")
+
+        # if mappings are bigger than a device size can take,
+        # available space becomes negative...
+        if not negative_ok and min_avail < 0:
+            min_avail = 0
 
         return min_avail, limiting_osd
 
@@ -3872,8 +3881,7 @@ class MappingAnalyzer:
             if self.pool_free_method == PoolFreeMethod.LIMITING:
                 avail, limit_osd = self.pg_mappings.get_pool_max_avail_pgs_limit(poolid)
             elif self.pool_free_method == PoolFreeMethod.WEIGHT:
-                avail = self.pg_mappings.get_pool_max_avail_weight(poolid)
-                limit_osd = -1
+                avail, limit_osd = self.pg_mappings.get_pool_max_avail_weight(poolid)
             else:
                 raise Exception()
 

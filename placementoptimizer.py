@@ -274,13 +274,19 @@ def pformatsize(size_bytes, commaplaces=1):
 
     return "%.1fB" % size_bytes
 
-def cephtime_to_datetime(cephtime: str):
+def cephtime_to_datetime(cephtime: str) -> datetime.datetime:
     """
     converts a ceph dump timestamp to python datetime.
     """
-    # we have to insert a : in the timezone part so python is happy...
-    cephtime_with_fixed_timezone = cephtime[:-2] + ":" + cephtime[-2:]
-    return datetime.datetime.fromisoformat(cephtime_with_fixed_timezone)
+
+    try:
+        # we've seen: 0.000000, seems to be an old pool :)
+        val = float(cephtime)
+        return datetime.datetime.fromtimestamp(val)
+    except ValueError:
+        # we have to insert a : in the timezone part so python is happy...
+        cephtime_with_fixed_timezone = cephtime[:-2] + ":" + cephtime[-2:]
+        return datetime.datetime.fromisoformat(cephtime_with_fixed_timezone)
 
 def datetime_to_osdmaptime(when: datetime.datetime):
     ns = when.time().microsecond * 1000
@@ -848,8 +854,8 @@ class ClusterState:
                 key_id = option_ids[key_name]
                 writeb(struct.pack('<i', key_id), f'pool_opts_t_key:{key_name}')
 
-                # only support string values for now
                 val_type = type(value)
+                # pool_opts_t::type_t
                 val_type_id = {
                     str: 0,    # std::string
                     int: 1,    # int64_t
@@ -862,8 +868,10 @@ class ClusterState:
                     writeb(value_b, 'pool_opts_t_str_value')
                 elif val_type_id == 1:
                     writeb(struct.pack('<q', value), 'pool_opts_t_value_int')
+                elif val_type_id == 2:
+                    writeb(struct.pack('<d', value), 'pool_opts_t_value_double')
                 else:
-                    raise Exception("unhandled option value type")
+                    raise Exception(f"unhandled option value type={val_type}->{val_type_id} for value={value}")
 
             pool_opts_struct.write_len()
 
@@ -978,7 +986,7 @@ class ClusterState:
 
             if osdmetadata is not None:
                 # the osd dump uses floats...
-                weight = (osdmetadata['weight'] * 0x10000) // 1
+                weight = int(osdmetadata['weight'] * 0x10000)
             else:
                 # we have to fill holes
                 weight = 0
@@ -1040,7 +1048,7 @@ class ClusterState:
         for osdid in range(max_osd):
             osdmetadata = osds.get(osdid)
             if osdmetadata is not None:
-                primary_affinity = (osdmetadata["primary_affinity"] * 0x10000) // 1
+                primary_affinity = int(osdmetadata["primary_affinity"] * 0x10000)
             else:
                 primary_affinity = 0
 
@@ -3037,7 +3045,7 @@ class PGMappings:
                     if len(osds) % 2 > 0:
                         raise Exception(f"for pg={pgid}: uneven osd count")
 
-                    for i in range(len(osds) // 2):
+                    for i in range(int(len(osds) // 2)):
                         # group the movement pairs
                         moves.append((int(osds[i*2]), int(osds[i*2 + 1])))
 
@@ -3896,7 +3904,7 @@ class MappingAnalyzer:
 
             # osd size utilization
             osd_min, osd_min_used = min(cc_osd_usages.items(), key=lambda x: x[1])
-            osd_median, osd_median_used = sorted(cc_osd_usages.items(), key=lambda x: x[1])[len(cc_osd_usages) // 2]
+            osd_median, osd_median_used = sorted(cc_osd_usages.items(), key=lambda x: x[1])[int(len(cc_osd_usages) // 2)]
             osd_max, osd_max_used = max(cc_osd_usages.items(), key=lambda x: x[1])
 
             self.crushclass_usages[crushclass] = CrushclassUsage(

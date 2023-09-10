@@ -1702,8 +1702,9 @@ class ClusterState:
 
             if pool_type == "ec":
                 profile = self.ec_profiles[ec_profile]
-                pg_shard_size_avg /= profile["data_chunks"]
-                blowup_rate = profile["data_chunks"] / (profile["data_chunks"] + profile["coding_chunks"])
+                data_chunks = profile["data_chunks"]
+                pg_shard_size_avg /= data_chunks
+                blowup_rate = (data_chunks + profile["coding_chunks"]) / data_chunks
 
             elif pool_type == "repl":
                 blowup_rate = poolmeta["size"]

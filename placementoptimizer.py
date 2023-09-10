@@ -59,7 +59,7 @@ def parse_args():
                         help='return the ignored statemaps as "reverted" when generating new upmaps (e.g. in balancing)')
 
     predictionp = argparse.ArgumentParser(add_help=False)
-    predictionp.add_argument('--avail-prediction', choices=['weight', 'limiting'], default='weight',
+    predictionp.add_argument('--avail-prediction', choices=['weight', 'limiting'], default='limiting',
                              help=("algorithm to use for available pool size prediction.\n"
                                    "weight: use ceph's original prediction based on crush weights. "
                                    "it's unfortunately wrong for multi-take crush rules, "
@@ -148,6 +148,9 @@ def parse_args():
                            help="compare to this pool which osds are involved")
 
     sp.add_parser('repairstats', parents=[statep])
+
+    testp = sp.add_parser('test', help="test internal stuff")
+    testp.add_argument('--name', '-n', help='doctest name to run')
 
     osdmapp = sp.add_parser('osdmap', help="compatibility with ceph osd maps")
     osdmapsp = osdmapp.add_subparsers(dest='osdmapmode')
@@ -398,7 +401,7 @@ def list_replace(iterator, search, replace):
 def stat_mean(iterable):
     """
     calculates mean.
-    speedup factor ~17 compared to python's statistics.mean
+    speedup factor ~10 compared to python's statistics.mean
     """
     count = len(iterable)
     if count == 0:
@@ -432,6 +435,89 @@ def stat_variance(iterable):
         diffsum += (val - mean) ** 2
 
     return 1/(count-1) * diffsum
+
+
+def remaps_merge(target_remaps: dict[int, int],
+                 merge_remaps: Optional[dict[int, int]] = None,
+                 in_place: bool = False):
+    """
+    remove cycles and transitive remaps from a remap dict.
+    modifies 'target_remaps'!
+    if merge_remaps is given, merge those remaps onto the `target_remaps` dict.
+
+    >>> remaps_merge({})
+    {}
+    >>> remaps_merge({1: 2, 3: 4})
+    {1: 2, 3: 4}
+    >>> remaps_merge({1: 2, 2: 3})
+    {1: 3}
+    >>> remaps_merge({1: 2}, {2: 3})
+    {1: 3}
+    >>> remaps_merge({1: 2, 2: 1})
+    {}
+    >>> remaps_merge({1: 2, 2: 3, 3: 4})
+    {1: 4}
+    >>> remaps_merge({1: 2, 2: 3}, {3: 4})
+    {1: 4}
+    >>> remaps_merge({216: 205, 360: 294}, {294: 216})
+    {360: 205}
+    >>> remaps_merge({1: 2, 2: 3}, {1: 4})
+    {1: 4}
+    >>> remaps_merge({1: 2, 2: 3}, {1: 4, 4: 5})
+    {1: 5}
+    """
+
+    ret = dict()
+
+    if in_place:
+        destination = target_remaps
+    else:
+        destination = target_remaps.copy()
+
+    def merge_chains(remaps):
+        for osd_from, osd_to in remaps.copy().items():
+            while True:
+                # given (a, b) is there (b, c)?
+                next_to = remaps.get(osd_to)
+                if next_to is not None:
+                    if osd_from == next_to:
+                        # symmetric: it's (a, b), (b, a)
+                        del remaps[osd_to]
+                        if merge_remaps is None:
+                            # in-place operation
+                            del remaps[next_to]
+                    else:
+                        # transitive: it's (a, b), (b, c) so we set (a, c) and remove (b, c)
+                        remaps[osd_from] = next_to
+                        del remaps[osd_to]
+                    # follow the remap-chain
+                    osd_to = next_to
+                else:
+                    break
+
+    merge_chains(destination)
+
+    if merge_remaps is not None:
+        destination.update(merge_remaps)
+        merge_chains(destination)
+
+    # TODO: remove once confident enough the above is correct :)
+    for new_from, new_to in destination.items():
+        if new_from == new_to:
+            raise Exception(f"somewhere something went wrong: "
+                            f"we map {pgid} from osd.{new_from} to osd.{new_to} in "
+                            f"{destination}")
+        while True:
+            next_to = destination.get(new_to)
+            if next_to is not None:
+                raise Exception(f"something went wrong: "
+                                f"there's still transitive remaps left for {new_to}: "
+                                f"{destination}")
+            else:
+                break
+
+
+    return destination
 
 
 def pool_from_pg(pg):
@@ -553,7 +639,7 @@ class ClusterState:
         out = io.BytesIO()
 
         def writeb(data, name=None):
-            print(f"[{out.tell():>10x}] {binascii.hexlify(data)} {'<- %s' % name if name else ''}")
+            logging.debug(strlazy(lambda: f"[{out.tell():>10x}] {binascii.hexlify(data)} {'<- %s' % name if name else ''}"))
             out.write(data)
 
         class StructLength:
@@ -1650,19 +1736,8 @@ class ClusterState:
                     continue
                 remaps[osd_from] = osd_to
 
-            # merge (a, b), (b, c) -> (a, c)
-            for osd_from, osd_to in remaps.copy().items():
-                # given (a, b) is there (b, c)?
-                other_to = remaps.get(osd_to)
-                if other_to is not None:
-                    if other_to == osd_from:
-                        # it's (a, b), (b, a)
-                        del remaps[osd_to]
-                        del remaps[osd_from]
-                    else:
-                        # it's (a, b), (b, c) so we set (a, c) and remove (b, c)
-                        remaps[osd_from] = other_to
-                        del remaps[osd_to]
+            # modify remaps to filter out redundant info
+            remaps = remaps_merge(remaps)
 
             self.upmap_items[upmap_item["pgid"]] = remaps
 
@@ -2681,6 +2756,9 @@ class PGMappings:
         # new simulated movements by apply_remap
         # pg->{osd_from: osd_to, ...}
         self.remaps = defaultdict(dict)
+        # combined version of self.remaps and cluster.upmap_items
+        # caches the merged remaps
+        self._upmap_items = defaultdict(dict)
 
         # {osd we moved data to/from: amount moved}
         self.osd_size_change = defaultdict(lambda: 0)
@@ -2713,7 +2791,6 @@ class PGMappings:
                 rootweights = rootweights_from_rule(cluster.crushrules[poolprops['crush_rule']], poolprops["size"])
 
                 # crush root names used in that pool
-                crushroots = rootweights.keys()
                 for crushroot in rootweights.keys():
                     # cut deviceclass from crush root name -> default~hdd -> get class hdd
                     classsplit = crushroot.split('~')
@@ -2855,7 +2932,18 @@ class PGMappings:
                     f"size={pformatsize(osd['device_size'], 3)}")))
 
         # pg movement statistics tracking
+        #
+        # analysis order:
+        # simulate cluster state
+        # ->init_analysis  if emit_ignored_upmaps
+        # revert cluster upmaps
+        # ->init_analysis  if not emit_ignored_upmaps
+        # ->analysis
+        # file upmaps (and in apply_remap, record moves)
+        #
+        # analysis for the base state
         self.init_analyzer = init_analyzer
+        # analysis for the current state
         self.analyzer = analyzer
 
         # which movements did we un-do: pgid->{from: to}, ...
@@ -2868,6 +2956,7 @@ class PGMappings:
             raise Exceptions('when emitting ignored upmaps, upmap ignoring must be enabled')
 
         if ignore_cluster_upmaps:
+            # base state without upmaps -> analyze
             if emit_ignored_upmaps:
                 if self.init_analyzer is not None:
                     self.init_analyzer.analyze(self)
@@ -2876,7 +2965,7 @@ class PGMappings:
             self.revert_upmaps(emit_ignored_upmaps)
 
         if not emit_ignored_upmaps and self.init_analyzer is not None:
-            # ignored upmaps are not emitted -> analyze after the revers were done
+            # ignored upmaps are not emitted -> analyze after the reverts were done
             self.init_analyzer.analyze(self)
 
         if self.analyzer is not None:
@@ -2897,8 +2986,8 @@ class PGMappings:
         else:
             movement_applier = self._move_pg
 
-        ctr = 0
-        moved = 0
+        move_count = 0
+        move_amount = 0
         for pgid, pg_upmaps in self.cluster.upmap_items.items():
             for osd_from, osd_to in pg_upmaps.items():
                 logging.debug(strlazy(lambda: f"move pg {pgid} from osd.{osd_to}->osd.{osd_from} to revert{' and emit' if emit else ''} upmap"))
@@ -2916,10 +3005,10 @@ class PGMappings:
 
                 self.reverted_upmaps[pgid][osd_from] = osd_to
 
-                moved += self.cluster.get_pg_shardsize(pgid)
-                ctr += 1
+                move_count += 1
+                move_amount += self.cluster.get_pg_shardsize(pgid)
 
-        logging.info("reverted %d upmaps (%s)", ctr, pformatsize(moved, 2))
+        logging.info(strlazy(lambda: f"reverted {move_count} moves ({pformatsize(move_amount, 2)})"))
 
 
     def apply_file_upmaps(self, filename):
@@ -2931,6 +3020,8 @@ class PGMappings:
         upmap_rm_re = re.compile(r'^ceph osd rm-pg-upmap-items ([0-9a-f\.]+)$')
 
         with open(filename) as upmap_file:
+            move_count = 0
+            move_amount = 0
             for upmap_line in upmap_file:
                 if upmap_line.strip().startswith('#'):
                     continue
@@ -2986,13 +3077,18 @@ class PGMappings:
                         osd_from = prev_remap
 
                     move_ok = self.apply_remap(pgid, osd_from, osd_to)
-                    if not move_ok:
+                    if move_ok:
+                        move_count += 1
+                        move_amount += self.cluster.get_pg_shardsize(pgid)
+                    else:
                         logging.info(strlazy(lambda: (f"skipped moving pg={pgid} from {osd_from}->{osd_to} "
                                                       f"since it's not mapped on osd.{osd_from}\n"
                                                       f"currently mapped to: {self.get_mapping(pgid)}\n"
                                                       f"cluster mapping: {self.cluster.pg_osds_up[pgid]}\n"
                                                       f"cluster upmaps for pg={pgid}: {cluster_upmaps}\n"
                                                       f"reverted upmaps for pg={pgid}: {reverted_upmaps}")))
+
+            logging.info(strlazy(lambda: f"applied {move_count} moves from file ({pformatsize(move_amount, 2)})"))
 
 
     def _move_pg(self, pgid, osd_from, osd_to) -> bool:
@@ -3030,7 +3126,8 @@ class PGMappings:
         self.osd_pool_up_shard_count[osd_from][poolid] -= 1
         self.osd_pool_up_shard_count[osd_to][poolid] += 1
 
-        # flush usage caches
+        # flush caches
+        self._upmap_items.pop(pgid, None)
         self.get_osd_usage.cache_clear()
         self.get_osd_usage_size.cache_clear()
         self.get_osd_space_allocated.cache_clear()
@@ -3058,7 +3155,7 @@ class PGMappings:
 
             if self.analyzer is not None:
                 if not revert:
-                    # TODO: maybe allow recording if requested by cli arg
+                    # TODO: maybe allow reverted move analysis if requested by cli arg
                     self.analyzer.record_move(pgid, osd_from, osd_to)
 
         return move_ok
@@ -3130,15 +3227,25 @@ class PGMappings:
 
         def limiting_osds():
             # [(limiting_osdid, usage), ]
-            limiting_osds = list()
+            limiting_osd_usages = dict()
+            limiting_osd_count = defaultdict(lambda: 0)
             for poolid in self.pool_candidates:
                 # all limiting osds
-                osdid = self.get_pool_max_avail_pgs_limit(poolid)[1]
-                limiting_osds.append((osdid, self.get_osd_usage(osdid)))
+                min_avail, osdid = self.get_pool_max_avail_pgs_limit(poolid, negative_ok=True)
+                limiting_osd_usages[osdid] = self.get_osd_usage(osdid)
+                limiting_osd_count[osdid] += 1
 
-            # TODO: not only sort by size, but prefer osds that limit many pools
+            pool_count = len(self.pool_candidates)
+            def cmp_limit_usage(osdid_usage):
+                osdid, usage = osdid_usage
+                # weight the usage by the pool limiting percentage
+                return usage * (limiting_osd_count[osdid] / pool_count)
+
+            # not only sort by size, but prefer osds that limit many pools
             # osd_usage * pools_limited/pool_count
-            for osdid, usage in sorted(limiting_osds, key=lambda x: x[1], reverse=True):
+            for osdid, usage in sorted(limiting_osd_usages.items(),
+                                       key=cmp_limit_usage,
+                                       reverse=True):
                 yield osdid, usage
 
         def fullest_osds():
@@ -3279,9 +3386,9 @@ class PGMappings:
     def get_upmaps(self):
         """
         get all applied mappings for generating movement instructions.
-        return {pgid: [(map_from, map_to), ...]}
+        return {pgid -> {map_from: map_to, ...}}
         """
-        # {pgid -> [(map_from, map_to), ...]}
+
         upmap_results = dict()
 
         # only look at newly adjusted pgs
@@ -3296,7 +3403,7 @@ class PGMappings:
         """
         for pgid, upmaps in self.get_upmaps().items():
             if upmaps:
-                upmap_str = " ".join([f"{osd_from} {osd_to}" for (osd_from, osd_to) in upmaps])
+                upmap_str = " ".join([f"{osd_from} {osd_to}" for (osd_from, osd_to) in upmaps.items()])
                 yield f"ceph osd pg-upmap-items {pgid} {upmap_str}"
             else:
                 # cluster had previous upmaps for this pg
@@ -3316,65 +3423,33 @@ class PGMappings:
     def get_pg_upmap(self, pgid):
         """
         get all applied mappings for a pg
-        return [(map_from, map_to), ...]
+        return {map_from: map_to, ...}
         """
-        previous_upmaps = self.get_cluster_upmaps(pgid)
+        cached = self._upmap_items.get(pgid)
+        if cached is not None:
+            return cached
+
+        # this is already redundancy-filtered
+        previous_remaps = self.get_cluster_upmaps(pgid)
+        # this may not be redundancy-filtered
         new_remaps = self.remaps.get(pgid, {})
 
-        if not new_remaps and not previous_upmaps:
-            return []
+        if not new_remaps and not previous_remaps:
+            return {}
 
         # merge new upmaps
-        for new_from, new_to in new_remaps.copy().items():
-            other_to = new_remaps.get(new_to)
-            if other_to is not None:
-                if other_to == new_from:
-                    # (a, b), (b, a) -> delete
-                    if new_from in new_remaps:
-                        # no longer exists due to copy of new_remaps
-                        del new_remaps[new_from]
-                    del new_remaps[new_to]
-                else:
-                    # (a, b), (b, c) -> (a, c)
-                    new_remaps[new_from] = other_to
-                    del new_remaps[new_to]
+        # this actually modifies the self.remaps, intentionally.
+        new_remaps = remaps_merge(new_remaps, in_place=True)
 
-        # now, let's merge previous_upmaps and remaps:
+        if not previous_remaps:
+            ret = new_remaps
+        else:
+            # now, let's merge new_remaps onto previous_remaps into results:
+            ret = remaps_merge(previous_remaps.copy(), new_remaps)
 
-        # which of the previous_upmaps to retain
-        resulting_upmaps = list()
-
-        # what remap-source-osds we already covered with merges
-        merged_remaps = set()
-
-        for prev_from, previous_to in previous_upmaps.items():
-            # do we currently map to a device, from which we move it again now?
-            new_mapping_of_previous = new_remaps.get(previous_to)
-            if new_mapping_of_previous is not None:
-                # this remap's source osd will now be merged
-                merged_remaps.add(previous_to)
-
-                if prev_from == new_mapping_of_previous:
-                    # skip current=(75->72), remapped=(72->75) leading to (75->75)
-                    continue
-
-                # transform e.g. current=197->188, remapped=188->261 to 197->261
-                resulting_upmaps.append((prev_from, new_mapping_of_previous))
-                continue
-
-            # keep it
-            resulting_upmaps.append((prev_from, previous_to))
-
-        for new_from, new_to in new_remaps.items():
-            if new_from in merged_remaps:
-                continue
-            resulting_upmaps.append((new_from, new_to))
-
-        for new_from, new_to in resulting_upmaps:
-            if new_from == new_to:
-                raise Exception(f"somewhere something went wrong, we map {pgid} from osd.{new_from} to osd.{new_to}")
-
-        return resulting_upmaps
+        # remember in cache
+        self._upmap_items[pgid] = ret
+        return ret
 
     @lru_cache(maxsize=2**16)
     def get_pool_max_avail_weight(self, poolid):
@@ -3758,7 +3833,7 @@ class MappingAnalyzer:
 
     def finish(self) -> None:
         if self.dump_output:
-            print(f'generating output DataFrame...')
+            logging.info(f'generating output DataFrame...')
 
             import pandas as pd
 
@@ -3767,7 +3842,7 @@ class MappingAnalyzer:
                 columns=['move_idx', 'poolid', 'pool', 'free'],
             )
 
-            print(f'saving data to {self.dump_output}...')
+            logging.info(f'saving data to {self.dump_output}...')
 
             with open(self.dump_output, "w") as outfd:
                 json.dump({
@@ -3905,10 +3980,14 @@ class MappingAnalyzer:
         poolnameheader = 'pool name'.ljust(self.max_poolname_len)
         logging.info(strlazy(lambda: f"  {poolnameheader} {'id': >4} {'previous': >8}    {'new': >8}    {'change': >8}"))
 
+        gain_sum = 0
         for poolid, (poolname, prev_avail, new_avail, gain) in space_won.items():
+            gain_sum += gain
             poolname = poolname.ljust(self.max_poolname_len)
             logging.info(strlazy(lambda: (f"  {poolname} {poolid: >4} {pformatsize(prev_avail, 2): >8} "
                                         f"-> {pformatsize(new_avail, 2): >8} => {pformatsize(gain, 2): >8}")))
+
+        logging.info(strlazy(lambda: (f"  {'' * self.max_poolname_len} => gain_sum: {pformatsize(gain_sum, 2)}")))
 
 
 def A001057():
@@ -4289,7 +4368,6 @@ def show(args, cluster):
         pool_free_method == PoolFreeMethod.LIMITING or
         args.dump_upmap_progress):
 
-
         if args.dump_upmap_progress:
             analyzer = MappingAnalyzer(
                 pool_free_method=pool_free_method,
@@ -4329,7 +4407,7 @@ def show(args, cluster):
 
         poolname = 'name'.ljust(maxpoolnamelen)
         print()
-        print(f"{'poolid': >6} {poolname} {'type': <7} {'size': >5} {'min': >3} {'pg_num': >6} {'stored': >7} {'used': >7} {'avail': >7}{maxavail_hdr} {'shrdsize': >8} crush")
+        print(f"{'poolid': >6} {poolname} {'type': <7} {'size': >5} {'min': >3} {'pg_num': >6} {'stored': >7} {'used': >7} {'avail': >8}{maxavail_hdr} {'shrdsize': >8} crush")
 
         # default, sort by pool id
         sort_func = lambda x: x[0]
@@ -4363,11 +4441,15 @@ def show(args, cluster):
             size = poolprops['size']
             min_size = poolprops['min_size']
             pg_num = poolprops['pg_num']
-            stored_sum += poolprops['stored']
-            used_sum += poolprops['used']
-            # TODO: maybe add poolprops['num_omap_bytes'] to stored?
-            stored = pformatsize(poolprops['stored'], 2)  # used data without redundancy
-            used = pformatsize(poolprops['used'], 2)  # raw usage incl redundancy
+
+            stored_amount = poolprops['stored']
+            used_amount = poolprops['used']
+
+            stored_sum += stored_amount
+            used_sum += used_amount
+
+            stored = pformatsize(stored_amount, 2)  # used data without redundancy
+            used = pformatsize(used_amount, 2)  # raw usage incl redundancy
 
             # predicted pool free space - either our or ceph's original size prediction
             if pool_free_method == PoolFreeMethod.WEIGHT:
@@ -4378,14 +4460,15 @@ def show(args, cluster):
                 raise Exception()
 
             if args.show_max_avail:
-                maxavail = pformatsize(mappings.get_pool_max_avail_weight(poolid), 2)
+                # if we had inf many pgs
+                maxavail = pformatsize(mappings.get_pool_max_avail_weight(poolid)[0], 2)
                 maxavail = f" {maxavail: >8}"
             else:
                 maxavail = ""
 
             shard_size = pformatsize(poolprops['pg_shard_size_avg'])
             rootweights_pp = ",".join(rootweights_ppl)
-            print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >7}{maxavail} {shard_size: >8} {crushruleid}:{crushrulename} {rootweights_pp: >12}")
+            print(f"{poolid: >6} {poolname} {repl_type: <7} {size: >5} {min_size: >3} {pg_num: >6} {stored: >7} {used: >7} {avail: >8}{maxavail} {shard_size: >8} {crushruleid}:{crushrulename} {rootweights_pp: >12}")
 
         for crushroot in stored_sum_class.keys():
             crush_tree_class = crushroot.split("~")

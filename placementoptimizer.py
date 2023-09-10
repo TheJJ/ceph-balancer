@@ -4792,7 +4792,24 @@ def main():
 
     log_setup(args.verbose - args.quiet)
 
-    if args.mode == 'gather':
+    if args.mode == 'test':
+        import doctest
+        if args.name is None:
+            failed, num_tests = doctest.testmod(exclude_empty=True)
+        else:
+            # like doctest.run_docstring_examples but returns results
+            finder = doctest.DocTestFinder(verbose=True, recurse=False)
+            runner = doctest.DocTestRunner(verbose=True)
+            for test in finder.find(globals()[args.name], args.name, globs=globals()):
+                runner.run(test)
+            runner.summarize()
+            failed, num_tests = runner.failures, runner.tries
+
+        return 1 if failed > 0 else 0
+
+    elif args.mode == 'gather':
+        if args.statefile:
+            raise Exception("in gather mode, a state file can't be used as source")
         state = ClusterState()
         state.dump(args.output_file)
 
@@ -4838,6 +4855,7 @@ def main():
 
         else:
             raise Exception(f"unknown mode: {args.mode}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    exit(main())

@@ -1610,6 +1610,9 @@ class ClusterState:
         # crush root name -> (bucket_tree, child bucket_ids)
         self.bucket_roots = dict()
 
+        # cluster id
+        self.fsid = self.state['osd_dump']['fsid']
+
         # what full percentage OSDs no longer accept data
         self.full_ratio = self.state["osd_dump"]["full_ratio"]
 
@@ -1631,6 +1634,7 @@ class ClusterState:
                 'avail': class_df_stats["total_avail_bytes"],
                 'used': class_df_stats["total_used_raw_bytes"],
                 'percent_used': class_df_stats["total_used_raw_ratio"] * 100,
+                'osd_count': len(class_osds),
             }
 
         # longest poolname's length
@@ -1914,6 +1918,7 @@ class ClusterState:
                     })
 
         # populare all bucket roots
+        # TODO: collect all other buckets too since they can be 'take'n too.
         for root_bucket_id in bucket_root_ids:
             bucket_tree, bucket_ids = bucket_fill(root_bucket_id, bucket_info)
             self.bucket_roots[bucket_tree['name']] = (bucket_tree, bucket_ids)
@@ -2066,7 +2071,7 @@ class ClusterState:
     def get_osd_size(self, osdid, adjust_full_ratio=False):
         """
         return the osd size in bytes, depending on the size determination variant.
-        takes into account the size loss due to "full_ratio"
+        can take into account the size loss due to "full_ratio"
         """
 
         if self.osdsize_method == OSDSizeMethod.DEVICE:
@@ -2079,7 +2084,7 @@ class ClusterState:
             raise Exception(f"unknown osd weight method {self.osdsize_method!r}")
 
         if adjust_full_ratio:
-            osd_size *=  self.full_ratio
+            osd_size *= self.full_ratio
 
         return osd_size
 
@@ -3102,7 +3107,7 @@ class PGMappings:
                         move_count += 1
                         move_amount += self.cluster.get_pg_shardsize(pgid)
                     else:
-                        logging.info(strlazy(lambda: (f"skipped moving pg={pgid} from {osd_from}->{osd_to} "
+                        logging.warn(strlazy(lambda: (f"skipped moving pg={pgid} from {osd_from}->{osd_to} "
                                                       f"since it's not mapped on osd.{osd_from}\n"
                                                       f"currently mapped to: {self.get_mapping(pgid)}\n"
                                                       f"cluster mapping: {self.cluster.pg_osds_up[pgid]}\n"
@@ -3835,9 +3840,12 @@ class MappingAnalyzer:
         self.pool_avail = None
         self.crushclass_usages = None
 
+        self.move_idx = 0
+
         if self.dump_output:
-            self.move_idx = 0
-            self.dump_pool_free = list()
+            self.dump_pool_moves = list()
+            self.dump_osd_moves = list()
+            self.dump_cluster_moves = list()
             # so it doesn't crash later if pandas is not there...
             import pandas as pd
 
@@ -3850,16 +3858,8 @@ class MappingAnalyzer:
         return self.pg_mappings is not None
 
     def record_move(self, pgid, move_from, move_to):
+        self.move_idx += 1
         self._update_stats((move_from, move_to))
-
-        if self.dump_output:
-            for pool_id, (pool_name, avail, limit_osd) in self.pool_avail.items():
-                avail_t = avail / 1024 ** 4
-
-                self.dump_pool_free.append((self.move_idx, pool_id, pool_name, avail_t))
-
-            self.move_idx += 1
-
 
     def finish(self) -> None:
         if self.dump_output:
@@ -3867,17 +3867,55 @@ class MappingAnalyzer:
 
             import pandas as pd
 
-            pool_free = pd.DataFrame(
-                self.dump_pool_free,
-                columns=['move_idx', 'poolid', 'pool', 'free'],
+            class PandasEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, pd.DataFrame):
+                        return obj.to_dict()
+                    return super().default(obj)
+
+            cluster = self.pg_mappings.cluster
+
+            # metadata
+            osd_props = pd.DataFrame(
+                [(osdid, cluster.get_osd_size(osdid)) for osdid in cluster.osds.keys()],
+                columns=['osdid', 'osdsize'],
+            )
+            pool_props = pd.DataFrame(
+                [(poolid, pooldata["name"]) for poolid, pooldata in cluster.pools.items()],
+                columns=['poolid', 'pool_name'],
             )
 
-            logging.info(f'saving data to {self.dump_output}...')
+            # movement logs
+            pool_moves = pd.DataFrame(
+                self.dump_pool_moves,
+                columns=['move_idx', 'poolid', 'pool_available'],
+            )
+            osd_moves = pd.DataFrame(
+                self.dump_osd_moves,
+                columns=['move_idx', 'osdid', 'osd_usage_percent', 'osd_used'],
+            )
+            cluster_moves = pd.DataFrame(
+                self.dump_cluster_moves,
+                columns=['move_idx', 'crushclass', 'class_variance'],
+            )
+
+            logging.info(f'saving data to {self.dump_output!r}...')
 
             with open(self.dump_output, "w") as outfd:
-                json.dump({
-                    "pool_free": pool_free.to_json(),
-                }, outfd)
+                json.dump(
+                    {
+                        "generated_at": datetime.datetime.now().isoformat(),
+                        "fsid": cluster.fsid,
+                        "argv": sys.argv,
+                        "pool": pool_props,
+                        "osd": osd_props,
+                        "cluster_moves": cluster_moves,
+                        "pool_moves": pool_moves,
+                        "osd_moves": osd_moves,
+                    },
+                    outfd,
+                    cls=PandasEncoder,
+                )
 
     def _update_stats(self, modified_osds=tuple()):
         # TODO: use modified_osds for more efficient update...
@@ -3888,7 +3926,7 @@ class MappingAnalyzer:
 
         cluster = self.pg_mappings.cluster
 
-        # cluster utilization
+        # cluster utilization variance by crushclass
         self.cluster_variance = self.pg_mappings.get_cluster_variance()
 
         # poolids for all that can be balanced due to their candidates osds having their contents moved around
@@ -3916,9 +3954,10 @@ class MappingAnalyzer:
                 cc_osd_usages[osdid] = self.pg_mappings.get_osd_usage(osdid)
 
             # osd size utilization
-            osd_min, osd_min_used = min(cc_osd_usages.items(), key=lambda x: x[1])
-            osd_median, osd_median_used = sorted(cc_osd_usages.items(), key=lambda x: x[1])[int(len(cc_osd_usages) // 2)]
-            osd_max, osd_max_used = max(cc_osd_usages.items(), key=lambda x: x[1])
+            osds_size_sorted = list(sorted(cc_osd_usages.items(), key=lambda x: x[1]))
+            osd_min, osd_min_used = osds_size_sorted[0]
+            osd_median, osd_median_used = osds_size_sorted[int(len(cc_osd_usages) // 2)]
+            osd_max, osd_max_used = osds_size_sorted[-1]
 
             self.crushclass_usages[crushclass] = CrushclassUsage(
                 fill_average=stat_mean(cc_osd_usages.values()),
@@ -3930,6 +3969,22 @@ class MappingAnalyzer:
                 osd_max=osd_max,
                 osd_max_used=osd_max_used,
             )
+
+            if self.dump_output:
+                for osdid in cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
+                    self.dump_osd_moves.append((
+                        self.move_idx,
+                        osdid,
+                        cc_osd_usages[osdid],
+                        self.pg_mappings.get_osd_usage_size(osdid),
+                    ))
+
+        if self.dump_output:
+            for pool_id, (_, avail, limit_osd) in self.pool_avail.items():
+                self.dump_pool_moves.append((self.move_idx, pool_id, avail))
+            for crushclass, variance in self.cluster_variance.items():
+                self.dump_cluster_moves.append((self.move_idx, crushclass, variance))
+
 
     def log(self):
         if self.pg_mappings is None:
@@ -4016,7 +4071,7 @@ class MappingAnalyzer:
             logging.info(strlazy(lambda: (f"  {poolname} {poolid: >4} {pformatsize(prev_avail, 2): >8} "
                                         f"-> {pformatsize(new_avail, 2): >8} => {pformatsize(gain, 2): >8}")))
 
-        logging.info(strlazy(lambda: (f"  {'' * self.max_poolname_len} => gain_sum: {pformatsize(gain_sum, 2)}")))
+        logging.info(strlazy(lambda: (f"  {' ' * (self.max_poolname_len + 24)} sum: {pformatsize(gain_sum, 2): >8}")))
 
 
 def A001057():
@@ -4419,13 +4474,14 @@ def show(args, cluster):
         print()
         crushclasscolumnlen = max(maxcrushclasslen, len('class'))
         crushclassheader = 'class'.ljust(crushclasscolumnlen)
-        print(f"{crushclassheader} {'size': >7} {'avail': >7} {'used': >7} {'%used': >7}")
+        print(f"{crushclassheader} {'size': >7} {'avail': >7} {'used': >7} {'%used': >7} {'osds': >6}")
         for crushclass, usage in cluster.crushclasses_usage.items():
             crushclassname = crushclass.ljust(crushclasscolumnlen)
             size = pformatsize(usage['size'], 2)
             avail = pformatsize(usage['avail'], 2)
             used = pformatsize(usage['used'], 2)
-            print(f"{crushclassname} {size: >7} {avail: >7} {used: >7} {usage['percent_used']: >6.02f}%")
+            devcount = usage['osd_count']
+            print(f"{crushclassname} {size: >7} {avail: >7} {used: >7} {usage['percent_used']: >6.02f}% {devcount: >6}")
 
         # TODO: allow showing cluster hierarchy
 
@@ -4448,6 +4504,7 @@ def show(args, cluster):
         stored_sum_class = defaultdict(int)
         used_sum = 0
         used_sum_class = defaultdict(int)
+        pg_sum = 0
 
         for poolid, poolprops in sorted(cluster.pools.items(), key=sort_func):
             poolname = poolprops['name'].ljust(maxpoolnamelen)
@@ -4476,6 +4533,7 @@ def show(args, cluster):
 
             stored_sum += stored_amount
             used_sum += used_amount
+            pg_sum += pg_num
 
             stored = pformatsize(stored_amount, 2)  # used data without redundancy
             used = pformatsize(used_amount, 2)  # raw usage incl redundancy
@@ -4517,7 +4575,7 @@ def show(args, cluster):
                   f"{pformatsize(used_sum_class[crushroot], 2): >7}"
                   f"{crushclass_usage: >10}")
 
-        print(f"sum    {' ' * maxpoolnamelen} {' ' * 24} {pformatsize(stored_sum, 2): >7} {pformatsize(used_sum, 2): >7}")
+        print(f"sum    {' ' * maxpoolnamelen} {' ' * 17} {pg_sum: >6} {pformatsize(stored_sum, 2): >7} {pformatsize(used_sum, 2): >7}")
 
         if args.osds:
             if args.only_crushclass:

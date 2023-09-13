@@ -147,7 +147,8 @@ def parse_args():
     pooldiffp.add_argument('pool2',
                            help="compare to this pool which osds are involved")
 
-    sp.add_parser('repairstats', parents=[statep])
+    sp.add_parser('repairstats', parents=[statep],
+                  help="which OSDs repaired their stored data?")
 
     testp = sp.add_parser('test', help="test internal stuff")
     testp.add_argument('--name', '-n', help='doctest name to run')
@@ -4858,12 +4859,19 @@ def poolosddiff(args, cluster):
 
 
 def repairstats(args, cluster):
-    stats_sum = self.state["pg_dump"]["pg_map"]["osd_stats_sum"]
+    stats_sum = cluster.state["pg_dump"]["pg_map"]["osd_stats_sum"]
     print(f"repaired reads globally: {stats_sum['num_shards_repaired']}")
-    for osdid, osdinfos in osds.items():
-        repairs = osdinfos["stats"]["num_shards_repaired"]
+    osd_repairs = list()
+    for osdid, osdinfos in cluster.osds.items():
+        stats = osdinfos.get("stats")
+        if stats is None:
+            continue
+        repairs = stats["num_shards_repaired"]
         if repairs != 0:
-            print(f"repaired on {osdid:>6}: {repairs}")
+            osd_repairs.append((osdid, repairs))
+
+    for osdid, repairs in sorted(osd_repairs, key=lambda x: (x[1], x[0])):
+        print(f"repaired on {osdid:>6}: {repairs}")
 
 
 def main():

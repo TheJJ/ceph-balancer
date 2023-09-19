@@ -23,6 +23,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import time
 import uuid
 from enum import Enum
 from collections import defaultdict
@@ -141,7 +142,10 @@ def parse_args():
                           help=("current source osd can't be emptied more, "
                                 "try this many more other osds candidates to empty. default: %(default)s"))
     balancep.add_argument('--source-osds',
-                          help="only consider these osds as movement source, separated by ','")
+                          help=("only consider these osds as movement source, separated by ',' or ' '. "
+                                'to balance just one bucket, use "$(ceph osd ls-tree bucketname)"'))
+    balancep.add_argument('--save-timings',
+                          help="filename to save timing information for each generated move")
 
     pooldiffp = sp.add_parser('poolosddiff', parents=[statep])
     pooldiffp.add_argument('--pgstate', choices=['up', 'acting'], default="acting",
@@ -157,11 +161,12 @@ def parse_args():
     testp = sp.add_parser('test', help="test internal stuff")
     testp.add_argument('--name', '-n', help='doctest name to run')
 
-    osdmapp = sp.add_parser('osdmap', help="compatibility with ceph osd maps")
+    osdmapp = sp.add_parser('osdmap', parents=[],
+                            help="compatibility with ceph osd maps")
     osdmapsp = osdmapp.add_subparsers(dest='osdmapmode')
     osdmapsp.required = True
 
-    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep], help="create osdmap files")
+    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep, upmapignorep], help="create osdmap files")
     osdmapexportsp.add_argument("output_file", help="osdmap filename to save to")
 
     args = cli.parse_args()
@@ -1520,14 +1525,14 @@ class ClusterState:
         logging.warning(f"cluster state exported as osdmap to {output_file}")
 
 
-    @lru_cache(maxsize=2**17)
+    @lru_cache(maxsize=2**20)
     def pg_is_ec(self, pg):
         pool_id = pool_from_pg(pg)
         pool = self.pools[pool_id]
         return pool["repl_type"] == "ec"
 
 
-    @lru_cache(maxsize=2**18)
+    @lru_cache(maxsize=2**20)
     def get_pg_shardsize(self, pgid):
         pg_stats = self.pgs[pgid]['stat_sum']
         shard_size = pg_stats['num_bytes']
@@ -3061,6 +3066,10 @@ class PGMappings:
                 if upmap_line.strip().startswith('#'):
                     continue
 
+                logging.debug(
+                    strlazy(lambda: (f"line {upmap_line!r}"))
+                )
+
                 items_match = upmap_re.match(upmap_line)
                 items_rm_match = upmap_rm_re.match(upmap_line)
 
@@ -3080,7 +3089,7 @@ class PGMappings:
                     pgid = items_rm_match.group(1)
                     reverted = self.reverted_upmaps.get(pgid, {})
 
-                    for osd_from, osd_to in self.cluster.upmap_items[pgid].items():
+                    for osd_from, osd_to in self.cluster.upmap_items.get(pgid, {}).items():
                         if reverted.get(osd_from) == osd_to:
                             # if we reverted this move already, no need to move again.
                             continue
@@ -3093,6 +3102,10 @@ class PGMappings:
 
                 else:
                     raise Exception(f'unknown line content {upmap_line}')
+
+                logging.debug(
+                    strlazy(lambda: (f"process pgid={pgid} moves: {moves}"))
+                )
 
                 for osd_from, osd_to in moves:
                     # skip the move if it's already 'applied'
@@ -3849,9 +3862,12 @@ class MappingAnalyzer:
         self.pool_avail = None
         self.crushclass_usages = None
 
+        # how many movements did we see?
+        # 0 = none yet.
         self.move_idx = 0
 
         if self.dump_output:
+            self.dump_moves = list()
             self.dump_pool_moves = list()
             self.dump_osd_moves = list()
             self.dump_cluster_moves = list()
@@ -3866,9 +3882,13 @@ class MappingAnalyzer:
     def is_analyzed(self) -> bool:
         return self.pg_mappings is not None
 
-    def record_move(self, pgid, move_from, move_to):
+    def record_move(self, pgid, osd_from, osd_to):
         self.move_idx += 1
-        self._update_stats((move_from, move_to))
+        self._update_stats((osd_from, osd_to))
+
+        if self.dump_output:
+            shard_size = self.pg_mappings.cluster.get_pg_shardsize(pgid)
+            self.dump_moves.append((self.move_idx, shard_size, pool_from_pg(pgid), pgid, osd_from, osd_to))
 
     def finish(self) -> None:
         if self.dump_output:
@@ -3895,6 +3915,10 @@ class MappingAnalyzer:
             )
 
             # movement logs
+            moves = pd.DataFrame(
+                self.dump_moves,
+                columns=['move_idx', 'move_size', 'poolid', 'pgid', 'osd_from', 'osd_to'],
+            )
             pool_moves = pd.DataFrame(
                 self.dump_pool_moves,
                 columns=['move_idx', 'poolid', 'pool_available'],
@@ -3913,11 +3937,12 @@ class MappingAnalyzer:
             with open(self.dump_output, "w") as outfd:
                 json.dump(
                     {
-                        "generated_at": datetime.datetime.now().isoformat(),
+                        "generated_at": datetime.datetime.now().astimezone().isoformat(),
                         "fsid": cluster.fsid,
                         "argv": sys.argv,
                         "pool": pool_props,
                         "osd": osd_props,
+                        "moves": moves,
                         "cluster_moves": cluster_moves,
                         "pool_moves": pool_moves,
                         "osd_moves": osd_moves,
@@ -4189,10 +4214,18 @@ def balance(args, cluster):
     # what't the status before moving around shards
     init_analyzer.log()
 
+    if args.save_timings:
+        # move_idx -> duration since start
+        move_calc_times = dict()
+        move_calc_start = time.time()
+        # so we can skip over the informational analysis phase duration
+        analysis_duration = 0
+
     # to restrict source osds
     source_osds = None
     if args.source_osds:
-        source_osds = [int(osdid) for osdid in args.source_osds.split(',')]
+        splitter = ',' if ',' in args._source_osds else None
+        source_osds = [int(osdid) for osdid in args.source_osds.split(splitter)]
 
     # number of found remaps
     found_remap_count = 0
@@ -4398,6 +4431,10 @@ def balance(args, cluster):
                         raise Exception(f'failed to move pg {move_pg} from osd.{osd_from} - '
                                         f"the simulator thinks it's not mapped there.")
 
+                    if args.save_timings:
+                        analysis_start = time.time()
+                        move_calc_times[len(move_calc_times)] = time.time() - move_calc_start - analysis_duration
+
                     if new_variance > variance_before:
                         variance_op = ">"
                     elif new_variance < variance_before:
@@ -4412,6 +4449,8 @@ def balance(args, cluster):
                     logging.info(f"    => variance new={new_variance} {variance_op} {variance_before}=old")
 
                     analyzer.log()
+                    if args.save_timings:
+                        analysis_duration += time.time() - analysis_start
 
                     found_remap = True
                     found_remap_count += 1
@@ -4430,6 +4469,20 @@ def balance(args, cluster):
                 # end of to-loop
             # end of pg loop
         # end of from-loop
+
+    # generation performance
+    if args.save_timings:
+        import socket
+        import platform
+        with open(args.save_timings, "w") as timingfd:
+            json.dump({
+                "generated_at": datetime.datetime.now().astimezone().isoformat(),
+                "hostname": socket.gethostname(),
+                "cpuname": platform.processor(),
+                "fsid": cluster.fsid,
+                "argv": sys.argv,
+                "timings": move_calc_times,
+            }, timingfd, indent=4)
 
     # show results!
     logging.info(80*"-")

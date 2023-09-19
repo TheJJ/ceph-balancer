@@ -3119,22 +3119,31 @@ class PGMappings:
                         continue
 
                     # when we have a->b and now want to do a->c, we have to do b->c instead.
-                    cluster_upmaps_dict = dict(cluster_upmaps)
-                    prev_remap = cluster_upmaps_dict.get(osd_from)
-                    if prev_remap is not None:
-                        osd_from = prev_remap
+                    pg_upmaps = self.get_pg_upmap(pgid)
+                    while True:
+                        prev_remap = pg_upmaps.get(osd_from)
+                        if prev_remap is not None:
+                            osd_from = prev_remap
+                        else:
+                            break
 
                     move_ok = self.apply_remap(pgid, osd_from, osd_to)
                     if move_ok:
                         move_count += 1
                         move_amount += self.cluster.get_pg_shardsize(pgid)
+                        logging.debug(
+                            strlazy(lambda: (f"move pg={pgid} from {osd_from}->{osd_to} "
+                                             f"now mapped to: {self.get_mapping(pgid)}"))
+                        )
                     else:
-                        logging.warn(strlazy(lambda: (f"skipped moving pg={pgid} from {osd_from}->{osd_to} "
-                                                      f"since it's not mapped on osd.{osd_from}\n"
-                                                      f"currently mapped to: {self.get_mapping(pgid)}\n"
-                                                      f"cluster mapping: {self.cluster.pg_osds_up[pgid]}\n"
-                                                      f"cluster upmaps for pg={pgid}: {cluster_upmaps}\n"
-                                                      f"reverted upmaps for pg={pgid}: {reverted_upmaps}")))
+                        logging.warning(
+                            strlazy(lambda: (f"skipped moving pg={pgid} from {osd_from}->{osd_to} "
+                                             f"since it's not mapped on osd.{osd_from}\n"
+                                             f"currently mapped to: {self.get_mapping(pgid)}\n"
+                                             f"cluster mapping: {self.cluster.pg_osds_up[pgid]}\n"
+                                             f"cluster upmaps for pg={pgid}: {cluster_upmaps}\n"
+                                             f"recorded remaps for pg={pgid}: {self.remaps[pgid]}\n"
+                                             f"reverted upmaps for pg={pgid}: {reverted_upmaps}")))
 
             logging.info(strlazy(lambda: f"applied {move_count} moves from file ({pformatsize(move_amount, 2)})"))
 

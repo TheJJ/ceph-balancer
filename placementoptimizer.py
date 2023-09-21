@@ -2853,8 +2853,12 @@ class PGMappings:
         # collect all possible osd candidates for discovered crushclasses remove weight=0
         # which we can consider for moving from/to
         self.osd_candidates = set()
+        # crushclass -> {osdid, ...}
+        self.osd_candidates_class = dict()
         for crushclass in self._enabled_crushclasses:
-            self.osd_candidates.update(self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True))
+            crushclass_osds = set(self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True))
+            self.osd_candidates.update(crushclass_osds)
+            self.osd_candidates_class[crushclass] = crushclass_osds
 
         # osdid -> used kb, based on the osd-level utilization report
         # so we can simulate movements.
@@ -3235,6 +3239,16 @@ class PGMappings:
         """
         return {osdid: self.get_osd_usage(osdid, add_size) for osdid in self.osd_candidates}
 
+    def get_class_osd_usages(self, add_size=0):
+        """
+        calculate {crushclass -> {osdid -> usage percent}}
+        """
+        ret = dict()
+        for cls, osds in self.osd_candidates_class.items():
+            ret[cls] = {osdid: self.get_osd_usage(osdid, add_size) for osdid in osds}
+
+        return ret
+
     def get_mapping(self, pgid):
         return self.pg_mappings[pgid]
 
@@ -3288,6 +3302,7 @@ class PGMappings:
             limiting_osd_count = defaultdict(lambda: 0)
             for poolid in self.pool_candidates:
                 # all limiting osds
+                # TODO: list of limiting osds, the most limiting one first.
                 min_avail, osdid = self.get_pool_max_avail_pgs_limit(poolid, negative_ok=True)
                 limiting_osd_usages[osdid] = self.get_osd_usage(osdid)
                 limiting_osd_count[osdid] += 1
@@ -3311,12 +3326,51 @@ class PGMappings:
                                        reverse=True):
                 yield osdid, usage
 
+        def fullest_osds_fairclasses():
+            class_usages = self.get_class_osd_usages()
+            class_variance = dict()
+            class_osds_sorted = dict()
+            max_len = 0
+            for cls, usages in class_usages.items():
+                class_variance[cls] = stat_variance(usages.values())
+                sorted_osds = list(sorted(usages.items(), key=lambda osd: osd[1], reverse=True))
+                if len(sorted_osds) > max_len:
+                    max_len = len(sorted_osds)
+                class_osds_sorted[cls] = sorted_osds
+
+            # most varying crushclass first
+            class_order = list(clsname for clsname, _ in
+                               sorted(class_variance.items(), key=lambda v: v[1], reverse=True))
+
+
+            # yield devices of high crushclass variance first
+            class_pos = 0
+            class_idx = {cls: 0 for cls in class_osds_sorted.keys()}
+            while True:
+                if not class_order:
+                    # all classes exhausted, no more osd candidates
+                    return
+
+                cls = class_order[class_pos % len(class_order)]
+                pos = class_idx[cls]
+
+                yield class_osds_sorted[cls][pos]
+
+                if pos + 1 >= len(class_osds_sorted[cls]):
+                    del class_order[class_order.index(cls)]
+                else:
+                    class_idx[cls] += 1
+
         iterators = list()
         if pool_limit:
             iterators.append(limiting_osds())
 
         if fullest_osd:
-            iterators.append(fullest_osds())
+            # simpler: just the fullest osd while ignoring crush classes
+            # iterators.append(fullest_osds())
+
+            # better: the fullest osd of each crush class, interleaved
+            iterators.append(fullest_osds_fairclasses())
 
         if alternate:
             def alternator(iterators):
@@ -3430,12 +3484,7 @@ class PGMappings:
             for osdid in self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
                 osd_usages.append(self.get_osd_usage(osdid))
 
-            if len(osd_usages) > 1:
-                class_variance = stat_variance(osd_usages)
-            elif osd_usages:
-                class_variance = osd_usages[0]
-            else:
-                raise Exception("no osds in crushclass, but variance requested")
+            class_variance = stat_variance(osd_usages)
             variances[crushclass] = class_variance
 
         return variances
@@ -3915,12 +3964,14 @@ class MappingAnalyzer:
 
             # metadata
             osd_props = pd.DataFrame(
-                [(osdid, cluster.get_osd_size(osdid)) for osdid in cluster.osds.keys()],
-                columns=['osdid', 'osdsize'],
+                [(osdid, cluster.get_osd_size(osdid), osdprops['crush_class'])
+                 for osdid, osdprops in cluster.osds.items()],
+                columns=['osdid', 'osdsize', 'crushclass'],
             )
             pool_props = pd.DataFrame(
-                [(poolid, pooldata["name"]) for poolid, pooldata in cluster.pools.items()],
-                columns=['poolid', 'pool_name'],
+                [(poolid, pooldata["name"], pooldata['pg_num'], pooldata['stored'], pooldata['used'])
+                 for poolid, pooldata in cluster.pools.items()],
+                columns=['poolid', 'pool_name', 'pg_num', 'stored', 'used'],
             )
 
             # movement logs
@@ -4101,8 +4152,8 @@ class MappingAnalyzer:
                     else:
                         change_newlimit_f = "was not touched not at all"
                     logging.info(f"pool {poolname} lost {pformatsize(gain, 2)} while we changed limiting osd.{prev_limit_osd} "
-                                f"by {pformatsize(change, 2)}, "
-                                f"now limited by osd.{new_limit_osd} (which {change_newlimit_f})")
+                                 f"by {pformatsize(change, 2)}, "
+                                 f"now limited by osd.{new_limit_osd} (which {change_newlimit_f})")
 
         poolnameheader = 'pool name'.ljust(self.max_poolname_len)
         logging.info(strlazy(lambda: f"  {poolnameheader} {'id': >4} {'previous': >8}    {'new': >8}    {'change': >8}"))

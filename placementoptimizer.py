@@ -3187,9 +3187,9 @@ def showremapped(args, cluster):
     if args.by_osd:
         if args.osds:
             osdids = [int(osdid) for osdid in args.osds.split(",")]
-            osdlist = sorted((osdid, osd_actions[osdid]) for osdid in osdids)
+            osdlist = sorted((osdid, cluster.osd_actions[osdid]) for osdid in osdids)
         else:
-            osdlist = sorted(osd_actions.items())
+            osdlist = sorted(cluster.osd_actions.items())
 
         for osdid, actions in osdlist:
             if osdid != -1:

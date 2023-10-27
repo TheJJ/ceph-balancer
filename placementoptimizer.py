@@ -345,7 +345,7 @@ def encode_ipstr(ipport: str):
         ip = re.match(r'\[([^\]]+)\]', ip).groups(1)
 
     if not ip:
-        raise Exception(f"invalid ip: {ip!r}")
+        raise RuntimeError(f"invalid ip: {ip!r}")
 
     ip_bytes = socket.inet_pton(addr_family, ip)
 
@@ -371,9 +371,8 @@ def encode_ipstr(ipport: str):
         # omit u16 family as first field
         sockaddr_data = struct.pack('!HI16sI', port, 0, ip_bytes, 0)
 
-        pass
     else:
-        raise Exception("unhandled family")
+        raise RuntimeError("unhandled family")
 
     # only extend by elen - sizeof(family), since we already wrote the family
     assert len(sockaddr_data) == (elen - 2)
@@ -520,15 +519,15 @@ def remaps_merge(target_remaps: dict[int, int],
     # TODO: remove once confident enough the above is correct :)
     for new_from, new_to in destination.items():
         if new_from == new_to:
-            raise Exception(f"somewhere something went wrong: "
-                            f"we map {pgid} from osd.{new_from} to osd.{new_to} in "
+            raise RuntimeError(f"somewhere something went wrong: "
+                            f"we map from osd.{new_from} to osd.{new_to} in "
                             f"{destination}")
         while True:
             next_to = destination.get(new_to)
             if next_to is not None:
-                raise Exception(f"something went wrong: "
-                                f"there's still transitive remaps left for {new_to}: "
-                                f"{destination}")
+                raise RuntimeError(f"something went wrong: "
+                                   f"there's still transitive remaps left for {new_to}: "
+                                   f"{destination}")
             else:
                 break
 
@@ -603,7 +602,7 @@ class ClusterState:
 
             import_version = self.state['stateversion']
             if import_version != self.STATE_VERSION:
-                raise Exception(f"imported file stores state in version {import_version}, but we need {self.STATE_VERSION}")
+                raise RuntimeError(f"imported file stores state in version {import_version}, but we need {self.STATE_VERSION}")
 
         else:
             logging.info(f"gathering cluster state via ceph api...")
@@ -638,8 +637,8 @@ class ClusterState:
             # check if the osdmap version changed meanwhile
             # => we'd have inconsistent state
             if self.state['osd_dump']['epoch'] != jsoncall("ceph osd dump --format json".split())['epoch']:
-                raise Exception("Cluster topology changed during information gathering (e.g. a pg changed state). "
-                                "Wait for things to calm down and try again")
+                raise RuntimeError("Cluster topology changed during information gathering (e.g. a pg changed state). "
+                                   "Wait for things to calm down and try again")
 
     def dump(self, output_file):
         logging.info(f"cluster state dumped. now saving to {output_file}...")
@@ -881,7 +880,7 @@ class ClusterState:
                 elif val_type_id == 2:
                     writeb(struct.pack('<d', value), 'pool_opts_t_value_double')
                 else:
-                    raise Exception(f"unhandled option value type={val_type}->{val_type_id} for value={value}")
+                    raise RuntimeError(f"unhandled option value type={val_type}->{val_type_id} for value={value}")
 
             pool_opts_struct.write_len()
 
@@ -1214,12 +1213,12 @@ class ClusterState:
                     writeb(struct.pack('<I', item["weight"]), f'crush_bucket_{bucket_id}_item_weight')
 
             else:
-                raise Exception(f"unsupported crush algorithm args {alg_id}")
+                raise RuntimeError(f"unsupported crush algorithm args {alg_id}")
 
 
         ## rules
         if max_rules > (0xff + 1):
-            raise Exception("max 255 rules supported, as rule_id is encoded as u8")
+            raise RuntimeError("max 255 rules supported, as rule_id is encoded as u8")
 
         op_to_id = {
             "noop": (0, None, None),  # CRUSH_RULE_NOOP
@@ -1263,7 +1262,7 @@ class ClusterState:
                     op_id = step.get('opcode')
 
                     if op_id is None:
-                        raise Exception(f"unparsable step {step}")
+                        raise RuntimeError(f"unparsable step {step}")
 
                     arg1 = step['arg1']
                     arg2 = step['arg2']
@@ -1296,53 +1295,53 @@ class ClusterState:
         for crush_type in crush_types:
             writeb(struct.pack('<i', crush_type['type_id']), f'crush_type_map_id')
             crush_name = crush_type['name'].encode()
-            writeb(struct.pack('<I', len(crush_name)), f'crush_type_map_name_len')
-            writeb(crush_name, f'crush_type_map_name')
+            writeb(struct.pack('<I', len(crush_name)), 'crush_type_map_name_len')
+            writeb(crush_name, 'crush_type_map_name')
 
         # name_map: map<s32, string>: crush item id -> item name
-        writeb(struct.pack('<I', len(crush_devices) + len(buckets)), f'crush_name_map_len')
+        writeb(struct.pack('<I', len(crush_devices) + len(buckets)), 'crush_name_map_len')
 
         # first encode buckets, start with the min id (they are negative)
         for bucket in reversed(buckets):
-            writeb(struct.pack('<i', bucket['id']), f'crush_name_map_bucket_id')
+            writeb(struct.pack('<i', bucket['id']), 'crush_name_map_bucket_id')
             bucket_name = bucket['name'].encode()
-            writeb(struct.pack('<I', len(bucket_name)), f'crush_name_map_bucket_name_len')
-            writeb(bucket_name, f'crush_name_map_bucket_name')
+            writeb(struct.pack('<I', len(bucket_name)), 'crush_name_map_bucket_name_len')
+            writeb(bucket_name, 'crush_name_map_bucket_name')
 
         # continue with devices, start also start with min id
         for device in crush_devices:
-            writeb(struct.pack('<i', device['id']), f'crush_name_map_id')
+            writeb(struct.pack('<i', device['id']), 'crush_name_map_id')
             # todo: may have no name apparently
             device_name = device['name'].encode()
-            writeb(struct.pack('<I', len(device_name)), f'crush_name_map_name_len')
-            writeb(device_name, f'crush_name_map_name')
+            writeb(struct.pack('<I', len(device_name)), 'crush_name_map_name_len')
+            writeb(device_name, 'crush_name_map_name')
 
         # rule_name_map: map<s32, string>
-        writeb(struct.pack('<I', len(rules)), f'crush_rule_name_map_len')
+        writeb(struct.pack('<I', len(rules)), 'crush_rule_name_map_len')
         for rule in rules:
-            writeb(struct.pack('<i', rule['rule_id']), f'crush_rule_name_map_id')
+            writeb(struct.pack('<i', rule['rule_id']), 'crush_rule_name_map_id')
             rule_name = rule['rule_name'].encode()
-            writeb(struct.pack('<I', len(rule_name)), f'crush_rule_name_map_name_len')
-            writeb(rule_name, f'crush_rule_name_map_name')
+            writeb(struct.pack('<I', len(rule_name)), 'crush_rule_name_map_name_len')
+            writeb(rule_name, 'crush_rule_name_map_name')
 
         ## tunables
         tunables = self.state['crush_dump']['tunables']
         # choose_local_tries: u32
-        writeb(struct.pack('<I', tunables["choose_local_tries"]), f'crush_choose_local_tries')
+        writeb(struct.pack('<I', tunables["choose_local_tries"]), 'crush_choose_local_tries')
         # choose_local_fallback_tries: u32
-        writeb(struct.pack('<I', tunables["choose_local_fallback_tries"]), f'crush_choose_local_fallback_tries')
+        writeb(struct.pack('<I', tunables["choose_local_fallback_tries"]), 'crush_choose_local_fallback_tries')
         # choose_total_tries: u32
-        writeb(struct.pack('<I', tunables["choose_total_tries"]), f'crush_choose_total_tries')
+        writeb(struct.pack('<I', tunables["choose_total_tries"]), 'crush_choose_total_tries')
         # chooseleaf_descend_once: u32
-        writeb(struct.pack('<I', tunables["chooseleaf_descend_once"]), f'crush_chooseleaf_descend_once')
+        writeb(struct.pack('<I', tunables["chooseleaf_descend_once"]), 'crush_chooseleaf_descend_once')
         # chooseleaf_vary_r: u8
-        writeb(struct.pack('<B', tunables["chooseleaf_vary_r"]), f'crush_chooseleaf_vary_r')
+        writeb(struct.pack('<B', tunables["chooseleaf_vary_r"]), 'crush_chooseleaf_vary_r')
         # straw_calc_version: u8
-        writeb(struct.pack('<B', tunables["straw_calc_version"]), f'crush_straw_calc_version')
+        writeb(struct.pack('<B', tunables["straw_calc_version"]), 'crush_straw_calc_version')
         # allowed_bucket_algs: u32
-        writeb(struct.pack('<I', tunables["allowed_bucket_algs"]), f'crush_straw_calc_version')
+        writeb(struct.pack('<I', tunables["allowed_bucket_algs"]), 'crush_straw_calc_version')
         # chooseleaf_stable: u8
-        writeb(struct.pack('<B', tunables["chooseleaf_stable"]), f'crush_chooseleaf_stable')
+        writeb(struct.pack('<B', tunables["chooseleaf_stable"]), 'crush_chooseleaf_stable')
 
         ## device_classes
         # class_map: map<s32, s32>: nodeid->classid
@@ -1444,7 +1443,7 @@ class ClusterState:
             remap_osds = pg_upmap["osds"]
             writeb(struct.pack('<I', len(remap_osds)), 'osd_pg_upmap_osds_len')
             for osdid in remap_osds:
-                writeb(struct.pack('<i', osd), 'osd_pg_upmap_osd')
+                writeb(struct.pack('<i', osdid), 'osd_pg_upmap_osd')
 
         # pg_upmap_items: map<pg_t, vector<pair<s32, s32>>>
         if ignore_state_upmaps:
@@ -1728,7 +1727,7 @@ class ClusterState:
                 blowup_rate = poolmeta["size"]
 
             else:
-                raise Exception(f"unknown pool_type={pool_type}")
+                raise RuntimeError(f"unknown pool_type={pool_type}")
 
             pool.update({
                 "erasure_code_profile": ec_profile if pool_type == "ec" else None,
@@ -1949,7 +1948,7 @@ class ClusterState:
         root_data = self.bucket_roots.get(root_name)
 
         if not root_data:
-            raise Exception(f"crush root {root_name} not known?")
+            raise RuntimeError(f"crush root {root_name} not known?")
 
         _, root_ids = root_data
 
@@ -2011,7 +2010,7 @@ class ClusterState:
         root_data = self.bucket_roots.get(root_name)
 
         if not root_data:
-            raise Exception(f"crush root {root_name} not known?")
+            raise RuntimeError(f"crush root {root_name} not known?")
 
         _, root_ids = root_data
 
@@ -2042,7 +2041,7 @@ class ClusterState:
             node_id = root_ids[node_id]["parent"]
 
         if not found:
-            raise Exception(f"could not find a crush-path from osd={osdid} to {root_name!r}")
+            raise RuntimeError(f"could not find a crush-path from osd={osdid} to {root_name!r}")
 
         topdown = list(reversed(bottomup))
         return topdown
@@ -2095,7 +2094,7 @@ class ClusterState:
         elif self.osdsize_method == OSDSizeMethod.CRUSH:
             osd_size = self.get_osd_crush_weighted_size(osdid)
         else:
-            raise Exception(f"unknown osd weight method {self.osdsize_method!r}")
+            raise RuntimeError(f"unknown osd weight method {self.osdsize_method!r}")
 
         if adjust_full_ratio:
             osd_size *= self.full_ratio
@@ -2184,7 +2183,7 @@ def root_uses_from_rule(rule, pool_size):
         root_choice_count *= num
 
     if not root_usages or chosen == 0:
-        raise Exception(f"rule chooses no roots")
+        raise RuntimeError(f"rule chooses no roots")
 
     return root_usages, root_order
 
@@ -2279,7 +2278,7 @@ class PGMoveChecker:
         root_uses, root_order = root_uses_from_rule(self.rule, self.pool_size)
 
         if len(root_order) != len(self.pg_osds):
-            raise Exception(f"not as many roots as shards! root_order={root_order} osds={self.pg_osds}")
+            raise RuntimeError(f"not as many roots as shards! root_order={root_order} osds={self.pg_osds}")
 
         # map osd -> crush root name
         self.osd_roots = dict()
@@ -2494,7 +2493,7 @@ class PGMoveChecker:
                     trace = self.cluster.trace_crush_root(pg_osd, current_root_name)
                     logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
                     if trace is None or len(trace) < 2:
-                        raise Exception(f"no trace found for {pg_osd} in {current_root_name}")
+                        raise RuntimeError(f"no trace found for {pg_osd} in {current_root_name}")
                     constraining_traces[pg_osd] = trace
                     # the root was "used"
                     root_id = trace[0]["id"]
@@ -2503,7 +2502,7 @@ class PGMoveChecker:
                     device_take_index[pg_osd] = take_index
 
                 if not constraining_traces:
-                    raise Exception(f"no device traces captured for step {step}")
+                    raise RuntimeError(f"no device traces captured for step {step}")
 
                 # only consider traces for the current choose step
                 take_traces = {osdid: constraining_traces[osdid] for osdid in root_osds}
@@ -2522,12 +2521,12 @@ class PGMoveChecker:
                     # how many steps we took is then returned.
                     used_steps = self.use_item_type(item_uses, constraining_trace[tree_depth:], choose_type, rule_step)
                     if used_steps is None:
-                        raise Exception(f"could not find item type {choose_type} "
-                                        f"requested by rule step {step}")
+                        raise RuntimeError(f"could not find item type {choose_type} "
+                                           f"requested by rule step {step}")
                     if steps_taken != -1 and used_steps != steps_taken:
-                        raise Exception(f"for trace {constraining_trace} we needed {used_steps} steps "
-                                        f"to reach {choose_type}, "
-                                        f"but for the previous trace we took {steps_taken} steps!")
+                        raise RuntimeError(f"for trace {constraining_trace} we needed {used_steps} steps "
+                                           f"to reach {choose_type}, "
+                                           f"but for the previous trace we took {steps_taken} steps!")
                     steps_taken = used_steps
 
                 # how many layers we went down the tree, i.e. how many entries in each trace did we proceed
@@ -2543,12 +2542,12 @@ class PGMoveChecker:
                 for constraining_trace in take_traces.values():
                     used_steps = self.use_item_type(item_uses, constraining_trace[tree_depth:], "osd", rule_step)
                     if used_steps is None:
-                        raise Exception(f"could not find trace steps down to osd"
-                                        f"requested by rule step {step}")
+                        raise RuntimeError(f"could not find trace steps down to osd"
+                                           f"requested by rule step {step}")
                     if steps_taken != -1 and used_steps != steps_taken:
-                        raise Exception(f"for trace {constraining_trace} we needed {used_steps} steps "
-                                        f"to reach {choose_type}, "
-                                        f"but for the previous trace we took {steps_taken} steps!")
+                        raise RuntimeError(f"for trace {constraining_trace} we needed {used_steps} steps "
+                                           f"to reach {choose_type}, "
+                                           f"but for the previous trace we took {steps_taken} steps!")
                     steps_taken = used_steps
 
                 rule_tree_depth.append(tree_depth + steps_taken)
@@ -2580,14 +2579,14 @@ class PGMoveChecker:
                             print(f"reuses: {max_reuses}")
                             print(f"item_uses: {pformat(item_uses)}")
                             print(f"constraining_traces: {pformat(constraining_traces)}")
-                            raise Exception(f"during emit, rule take {take_index} at step "
-                                            f"{take_rule_step + idx} item {item} was used {uses} > {step_reuses} expected")
+                            raise RuntimeError(f"during emit, rule take {take_index} at step "
+                                               f"{take_rule_step + idx} item {item} was used {uses} > {step_reuses} expected")
 
             else:
-                raise Exception(f"unknown crush operation encountered: {step['op']}")
+                raise RuntimeError(f"unknown crush operation encountered: {step['op']}")
 
         if not emit:
-            raise Exception("no emit in crush rule processed")
+            raise RuntimeError("no emit in crush rule processed")
 
         # we should have processed exactly pool-size many devices
         assert devices_chosen == self.pool_size, f"devices_chosen={devices_chosen} != poolsize={self.pool_size}"
@@ -2626,7 +2625,7 @@ class PGMoveChecker:
         root_name = self.osd_roots[old_osd]
 
         if new_osd not in self.osd_candidates[root_name]:
-            raise Exception(f"target osd.{new_osd} not in same crush root as source")
+            raise RuntimeError(f"target osd.{new_osd} not in same crush root as source")
 
         # which "take" was the old osd in - we need to respect the same "take"
         take_index = self.device_take_index[old_osd]
@@ -2636,7 +2635,7 @@ class PGMoveChecker:
 
         if new_trace is None:
             # new_osd should never be tried as candidate if it's not part of root_name
-            raise Exception(f"no trace found for {new_osd} up to {root_name}")
+            raise RuntimeError(f"no trace found for {new_osd} up to {root_name}")
 
         logging.debug(strlazy(lambda: f"   trace for old osd.{old_osd}: {old_trace}"))
         logging.debug(strlazy(lambda: f"   trace for new osd.{new_osd}: {new_trace}"))
@@ -2951,8 +2950,8 @@ class PGMappings:
                     pg_obj_size = shardsize / pg_objs
                     pg_objs_transferred = pg_objs - osd_pg_objs_to_restore
                     if pg_objs_transferred < 0:
-                        raise Exception(f"pg {pg} to be moved to osd.{osdid} is misplaced "
-                                        f"with {pg_objs_transferred}<0 objects already transferred")
+                        raise RuntimeError(f"pg {pg} to be moved to osd.{osdid} is misplaced "
+                                           f"with {pg_objs_transferred}<0 objects already transferred")
 
                     shardsize_already_transferred = int(pg_obj_size * pg_objs_transferred)
 
@@ -2997,7 +2996,7 @@ class PGMappings:
         self.emit_ignored_upmaps = emit_ignored_upmaps
 
         if emit_ignored_upmaps and not ignore_cluster_upmaps:
-            raise Exceptions('when emitting ignored upmaps, upmap ignoring must be enabled')
+            raise RuntimeError('when emitting ignored upmaps, upmap ignoring must be enabled')
 
         if ignore_cluster_upmaps:
             # base state without upmaps -> analyze
@@ -3037,9 +3036,9 @@ class PGMappings:
                 logging.debug(strlazy(lambda: f"move pg {pgid} from osd.{osd_to}->osd.{osd_from} to revert{' and emit' if emit else ''} upmap"))
                 move_ok = movement_applier(pgid, osd_to, osd_from)
                 if not move_ok:
-                    raise Exception(
+                    raise RuntimeError(
                         f'failed reverting move of {pgid} from osd.{osd_to} to osd.{osd_from}. '
-                        f'this would be due to an internal inconsistency:\n'
+                        'this would be due to an internal inconsistency:\n'
                         f'the cluster upmap items indicate the pg is on osd.{osd_to}, '
                         f"but PGMappings thinks it's not. \n"
                         f"pg_upmaps[{pgid}]  = {pg_upmaps}\n"
@@ -3083,7 +3082,7 @@ class PGMappings:
                     pgid = items_match.group(1)
                     osds = items_match.group(2).split()
                     if len(osds) % 2 > 0:
-                        raise Exception(f"for pg={pgid}: uneven osd count")
+                        raise RuntimeError(f"for pg={pgid}: uneven osd count")
 
                     for i in range(int(len(osds) // 2)):
                         # group the movement pairs
@@ -3105,7 +3104,7 @@ class PGMappings:
                         moves.append((osd_to, osd_from))
 
                 else:
-                    raise Exception(f'unknown line content {upmap_line}')
+                    raise RuntimeError(f'unknown line content {upmap_line}')
 
                 logging.debug(
                     strlazy(lambda: (f"process pgid={pgid} moves: {moves}"))
@@ -3175,7 +3174,7 @@ class PGMappings:
                 break
 
         if not did_remap:
-            raise Exception(f"did not find osd {osd_from} in pg {pgid} mapping")
+            raise RuntimeError(f"did not find osd {osd_from} in pg {pgid} mapping")
 
         # adjust the tracked sizes
         shard_size = self.cluster.get_pg_shardsize(pgid)
@@ -3292,7 +3291,7 @@ class PGMappings:
             pool_limit = True
             fullest_osd = True
         else:
-            raise Exception(f"unknown OSDFromChoiceMethod: {self.osd_from_choice_method}")
+            raise RuntimeError(f"unknown OSDFromChoiceMethod: {self.osd_from_choice_method}")
 
         emitted = set()
 
@@ -3449,7 +3448,7 @@ class PGMappings:
         elif self.osdused_method == OSDUsedMethod.SHARDSUM:
             used = self.get_osd_shardsize_sum(osdid)
         else:
-            raise Exception(f"unknown osd usage estimator: {self.osdused_method!r}")
+            raise RuntimeError(f"unknown osd usage estimator: {self.osdused_method!r}")
 
         used += add_size
 
@@ -3463,7 +3462,7 @@ class PGMappings:
         osd_size = self.cluster.get_osd_size(osdid)
 
         if osd_size == 0:
-            raise Exception(f"getting relative usage of osd.{osdid} which has size 0 impossible")
+            raise RuntimeError(f"getting relative usage of osd.{osdid} which has size 0 impossible")
 
         used = self.get_osd_usage_size(osdid, add_size)
 
@@ -3688,7 +3687,7 @@ class PGMappings:
                 )
 
         if limiting_osd is None:
-            raise Exception(f"no pg of poolid={poolid} mapped on any osd to use space")
+            raise RuntimeError(f"no pg of poolid={poolid} mapped on any osd to use space")
 
         # if mappings are bigger than a device size can take,
         # available space becomes negative...
@@ -3762,9 +3761,9 @@ class PGCandidates:
     Generate movement candidates to empty the given osd.
     """
 
-    def __init__(self, pg_mappings, osd, pool_candidates, pg_choice_method):
-        up_pgs = pg_mappings.get_osd_pgs_up(osd)
-        acting_pgs = pg_mappings.get_osd_pgs_acting(osd)
+    def __init__(self, pg_mappings, osdid, pool_candidates, pg_choice_method):
+        up_pgs = pg_mappings.get_osd_pgs_up(osdid)
+        acting_pgs = pg_mappings.get_osd_pgs_acting(osdid)
         remapped_pgs = up_pgs - acting_pgs
 
         self.cluster = pg_mappings.cluster
@@ -3801,6 +3800,7 @@ class PGCandidates:
             # if we could move there, most balance would be created.
             # use this to guess the shard size to move.
             best_target_osd, best_target_osd_usage = next(pg_mappings.get_osd_target_candidates())
+            osd_from_used_percent = pg_mappings.cluster.get_osd_usage(osdid)
 
             for idx, pg_candidate in enumerate(pg_candidates_desc):
                 pg_candidate_size = self.pg_properties[pg_candidate].size
@@ -3841,7 +3841,7 @@ class PGCandidates:
             pg_walk_anchor = pg_candidates_desc_sizes.index(pg_candidates_median)
 
         else:
-            raise Exception(f'unhandled shard choice {pg_choice_method!r}')
+            raise RuntimeError(f'unhandled shard choice {pg_choice_method!r}')
 
         # if we have a walk anchor, alternate pg sizes around that anchor point
         # and build the pg_candidates that way.
@@ -3950,7 +3950,7 @@ class MappingAnalyzer:
 
     def finish(self) -> None:
         if self.dump_output:
-            logging.info(f'generating output DataFrame...')
+            logging.info('generating output DataFrame...')
 
             import pandas as pd
 
@@ -4016,7 +4016,7 @@ class MappingAnalyzer:
         # if it's not the limit_osd, a pool didn't gain space.
 
         if self.pg_mappings is None:
-            raise Exception("analysis missing")
+            raise RuntimeError("analysis missing")
 
         cluster = self.pg_mappings.cluster
 
@@ -4036,7 +4036,7 @@ class MappingAnalyzer:
             elif self.pool_free_method == PoolFreeMethod.WEIGHT:
                 avail, limit_osd = self.pg_mappings.get_pool_max_avail_weight(poolid)
             else:
-                raise Exception()
+                raise RuntimeError()
 
             self.pool_avail[poolid] = (poolname, avail, limit_osd)
 
@@ -4082,7 +4082,7 @@ class MappingAnalyzer:
 
     def log(self):
         if self.pg_mappings is None:
-            raise Exception("initial analysis missing")
+            raise RuntimeError("initial analysis missing")
 
         logging.info("cluster variance for crushclasses:")
         for crushclass, variance in self.cluster_variance.items():
@@ -4105,10 +4105,10 @@ class MappingAnalyzer:
 
     def log_compare_with(self, ana_new: "MappingAnalyzer"):
         if not isinstance(ana_new, MappingAnalyzer):
-            raise Exception("can only compare with other analysis")
+            raise RuntimeError("can only compare with other analysis")
 
         if self.pg_mappings is None:
-            raise Exception("analysis missing")
+            raise RuntimeError("analysis missing")
 
         logging.info("OSD fill rate by crushclass:")
         logging.info(f"                      OLD                         NEW")
@@ -4194,16 +4194,6 @@ def list_highlight(osdlist, changepos, colorcode):
     return f"[{', '.join(ret)}]"
 
 
-def print_osd_usages(usagedict):
-    """
-    given a sorted (osdid, usage) iterable, print it for debugging.
-    """
-    return
-    logging.debug("osd usages in ascending order:")
-    for osdid, usage in usagedict:
-        logging.debug("  usage of %s.osd.%s: %.2f%%", strlazy(lambda: osds[osdid]["host_name"]), osdid, usage)
-
-
 def balance(args, cluster):
     logging.info("running pg balancer")
 
@@ -4215,7 +4205,7 @@ def balance(args, cluster):
     elif args.osdused == "shardsum":
         osdused_method = OSDUsedMethod.SHARDSUM
     else:
-        raise Exception(f"unknown osd usage rate method {args.osdused!r}")
+        raise RuntimeError(f"unknown osd usage rate method {args.osdused!r}")
 
     if args.osdfrom == "fullest":
         osdfrom_method = OSDFromChoiceMethod.FULLEST
@@ -4224,7 +4214,7 @@ def balance(args, cluster):
     elif args.osdfrom == "alternate":
         osdfrom_method = OSDFromChoiceMethod.ALTERNATE
     else:
-        raise Exception(f"unknown osd usage rate method {args.osdused!r}")
+        raise RuntimeError(f"unknown osd usage rate method {args.osdused!r}")
 
     if args.pg_choice == "largest":
         pg_choice_method = PGChoiceMethod.LARGEST
@@ -4233,7 +4223,7 @@ def balance(args, cluster):
     elif args.pg_choice == "auto":
         pg_choice_method = PGChoiceMethod.AUTO
     else:
-        raise Exception(f"unknown osd usage rate method {args.pg_choice!r}")
+        raise RuntimeError(f"unknown osd usage rate method {args.pg_choice!r}")
 
     only_crushclasses = None
     if args.only_crushclass and not (args.only_pool or args.only_poolid):
@@ -4407,7 +4397,7 @@ def balance(args, cluster):
 
                 for osd_to, osd_to_usage in pg_mappings.get_osd_target_candidates(osd_to_candidates, move_pg):
                     if not osd_to in osd_to_candidates:
-                        raise Exception("tried non-candidate target osd")
+                        raise RuntimeError("tried non-candidate target osd")
 
                     if osd_to == osd_from:
                         continue
@@ -4483,13 +4473,13 @@ def balance(args, cluster):
                         new_pg_mapping.append(osdid)
 
                     if new_mapping_pos is None:
-                        raise Exception(f"prev_mapping={prev_pg_mapping} doesn't contain osd_from={osd_from}")
+                        raise RuntimeError(f"prev_mapping={prev_pg_mapping} doesn't contain osd_from={osd_from}")
 
                     # record the mapping
                     move_ok = pg_mappings.apply_remap(move_pg, osd_from, osd_to)
                     if not move_ok:
-                        raise Exception(f'failed to move pg {move_pg} from osd.{osd_from} - '
-                                        f"the simulator thinks it's not mapped there.")
+                        raise RuntimeError(f'failed to move pg {move_pg} from osd.{osd_from} - '
+                                           f"the simulator thinks it's not mapped there.")
 
                     if args.save_timings:
                         analysis_start = time.time()
@@ -4568,7 +4558,7 @@ def show(args, cluster):
     elif args.avail_prediction == "limiting":
         pool_free_method = PoolFreeMethod.LIMITING
     else:
-        raise Exception()
+        raise RuntimeError()
 
     if (args.show_max_avail or
         pool_free_method == PoolFreeMethod.LIMITING or
@@ -4666,7 +4656,7 @@ def show(args, cluster):
             elif pool_free_method == PoolFreeMethod.LIMITING:
                 avail = pformatsize(mappings.get_pool_max_avail_pgs(poolid), 2)
             else:
-                raise Exception()
+                raise RuntimeError()
 
             if args.show_max_avail:
                 # if we had inf many pgs
@@ -4724,7 +4714,7 @@ def show(args, cluster):
                     elif args.pgstate == 'acting':
                         placed_pgs = props['pgs_acting']
                     else:
-                        raise Exception("unknown pgstate")
+                        raise RuntimeError("unknown pgstate")
 
                     for pg in placed_pgs:
                         used += cluster.get_pg_shardsize(pg)
@@ -4758,7 +4748,7 @@ def show(args, cluster):
                     pg_count = props.get('pg_count_acting', dict())
                     pg_num = props.get('pg_num_acting', 0)
                 else:
-                    raise Exception("unknown pgstate")
+                    raise RuntimeError("unknown pgstate")
 
                 pool_list = dict()
                 for pool, count in sorted(pg_count.items()):
@@ -4821,18 +4811,18 @@ def show(args, cluster):
                 pool_info[poolid] = dict(poolprops)
                 pool_info[poolid]['store_avail'] = mappings.get_pool_max_avail_pgs(poolid)
         else:
-            raise Exception()
+            raise RuntimeError()
 
         ret = {
             'pgstate': args.pgstate,
             'pools': pool_info,
-            'osds': osds,
+            'osds': cluster.osds,
         }
 
         json.dump(ret, sys.stdout)
 
     else:
-        raise Exception(f'unhandled output format {args.format!r}')
+        raise RuntimeError(f'unhandled output format {args.format!r}')
 
     if analyzer is not None:
         analyzer.finish()
@@ -4927,7 +4917,7 @@ def showremapped(args, cluster):
             sum_from = len(actions['from'])
             sum_data_to = sum((pg_move_status[pg]['size'] for pg in actions["to"].keys()))
             sum_data_from = sum((pg_move_status[pg]['size'] for pg in actions["from"].keys()))
-            sum_data_delta = (sum_data_from - sum_data_to)
+            sum_data_delta = sum_data_from - sum_data_to
             sum_data_to_pp = pformatsize(sum_data_to, 2)
             sum_data_from_pp = pformatsize(sum_data_from, 2)
             sum_data_delta_pp = pformatsize(sum_data_delta, 2)
@@ -4960,7 +4950,7 @@ def poolosddiff(args, cluster):
     elif args.pgstate == "acting":
         pool_osds = cluster.pool_osds_acting
     else:
-        raise Exception("unknown pgstate {args.pgstate!r}")
+        raise RuntimeError("unknown pgstate {args.pgstate!r}")
 
     p1_id = cluster.poolnames[args.pool1]
     p2_id = cluster.poolnames[args.pool2]
@@ -5017,7 +5007,7 @@ def main():
 
     elif args.mode == 'gather':
         if args.statefile:
-            raise Exception("in gather mode, a state file can't be used as source")
+            raise RuntimeError("in gather mode, a state file can't be used as source")
         state = ClusterState()
         state.dump(args.output_file)
 
@@ -5029,7 +5019,7 @@ def main():
         elif args.osdsize == "crush":
             osdsize_method = OSDSizeMethod.CRUSH
         else:
-            raise Exception(f"unknown osd weight method {args.osdsize!r}")
+            raise RuntimeError(f"unknown osd weight method {args.osdsize!r}")
 
         state = ClusterState(args.state, osdsize_method=osdsize_method)
         state.preprocess()
@@ -5060,10 +5050,10 @@ def main():
                 state.export_osdmap(args.output_file,
                                     ignore_state_upmaps=args.ignore_state_upmaps)
             else:
-                raise Exception(f"unknown osdmap mode {args.osdmapmode!r}")
+                raise RuntimeError(f"unknown osdmap mode {args.osdmapmode!r}")
 
         else:
-            raise Exception(f"unknown mode: {args.mode}")
+            raise RuntimeError(f"unknown mode: {args.mode}")
     return 0
 
 if __name__ == "__main__":

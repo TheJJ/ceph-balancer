@@ -5009,8 +5009,6 @@ def main():
         return 1 if failed > 0 else 0
 
     elif args.mode == 'gather':
-        if args.statefile:
-            raise RuntimeError("in gather mode, a state file can't be used as source")
         state = ClusterState()
         state.dump(args.output_file)
 

@@ -271,7 +271,10 @@ def jsoncall(cmd, swallow_stderr=False):
         raise ValueError("need cmd as list")
     stderrval = subprocess.DEVNULL if swallow_stderr else None
     rawdata = subprocess.check_output(cmd, stderr=stderrval)
-    return json.loads(rawdata.decode())
+    # in ceph reef, inf is encoded in invalid format for python's json.
+    rawdata = rawdata.replace(b':inf', b':Infinity')
+    rawdata = rawdata.decode()
+    return json.loads(rawdata)
 
 
 def pformatsize(size_bytes, commaplaces=1):

@@ -30,7 +30,7 @@ from collections import defaultdict
 from functools import lru_cache
 from itertools import chain, zip_longest
 from pprint import pformat, pprint
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict
 
 
 def parse_args():
@@ -455,8 +455,8 @@ def stat_variance(iterable):
     return 1/(count-1) * diffsum
 
 
-def remaps_merge(target_remaps: dict[int, int],
-                 merge_remaps: Optional[dict[int, int]] = None,
+def remaps_merge(target_remaps: Dict[int, int],
+                 merge_remaps: Optional[Dict[int, int]] = None,
                  in_place: bool = False):
     """
     remove cycles and transitive remaps from a remap dict.

@@ -1745,9 +1745,15 @@ class ClusterState:
                 pool['used'] *= blowup_rate
 
         # create osd base structure
+        for osd in self.state["osd_dump"]["osd_xinfo"]:
+            self.osds[osd["osd"]] = {
+                'features': osd['features'],
+                'laggy_probability': osd['laggy_probability'],
+            }
+
         for osd in self.state["osd_df_dump"]["nodes"]:
             id = osd["id"]
-            self.osds[id] = {
+            self.osds[id].update({
                 "device_size": osd["kb"] * 1024,
                 "device_used": osd["kb_used"] * 1024,
                 "device_used_data": osd["kb_used_data"] * 1024,
@@ -1756,7 +1762,7 @@ class ClusterState:
                 "utilization": osd["utilization"],
                 "crush_weight": osd["crush_weight"],
                 "status": osd["status"],
-            }
+            })
             # "internal_metadata": osd["statfs"]["internal_metadata"]
 
             self.osd_devsize[id] = osd["kb"] * 1024

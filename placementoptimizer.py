@@ -134,6 +134,10 @@ def parse_args():
                                 "fullest=start with the fullest osd (by percent of device size). "
                                 "limiting=start with the fullest osd that actually limits the usable pool space. "
                                 "alternate=alternate between limiting and fullest devices"))
+    balancep.add_argument('--ignore-ideal-pgcounts', choices=['all', 'source', 'destination', 'none'],
+                          default='none',
+                          help=("don't consider balancing by placement group count on an source/destination/both OSD. "
+                                "if you set this, the ceph's built-in balancer and this one will have a fight."))
     balancep.add_argument('--ensure-optimal-moves', action='store_true',
                           help='make sure that only movements which win full shardsizes are done')
     balancep.add_argument('--ensure-variance-decrease', action='store_true',
@@ -4251,6 +4255,9 @@ def balance(args, cluster):
         if args.only_crushclass:
             logging.info(f"  ignoring the only-crushclass option since explicit pools were given.")
 
+    ignore_ideal_pgcounts_src = args.ignore_ideal_pgcounts in ('source', 'all')
+    ignore_ideal_pgcounts_dest = args.ignore_ideal_pgcounts in ('destination', 'all')
+
     # movement change tracking and logging
     analyzer = MappingAnalyzer()
     # remember start state for comparison
@@ -4372,15 +4379,21 @@ def balance(args, cluster):
                 # only move the pg if the source osd has more PGs of the pool than average
                 # otherwise the regular balancer will fill this OSD again
                 # with another PG (of the same pool) from somewhere
-                if from_osd_pg_count[pg_pool] <= from_osd_pg_count_ideal:
-                    from_osd_satisfied_pools.add(pg_pool)
-                    logging.debug("  BAD => skipping pg %s since source osd.%s "
-                                  "doesn't have too many of pool=%s (%s <= %s)",
+                if ignore_ideal_pgcounts_src:
+                    if from_osd_pg_count[pg_pool] <= from_osd_pg_count_ideal:
+                        from_osd_satisfied_pools.add(pg_pool)
+                        logging.debug("  BAD => skipping pg %s since source osd.%s "
+                                      "doesn't have too many of pool=%s (%s <= %s)",
+                                      move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
+                        continue
+
+                    logging.debug("  OK => taking pg %s from source osd.%s "
+                                  "since it has too many of pool=%s (%s > %s)",
                                   move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
-                    continue
-                logging.debug("  OK => taking pg %s from source osd.%s "
-                              "since it has too many of pool=%s (%s > %s)",
-                              move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
+                else:
+                    logging.debug("  OK => taking pg %s from source osd.%s, "
+                                  " pool=%s count %s, ideal %s",
+                                  move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
 
                 # pre-filter PGs to rule out those that will for sure not gain any space
                 pg_small_enough = False
@@ -4419,19 +4432,25 @@ def balance(args, cluster):
                     # i.e. don't be the +1
                     to_osd_pg_count = pg_mappings.osd_pool_up_shard_count[osd_to]
                     to_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_to)
-                    if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal and not to_osd_pg_count_ideal < 1.0:
+                    if ignore_ideal_pgcounts_dest:
                         logging.debug(strlazy(lambda:
-                                      f" BAD => osd.{osd_to} already has too many of pool={pg_pool} "
-                                      f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})"))
-                        continue
-                    elif to_osd_pg_count_ideal >= 1.0:
-                        logging.debug(strlazy(lambda:
-                                      f" OK => osd.{osd_to} has too few of pool={pg_pool} "
-                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
+                                              f" OK => osd.{osd_to} has pool={pg_pool} "
+                                              f"{to_osd_pg_count[pg_pool]}, target {to_osd_pg_count_ideal}"))
+
                     else:
-                        logging.debug(strlazy(lambda:
-                                      f" OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
-                                      f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
+                        if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal and not to_osd_pg_count_ideal < 1.0:
+                            logging.debug(strlazy(lambda:
+                                                  f" BAD => osd.{osd_to} already has too many of pool={pg_pool} "
+                                                  f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})"))
+                            continue
+                        elif to_osd_pg_count_ideal >= 1.0:
+                            logging.debug(strlazy(lambda:
+                                                  f" OK => osd.{osd_to} has too few of pool={pg_pool} "
+                                                  f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
+                        else:
+                            logging.debug(strlazy(lambda:
+                                                  f" OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
+                                                  f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
 
                     # how full will the target be
                     target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)

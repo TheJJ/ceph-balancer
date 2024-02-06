@@ -1637,15 +1637,18 @@ class ClusterState:
     def get_pg_shardsize(self, pgid):
         pg_stats = self.pgs[pgid]['stat_sum']
         shard_size = pg_stats['num_bytes']
-        shard_size += pg_stats['num_omap_bytes']
 
         pool_id = pool_from_pg(pgid)
         pool = self.pools[pool_id]
         ec_profile = pool["erasure_code_profile"]
         if ec_profile:
             shard_size /= self.ec_profiles[ec_profile]["data_chunks"]
-            # TODO: once omap is supported on EC pools
-            # we have to check how the omap data is spread (replica or also ec?)
+        # metadata is per-shard (each needs object infos), so no influence by ec
+        shard_size += self.pgs[pgid]['metadata_bytes']
+
+        # TODO: once omap is supported on EC pools
+        # we have to check how the omap data is spread (replica or also ec?)
+        shard_size += pg_stats['num_omap_bytes']
 
         return shard_size
 
@@ -1692,11 +1695,8 @@ class ClusterState:
         # pgid -> pg dump pgstats entry
         self.pgs = dict()
 
-        # osdid -> osdinfo
+        # osdid -> various osdinfos
         self.osds = dict()
-
-        # osdid -> device size in bytes
-        self.osd_devsize = dict()
 
         # osds used by a pool:
         # pool_id -> {osdid}
@@ -1832,20 +1832,12 @@ class ClusterState:
             }
 
         for osd in self.state["osd_df_dump"]["nodes"]:
-            id = osd["id"]
-            self.osds[id].update({
-                "device_size": osd["kb"] * 1024,
-                "device_used": osd["kb_used"] * 1024,
-                "device_used_data": osd["kb_used_data"] * 1024,
-                "device_used_meta": osd["kb_used_meta"] * 1024,
-                "device_available": osd["kb_avail"] * 1024,
+            osdid = osd["id"]
+            self.osds[osdid].update({
                 "utilization": osd["utilization"],
-                "crush_weight": osd["crush_weight"],
+                # "crush_weight": osd["crush_weight"],  # done when walking the crush trees
                 "status": osd["status"],
             })
-            # "internal_metadata": osd["statfs"]["internal_metadata"]
-
-            self.osd_devsize[id] = osd["kb"] * 1024
 
         # adjustments to the crush mappings
         # these are already applied in the pg->osd mapping infos via up/acting.
@@ -1885,6 +1877,13 @@ class ClusterState:
             acting = pginfo["acting"]
             primary = acting[0]
 
+            self.pgs[pgid].update({
+                # osdid -> metadata amount estimated by object count
+                "metadata_estimates": dict(),
+                # average metadata size estimation (avg ov above dict)
+                "metadata_bytes": 0,
+            })
+
             self.pg_osds_up[pgid] = up
             self.pg_osds_acting[pgid] = acting
 
@@ -1908,21 +1907,28 @@ class ClusterState:
             pg_count_up = defaultdict(int)
             pg_count_acting = defaultdict(int)
 
-            for pg in osdpgs['up']:
-                poolid = pool_from_pg(pg)
+            osd_objs_up = 0
+            osd_objs_acting = 0
+
+            for pgid in osdpgs['up']:
+                poolid = pool_from_pg(pgid)
                 osd_pools_up.add(poolid)
-                pgs_up.add(pg)
+                pgs_up.add(pgid)
 
                 pg_count_up[poolid] += 1
                 self.pool_osds_up[poolid].add(osdid)
 
-            for pg in osdpgs['acting']:
-                poolid = pool_from_pg(pg)
+                osd_objs_up += self.pgs[pgid]['stat_sum']['num_objects']
+
+            for pgid in osdpgs['acting']:
+                poolid = pool_from_pg(pgid)
                 osd_pools_acting.add(poolid)
-                pgs_acting.add(pg)
+                pgs_acting.add(pgid)
 
                 pg_count_acting[poolid] += 1
                 self.pool_osds_acting[poolid].add(osdid)
+
+                osd_objs_acting += self.pgs[pgid]['stat_sum']['num_objects']
 
             if osdid == 0x7fffffff:
                 # the "missing" osds
@@ -1937,8 +1943,9 @@ class ClusterState:
                 'pgs_up': pgs_up,
                 'pg_num_acting': len(pgs_acting),
                 'pgs_acting': pgs_acting,
+                'objs_up': osd_objs_up,
+                'objs_acting': osd_objs_acting,
             })
-
 
         for osd in self.state["osd_dump"]["osds"]:
             osdid = osd["osd"]
@@ -1952,9 +1959,194 @@ class ClusterState:
                 'crush_class': crushclass,
             })
 
+        for osd_stat in self.state["pg_dump"]["pg_map"]["osd_stats"]:
+            osdid = osd_stat['osd']
+            statfs = osd_stat['statfs']
+            self.osds[osdid].update({
+                "device_size": statfs["total"],
+                "device_used": statfs["allocated"] + statfs["internal_metadata"],
+                "device_used_data": statfs["allocated"],
+                "device_used_meta": statfs["internal_metadata"],
+                "device_used_omap": statfs["omap_allocated"],
+                "device_available": statfs["available"],
+                # TODO osd["statfs"]["data_compressed", "data_compressed_allocated", "data_compressed_original"]
+            })
 
-        for osd_info in self.state["pg_dump"]["pg_map"]["osd_stats"]:
-            self.osds[osd_info['osd']]['stats'] = osd_info
+        # estimate pg metadata sizes
+        for osdid, osdpgs in osd_mappings.items():
+            osdinfo = self.osds[osdid]
+            meta_amount = osdinfo["device_used_meta"]
+            if meta_amount == 0:
+                raise Exception()
+
+            osd_objs_acting = osdinfo['objs_acting']
+
+            # TODO: this is off by the currently in-transfer pgs that occupy space on the current osdid as destination already
+            # we'd have to remove this metadata estimate by subtracting it from device_meta_amount.
+            # meta_amount = meta_amount * (1 - (partially_transferred_objects / total_obj_count_of_in_transfer_pgs)
+            # -> unify this section with osd_transfer_remainings calculation.
+
+            # TODO: we could unify it a bit accross pgs of a pool: under equal distribution between pgs,
+            # each should have the same amount of metadata? (maybe weighted by pg's object count)
+
+            for pgid in osdpgs['acting']:
+                # this calculation is done multiple times: once for each acting pg shard!
+                # this is an advantage: for each one we can calculate the metadata_bytes in context of the current shard's osd
+                # and hence get a better estimate of the real metadata size:
+                # calculate a list of all the metadata estimates, and in the end, store the average of them.
+
+                # calculated by weighting osd metadata sizes by pg object counts
+                pg_objects = self.pgs[pgid]['stat_sum']['num_objects']
+                metadata_estimate = int(meta_amount * pg_objects / osd_objs_acting)
+
+                estimates = self.pgs[pgid]["metadata_estimates"]
+                estimates[osdid] = metadata_estimate
+
+                self.pgs[pgid]["metadata_bytes"] = int(sum(estimates.values()) / len(estimates))
+
+        #for pgid, p in self.pgs.items():
+        #    print(f"id {pgid}, shrd={pformatsize(self.get_pg_shardsize(pgid))}, meta={pformatsize(p['metadata_bytes'])}, est={p['metadata_estimates']}")
+
+        # osdid -> used kb change, based on the osd-level utilization report and ongoing movemements
+        # to estimate osd utilization with DELTA method.
+        # this is the expected utilization change once we reach the up pg state.
+        self.osd_transfer_remainings = dict()
+        for osdid, osdpgs in osd_mappings.items():
+            osd = self.osds[osdid]
+            # this is the estimated size of remaining pg transfer amount
+            # the already-transferred part is part of device_used.
+            osd_transfer_remaining = 0
+
+            # this is a bit similar to the implementation of `showremapped` to figure out
+            # movement progress.
+            #
+            # we want to estimate the up-utilization, i.e. the osd utilization when all moves
+            # would be finished.
+            # to estimate it, we need to add the remaining (partial) shards of (up - acting) = incoming
+            # and remove the shards of (acting - up) = outgoing.
+            # osd['device_used'] already contains the size of partially transferred shard's objects.
+            # now we account for ongoing/planned transfers.
+
+            # pgs that are transferred to the osd, so they will be acting soon(tm)
+            for pg_incoming in (osdpgs['up'] - osdpgs['acting']):
+                shardsize = self.get_pg_shardsize(pg_incoming)
+                pginfo = self.pgs[pg_incoming]
+
+                pg_objs = pginfo["stat_sum"]["num_objects"]
+
+                if pg_objs <= 0:
+                    shardsize_already_transferred = 0
+
+                else:
+                    # in ceph 17 the degraded calculation is done in PeeringState::update_calc_stats
+                    # if replicated:
+                    #   degraded += num_objects * (pool_size - len(up_osds))
+                    # else:  # ec
+                    #   for shardid in pool_size:
+                    #     degraded += objs_missing_on_shard[shardid]
+                    #
+                    # -> for each shard the missing objects are counted separately:
+                    # for each move to be done, num_objects_misplaced+=num_objects,
+                    # for each restore to be done, num_objects_degraded+=num_objects
+                    #
+                    # but we only get the sum of the missing objects for a pg, not per shard.
+                    # another problem: we only know the shard size, not the object sizes,
+                    # so we can only estimate the remaining object sizes.
+                    # -> utilization estimation will work best if there are no more remapped PGs!
+
+
+                    # we figure out how many shards are misplaced/degraded,
+                    # and divide these numbers to get an estimate per shard.
+                    # this we can then assign to our current osdid.
+                    pg_objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
+                    pg_objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
+
+                    # the pginfo statistics only provide us with pg-overall statistics
+                    # so we need to figure out how much of that affects the current osdid
+                    # -> see how many moves exist for the whole pg,
+                    # and estimate the fraction due to movements with this osdid.
+
+                    # the pg is moved and the source is missing
+                    pg_degraded_moves = 0
+                    # the pg is moved and the source exists
+                    pg_misplaced_moves = 0
+                    # this osd is the target of a pg move where the source is nonexistant
+                    pg_degraded_shards_on_osd = 0
+                    # this osd is the target of a pg move where the source does exist
+                    pg_misplaced_shards_on_osd = 0
+
+                    # get the real current remaps active in the cluster
+                    incoming_pg_moves = self.get_remaps(pginfo)
+
+                    # TODO in pginfo there's shards in object_location_counts, but that doesn't seem to contain
+                    # sensible content, just the pg object count?
+                    # maybe this info is available sometime in the future
+
+                    for osds_from, osds_to in incoming_pg_moves:
+                        # -1 in osds_from means -> move source is degraded
+                        # (from_osdid, ...), (to_osdid, ...)
+
+                        # osd list lengths are always equal
+                        for osd_from, osd_to in zip(osds_from, osds_to):
+                            if osd_from == -1:
+                                pg_degraded_moves += 1
+                                if osd_to == osdid:
+                                    pg_degraded_shards_on_osd += 1
+                            elif osd_from != osd_to:
+                                pg_misplaced_moves += 1
+                                if osd_to == osdid:
+                                    pg_misplaced_shards_on_osd += 1
+
+                    # the following assumes that all shards of this pg are recovered at the same rate,
+                    # when there's multiple from/to osds for this pg
+                    # we can't do better apparently since we don't get missing object
+                    # counts per shard, but just per-pg unfortunately.
+                    osd_pg_objs_to_restore = 0
+
+                    # estimate the degraded object counts for each shard
+                    if pg_degraded_moves > 0:
+                        pg_shard_objs_degraded = pg_objs_degraded / pg_degraded_moves
+                        osd_pg_objs_to_restore += pg_shard_objs_degraded * pg_degraded_shards_on_osd
+
+                    # same for misplaced objects
+                    if pg_misplaced_moves > 0:
+                        pg_shard_objs_misplaced = pg_objs_misplaced / pg_misplaced_moves
+                        osd_pg_objs_to_restore += pg_shard_objs_misplaced * pg_misplaced_shards_on_osd
+
+                    # adjust fs size by average object size times estimated restoration count.
+                    # this is also kinda lame but it seems one can't get more info easily.
+                    pg_obj_size = shardsize / pg_objs
+                    pg_objs_transferred = pg_objs - osd_pg_objs_to_restore
+                    if pg_objs_transferred < 0:
+                        raise RuntimeError(f"pg {pg_incoming} to be moved to osd.{osdid} is misplaced "
+                                           f"with {pg_objs_transferred}<0 objects already transferred")
+
+                    shardsize_already_transferred = int(pg_obj_size * pg_objs_transferred)
+
+                # already-transferred is not missing - it's included in the device fill level already
+                missing_shardsize = shardsize - shardsize_already_transferred
+
+                if missing_shardsize < 0:
+                    raise Exception("a negative amount of shardsize is not yet transferred?")
+
+                # add the estimated future shardsize
+                osd_transfer_remaining += missing_shardsize
+
+            # pgs that will be transferred off the osd
+            for pg_outgoing in (osdpgs['acting'] - osdpgs['up']):
+                osd_transfer_remaining -= self.get_pg_shardsize(pg_outgoing)
+
+            self.osd_transfer_remainings[osdid] = osd_transfer_remaining
+
+            if False:
+                osd_fs_used = osd_transfer_remaining + osd['device_used']
+                logging.debug(strlazy(lambda: (
+                    f"estimated {'osd.%s' % osdid: <8} weight={osd['weight']:.4f} "
+                    f"#acting={len(osdpgs['acting']):<3} "
+                    f"acting={pformatsize(osd['device_used'], 3)}={0 if osd['device_size'] == 0 else ((100 * osd['device_used']) / osd['device_size']):.03f}% "
+                    f"#up={len(osdpgs['up']):<3} "
+                    f"up={pformatsize(osd_fs_used, 3)}={0 if osd['device_size'] == 0 else ((100 * osd_fs_used) / osd['device_size']):.03f}% "
+                    f"size={pformatsize(osd['device_size'], 3)}")))
 
 
         # store osd host name
@@ -2146,7 +2338,7 @@ class ClusterState:
         """
 
         osd = self.osds[osdid]
-        size = self.osd_devsize[osdid]
+        size = osd['device_size']
         weight = osd['weight']
 
         return size * weight
@@ -2162,6 +2354,7 @@ class ClusterState:
 
         return size * weight
 
+    @lru_cache(maxsize=2**20)
     def get_osd_size(self, osdid, adjust_full_ratio=False):
         """
         return the osd size in bytes, depending on the size determination variant.
@@ -2169,7 +2362,7 @@ class ClusterState:
         """
 
         if self.osdsize_method == OSDSizeMethod.DEVICE:
-            osd_size = self.osd_devsize[osdid]
+            osd_size = self.osds[osdid]['device_size']
         elif self.osdsize_method == OSDSizeMethod.WEIGHTED:
             osd_size = self.get_osd_weighted_size(osdid)
         elif self.osdsize_method == OSDSizeMethod.CRUSH:
@@ -2872,8 +3065,6 @@ class PGMappings:
 
             poolid = pool_from_pg(pgid)
 
-            # TODO: for shardsum, estimate the metadata amount somehow?
-
             for osdid in up_osds:
                 self.osd_pgs_up[osdid].add(pgid)
                 self.osd_pool_up_shard_count[osdid][poolid] += 1
@@ -2955,144 +3146,6 @@ class PGMappings:
             self.osd_candidates.update(crushclass_osds)
             self.osd_candidates_class[crushclass] = crushclass_osds
 
-        # osdid -> used kb change, based on the osd-level utilization report and ongoing movemements
-        # to estimate osd utilization with DELTA method.
-        # this is the expected utilization change once we reach the up pg state.
-        self.osd_transfer_remainings = dict()
-        for osdid in self.osd_candidates:
-            osd = self.cluster.osds[osdid]
-            # this is the estimated size of remaining pg transfer amount
-            # the already-transferred part is part of device_used.
-            osd_transfer_remaining = 0
-
-            # this is a bit similar to the implementation of `showremapped` to figure out
-            # movement progress.
-            #
-            # we want to estimate the up-utilization, i.e. the osd utilization when all moves
-            # would be finished.
-            # to estimate it, we need to add the remaining (partial) shards of (up - acting) = incoming
-            # and remove the shards of (acting - up) = outgoing.
-            # osd['device_used'] already contains the size of partially transferred shard's objects.
-            # now we account for ongoing/planned transfers.
-
-            # pgs that are transferred to the osd, so they will be acting soon(tm)
-            for pg_incoming in (self.osd_pgs_up[osdid] - self.osd_pgs_acting[osdid]):
-                shardsize = self.cluster.get_pg_shardsize(pg_incoming)
-                pginfo = self.cluster.pgs[pg_incoming]
-
-                pg_objs = pginfo["stat_sum"]["num_objects"]
-
-                if pg_objs <= 0:
-                    shardsize_already_transferred = 0
-
-                else:
-                    # in ceph 17 the degraded calculation is done in PeeringState::update_calc_stats
-                    # if replicated:
-                    #   degraded += num_objects * (pool_size - len(up_osds))
-                    # else:  # ec
-                    #   for shardid in pool_size:
-                    #     degraded += objs_missing_on_shard[shardid]
-                    #
-                    # -> for each shard the missing objects are counted separately:
-                    # for each move to be done, num_objects_misplaced+=num_objects,
-                    # for each restore to be done, num_objects_degraded+=num_objects
-                    #
-                    # but we only get the sum of the missing objects for a pg, not per shard.
-                    # another problem: we only know the shard size, not the object sizes,
-                    # so we can only estimate the remaining object sizes.
-                    # -> utilization estimation will work best if there are no more remapped PGs!
-
-
-                    # we figure out how many shards are misplaced/degraded,
-                    # and divide these numbers to get an estimate per shard.
-                    # this we can then assign to our current osdid.
-                    pg_objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
-                    pg_objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
-
-                    # the pginfo statistics only provide us with pg-overall statistics
-                    # so we need to figure out how much of that affects the current osdid
-                    # -> see how many moves exist for the whole pg,
-                    # and estimate the fraction due to movements with this osdid.
-
-                    # the pg is moved and the source is missing
-                    pg_degraded_moves = 0
-                    # the pg is moved and the source exists
-                    pg_misplaced_moves = 0
-                    # this osd is the target of a pg move where the source is nonexistant
-                    pg_degraded_shards_on_osd = 0
-                    # this osd is the target of a pg move where the source does exist
-                    pg_misplaced_shards_on_osd = 0
-
-                    # get the real current remaps active in the cluster
-                    incoming_pg_moves = self.cluster.get_remaps(pginfo)
-
-                    # TODO in pginfo there's shards in object_location_counts, but that doesn't seem to contain
-                    # sensible content, just the pg object count?
-                    # maybe this info is available sometime in the future
-
-                    for osds_from, osds_to in incoming_pg_moves:
-                        # -1 in osds_from means -> move source is degraded
-                        # (from_osdid, ...), (to_osdid, ...)
-
-                        # osd list lengths are always equal
-                        for osd_from, osd_to in zip(osds_from, osds_to):
-                            if osd_from == -1:
-                                pg_degraded_moves += 1
-                                if osd_to == osdid:
-                                    pg_degraded_shards_on_osd += 1
-                            elif osd_from != osd_to:
-                                pg_misplaced_moves += 1
-                                if osd_to == osdid:
-                                    pg_misplaced_shards_on_osd += 1
-
-
-                    # the following assumes that all shards of this pg are recovered at the same rate,
-                    # when there's multiple from/to osds for this pg
-                    # we can't do better apparently since we don't get missing object
-                    # counts per shard, but just per-pg unfortunately.
-                    osd_pg_objs_to_restore = 0
-
-                    # estimate the degraded object counts for each shard
-                    if pg_degraded_moves > 0:
-                        pg_shard_objs_degraded = pg_objs_degraded / pg_degraded_moves
-                        osd_pg_objs_to_restore += pg_shard_objs_degraded * pg_degraded_shards_on_osd
-
-                    # same for misplaced objects
-                    if pg_misplaced_moves > 0:
-                        pg_shard_objs_misplaced = pg_objs_misplaced / pg_misplaced_moves
-                        osd_pg_objs_to_restore += pg_shard_objs_misplaced * pg_misplaced_shards_on_osd
-
-                    # adjust fs size by average object size times estimated restoration count.
-                    # this is also kinda lame but it seems one can't get more info easily.
-                    pg_obj_size = shardsize / pg_objs
-                    pg_objs_transferred = pg_objs - osd_pg_objs_to_restore
-                    if pg_objs_transferred < 0:
-                        raise RuntimeError(f"pg {pg_incoming} to be moved to osd.{osdid} is misplaced "
-                                           f"with {pg_objs_transferred}<0 objects already transferred")
-
-                    shardsize_already_transferred = int(pg_obj_size * pg_objs_transferred)
-
-                # already-transferred is not missing - it's included in the device fill level already
-                missing_shardsize = shardsize - shardsize_already_transferred
-
-                # add the estimated future shardsize
-                osd_transfer_remaining += missing_shardsize
-
-            # pgs that will be transferred off the osd
-            for pg_outgoing in (self.osd_pgs_acting[osdid] - self.osd_pgs_up[osdid]):
-                osd_transfer_remaining -= self.cluster.get_pg_shardsize(pg_outgoing)
-
-            self.osd_transfer_remainings[osdid] = osd_transfer_remaining
-
-            if False:
-                osd_fs_used = osd_transfer_remaining + osd['device_used']
-                logging.debug(strlazy(lambda: (
-                    f"estimated {'osd.%s' % osdid: <8} weight={osd['weight']:.4f} "
-                    f"#acting={len(self.osd_pgs_acting[osdid]):<3} "
-                    f"acting={pformatsize(osd['device_used'], 3)}={0 if osd['device_size'] == 0 else ((100 * osd['device_used']) / osd['device_size']):.03f}% "
-                    f"#up={len(self.osd_pgs_up[osdid]):<3} "
-                    f"up={pformatsize(osd_fs_used, 3)}={0 if osd['device_size'] == 0 else ((100 * osd_fs_used) / osd['device_size']):.03f}% "
-                    f"size={pformatsize(osd['device_size'], 3)}")))
 
         # pg movement statistics tracking
         #
@@ -3555,7 +3608,7 @@ class PGMappings:
 
                 # this returns the estimated up-size by adjusting for ongoing transfers
                 # (outgoing ones to be deleted, incoming ones to be completed)
-                used += self.osd_transfer_remainings[osdid]
+                used += self.cluster.osd_transfer_remainings[osdid]
 
             elif pgstate == PGState.ACTING:
                 # used already has the correct current amount.
@@ -3569,7 +3622,6 @@ class PGMappings:
             # used = sum(pgs on the osd)
             # no need to account for pending pg moves - we don't use the device usage report.
             if pgstate == PGState.UP:
-                # TODO add the estimated metadata size
                 used = self.osd_shardsize_sum_up[osdid]
             elif pgstate == PGState.ACTING:
                 used = self.osd_shardsize_sum_acting[osdid]
@@ -3600,8 +3652,7 @@ class PGMappings:
         used = self.get_osd_usage_size(osdid, add_size)
 
         # make it relative
-        used /= osd_size
-        used *= 100
+        used *= 100 / osd_size
         # logging.debug(f"{osdid} {pformatsize(used)}/{pformatsize(osd_size)} = {used/osd_size * 100:.2f}%")
 
         return used
@@ -3721,7 +3772,7 @@ class PGMappings:
         limiting_osd = None
         for osdid, osdweight in osdid_candidates.items():
             # since we will adjust weight below, we need the raw device size
-            device_size = self.cluster.osd_devsize[osdid]
+            device_size = self.cluster.osds[osdid]['device_size']
             # shrink the device size by configured cluster full_ratio
             device_size *= self.cluster.full_ratio
 
@@ -3802,7 +3853,7 @@ class PGMappings:
                 continue
 
             # raw device size as reported by osd
-            device_size = self.cluster.osd_devsize[osdid]
+            device_size = self.cluster.osds[osdid]["device_size"]
             # shrink the device size by configured cluster full_ratio
             device_size *= self.cluster.full_ratio
 

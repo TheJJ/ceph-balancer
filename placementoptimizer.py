@@ -212,7 +212,6 @@ def clamp(number, smallest, largest):
     return max(smallest, min(number, largest))
 
 
-
 class strlazy:
     """
     to be used like this: logging.debug("rolf %s", strlazy(lambda: do_something()))
@@ -437,6 +436,15 @@ def list_replace(iterator, search, replace):
             elem = replace
         ret.append(elem)
     return ret
+
+
+def replace_missing_osds(osdids):
+    """
+    the "missing" osds have id 2147483647 or 0x7fffffff
+    replace it with -1
+    """
+    return list_replace(osdids, 0x7fffffff, -1)
+
 
 def stat_mean(iterable):
     """
@@ -1667,12 +1675,9 @@ class ClusterState:
         return [((osd_from, ...), (osd_to, ..)), ...]
         """
 
-        up_osds = list_replace(pginfo["up"], 0x7fffffff, -1)
-        acting_osds = list_replace(pginfo["acting"], 0x7fffffff, -1)
-
         is_ec = self.pg_is_ec(pginfo["pgid"])
 
-        return moves_from_up_acting(up_osds, acting_osds, is_ec)
+        return moves_from_up_acting(pginfo["up"], pginfo["acting"], is_ec)
 
 
     def preprocess(self):
@@ -1878,8 +1883,10 @@ class ClusterState:
             pgid = pginfo["pgid"]
             self.pgs[pgid] = pginfo
 
-            up = pginfo["up"]
-            acting = pginfo["acting"]
+            up = replace_missing_osds(pginfo["up"])
+            pginfo["up"] = up
+            acting = replace_missing_osds(pginfo["acting"])
+            pginfo["acting"] = acting
             primary = acting[0]
 
             self.pgs[pgid].update({
@@ -1903,6 +1910,9 @@ class ClusterState:
         # gather which pgs are on what osd
         # and which pools have which osds
         for osdid, osdpgs in osd_mappings.items():
+            if osdid == -1:
+                continue
+
             osd_pools_up = set()
             osd_pools_acting = set()
 
@@ -1934,10 +1944,6 @@ class ClusterState:
                 self.pool_osds_acting[poolid].add(osdid)
 
                 osd_objs_acting += self.pgs[pgid]['stat_sum']['num_objects']
-
-            if osdid == 0x7fffffff:
-                # the "missing" osds
-                continue
 
             self.osds[osdid].update({
                 'pools_up': list(sorted(osd_pools_up)),
@@ -1982,6 +1988,9 @@ class ClusterState:
 
         # estimate pg metadata sizes
         for osdid, osdpgs in osd_mappings.items():
+            if osdid == -1:
+                continue
+
             osdinfo = self.osds[osdid]
             meta_amount = osdinfo["device_used_meta"]
             if meta_amount == 0:
@@ -2020,6 +2029,9 @@ class ClusterState:
         # this is the expected utilization change once we reach the up pg state.
         self.osd_transfer_remainings = dict()
         for osdid, osdpgs in osd_mappings.items():
+            if osdid == -1:
+                continue
+
             osd = self.osds[osdid]
             # this is the estimated size of remaining pg transfer amount
             # the already-transferred part is part of device_used.
@@ -2695,6 +2707,11 @@ class PGMoveChecker:
         # osd -> crush-root-trace
         constraining_traces = dict()
 
+        # how many osds were missing (== -1)?
+        # doesn't make sense though since the up set should never contain -1,
+        # but hey apparently it happens.
+        pg_missing_up_osds = 0
+
         # how far down the crush hierarchy have we stepped
         # 0 = observe the whole tree
         # each value cuts one layer of the current step's trace
@@ -2772,6 +2789,11 @@ class PGMoveChecker:
                 # generate tracebacks for all osds that ends up in this root.
                 # we collect root-traces of all acting osds of the pg we wanna check for.
                 for pg_osd in root_osds:
+                    if pg_osd == -1:
+                        pg_missing_up_osds += 1
+                        logging.debug("   trace for   -1: ignoring missing")
+                        continue
+
                     trace = self.cluster.trace_crush_root(pg_osd, current_root_name)
                     logging.debug(strlazy(lambda: f"   trace for {pg_osd:4d}: {trace}"))
                     if trace is None or len(trace) < 2:
@@ -2787,7 +2809,8 @@ class PGMoveChecker:
                     raise RuntimeError(f"no device traces captured for step {step}")
 
                 # only consider traces for the current choose step
-                take_traces = {osdid: constraining_traces[osdid] for osdid in root_osds}
+                # and only consider existing devices (whyever it's possible to have -1 in the up set)
+                take_traces = {osdid: constraining_traces[osdid] for osdid in root_osds if osdid != -1}
 
                 # we just processed the root depth
                 rule_step += 1
@@ -2872,7 +2895,7 @@ class PGMoveChecker:
 
         # we should have processed exactly pool-size many devices
         assert devices_chosen == self.pool_size, f"devices_chosen={devices_chosen} != poolsize={self.pool_size}"
-        assert devices_chosen == len(constraining_traces)
+        assert devices_chosen == len(constraining_traces) + pg_missing_up_osds
         # for each rule step there should be a tree depth entry
         assert len(rule_tree_depth) == rule_step
         # for each rule step, we should have registered item usages
@@ -4514,7 +4537,9 @@ def balance(args, cluster):
             if source_attempts > args.max_move_attempts:
                 logging.info(f"couldn't empty osd.{last_attempt}, so we're done. "
                              f"if you want to try more often, set --max-move-attempts=$nr, this may unlock "
-                             f"more balancing possibilities.")
+                             f"more balancing possibilities. "
+                             f"setting --ignore-ideal-pgcounts also unlocks more, but will then we will "
+                             f"fight with ceph's default balancer.")
                 force_finish = True
                 continue
 

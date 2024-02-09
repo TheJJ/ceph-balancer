@@ -38,9 +38,11 @@ def parse_args():
     cli = argparse.ArgumentParser()
 
     cli.add_argument("-v", "--verbose", action="count", default=0,
-                    help="increase program verbosity")
+                     help="increase program verbosity")
     cli.add_argument("-q", "--quiet", action="count", default=0,
-                    help="decrease program verbosity")
+                     help="decrease program verbosity")
+    cli.add_argument("--profile", action="store_true",
+                     help=("activate the performance profiler for the balancer itself"))
     cli.add_argument('--osdsize', choices=['device', 'weighted', 'crush'], default="crush",
                      help=("what parameter to take for determining the osd size. default: %(default)s. "
                            "device=device_size, weighted=devsize*weight, crush=crushweight*weight"))
@@ -5281,35 +5283,44 @@ def main():
         state.preprocess()
 
         if args.mode == 'balance':
-            balance(args, state)
-
-            #import cProfile
-            #from pstats import SortKey
-            #with cProfile.Profile() as pr:
-            #    balance(args, state)
-            #    pr.print_stats(SortKey.CUMULATIVE)
+            run = lambda: balance(args, state)
 
         elif args.mode == 'show':
-            show(args, state)
+            run = lambda: show(args, state)
 
         elif args.mode == 'showremapped':
-            showremapped(args, state)
+            run = lambda: showremapped(args, state)
 
         elif args.mode == 'poolosddiff':
-            poolosddiff(args, state)
+            run = lambda: poolosddiff(args, state)
 
         elif args.mode == 'repairstats':
-            repairstats(args, state)
+            run = lambda: repairstats(args, state)
 
         elif args.mode == "osdmap":
             if args.osdmapmode == "export":
-                state.export_osdmap(args.output_file,
-                                    ignore_state_upmaps=args.ignore_state_upmaps)
+                run = lambda: state.export_osdmap(
+                    args.output_file,
+                    ignore_state_upmaps=args.ignore_state_upmaps
+                )
             else:
                 raise RuntimeError(f"unknown osdmap mode {args.osdmapmode!r}")
 
         else:
             raise RuntimeError(f"unknown mode: {args.mode}")
+
+        if args.profile:
+            import cProfile
+            from pstats import SortKey, Stats
+            with cProfile.Profile() as pr:
+                run()
+            s = Stats(pr)
+            s.sort_stats(SortKey.CUMULATIVE)
+            s.print_stats()
+            s.print_callers()
+        else:
+            run()
+
     return 0
 
 if __name__ == "__main__":

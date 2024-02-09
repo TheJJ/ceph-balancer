@@ -3,7 +3,7 @@
 """
 Ceph balancer.
 
-(c) 2020-2023 Jonas Jelten <jj@sft.lol>
+(c) 2020-2024 Jonas Jelten <jj@sft.lol>
 GPLv3 or later
 """
 
@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import lzma
+import math
 import re
 import shlex
 import socket
@@ -143,6 +144,8 @@ def parse_args():
                           default='none',
                           help=("don't consider balancing by placement group count on an source/destination/both OSD. "
                                 "if you set this, the ceph's built-in balancer and this one will have a fight."))
+    balancep.add_argument('--allow-target-usage-grow', action="store_true",
+                          help=("allow a destination OSD to become fuller than the source OSD of a movement is."))
     balancep.add_argument('--ensure-optimal-moves', action='store_true',
                           help='make sure that only movements which win full shardsizes are done')
     balancep.add_argument('--ensure-variance-decrease', action='store_true',
@@ -456,7 +459,7 @@ def stat_variance(iterable):
     """
     count = len(iterable)
     if count == 0:
-        raise ValueError()
+        raise ValueError("iterator length is zero")
     if count == 1:
         return 0
 
@@ -1949,7 +1952,10 @@ class ClusterState:
 
         for osd in self.state["osd_dump"]["osds"]:
             osdid = osd["osd"]
+            # is None when crushclass is not known
             crushclass = self.osd_crushclass.get(osdid)
+            if crushclass is None and osd["weight"] > 0:
+                raise Exception(f"crushclass for osd.{osdid} unknown but weight is > 0")
 
             self.osds[osdid].update({
                 "weight": osd["weight"],
@@ -1977,7 +1983,7 @@ class ClusterState:
             osdinfo = self.osds[osdid]
             meta_amount = osdinfo["device_used_meta"]
             if meta_amount == 0:
-                raise Exception()
+                continue
 
             osd_objs_acting = osdinfo['objs_acting']
 
@@ -3361,6 +3367,7 @@ class PGMappings:
 
         # flush caches
         self._upmap_items.pop(pgid, None)
+        self.get_class_osd_usages.cache_clear()
         self.get_osd_usage.cache_clear()
         self.get_osd_usage_size.cache_clear()
         self.get_pool_max_avail_limited.cache_clear()
@@ -3410,13 +3417,14 @@ class PGMappings:
         """
         return {osdid: self.get_osd_usage(osdid) for osdid in self.osd_candidates}
 
+    @lru_cache(maxsize=1)
     def get_class_osd_usages(self):
         """
         calculate {crushclass -> {osdid -> usage percent}}
         """
         ret = dict()
-        for cls, osds in self.osd_candidates_class.items():
-            ret[cls] = {osdid: self.get_osd_usage(osdid) for osdid in osds}
+        for crushclass in self._enabled_crushclasses:
+            ret[crushclass] = {osdid: self.get_osd_usage(osdid) for osdid in self.osd_candidates_class[crushclass]}
 
         return ret
 
@@ -3501,18 +3509,14 @@ class PGMappings:
             class_usages = self.get_class_osd_usages()
             class_variance = dict()
             class_osds_sorted = dict()
-            max_len = 0
             for cls, usages in class_usages.items():
                 class_variance[cls] = stat_variance(usages.values())
                 sorted_osds = list(sorted(usages.items(), key=lambda osd: osd[1], reverse=True))
-                if len(sorted_osds) > max_len:
-                    max_len = len(sorted_osds)
                 class_osds_sorted[cls] = sorted_osds
 
             # most varying crushclass first
             class_order = list(clsname for clsname, _ in
                                sorted(class_variance.items(), key=lambda v: v[1], reverse=True))
-
 
             # yield devices of high crushclass variance first
             class_pos = 0
@@ -3586,7 +3590,7 @@ class PGMappings:
                                    reverse=False):
             yield osdid, usage
 
-    @lru_cache(maxsize=2**18)
+    @lru_cache(maxsize=2**20)
     def get_osd_usage_size(self, osdid, add_size=0, pgstate=PGState.UP):
         """
         returns the occupied space on an osd.
@@ -3639,7 +3643,7 @@ class PGMappings:
 
         return used
 
-    @lru_cache(maxsize=2**18)
+    @lru_cache(maxsize=2**20)
     def get_osd_usage(self, osdid, add_size=0):
         """
         returns the occupied OSD space in percent.
@@ -3662,13 +3666,9 @@ class PGMappings:
         get {crushclass -> variance} for given mapping
         """
         variances = dict()
-        for crushclass in self._enabled_crushclasses:
-            osd_usages = list()
-            for osdid in self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
-                osd_usages.append(self.get_osd_usage(osdid))
 
-            class_variance = stat_variance(osd_usages)
-            variances[crushclass] = class_variance
+        for crushclass, usages in self.get_class_osd_usages().items():
+            variances[crushclass] = stat_variance(usages.values())
 
         return variances
 
@@ -4438,6 +4438,8 @@ def balance(args, cluster):
     ignore_ideal_pgcounts_src = args.ignore_ideal_pgcounts in ('source', 'all')
     ignore_ideal_pgcounts_dest = args.ignore_ideal_pgcounts in ('destination', 'all')
 
+    allow_target_usage_grow = args.allow_target_usage_grow
+
     # movement change tracking and logging
     analyzer = MappingAnalyzer()
     # remember start state for comparison
@@ -4525,7 +4527,10 @@ def balance(args, cluster):
             pg_candidates = pg_mappings.get_pg_move_candidates(osd_from)
 
             from_osd_pg_count = pg_mappings.osd_pool_up_shard_count[osd_from]
-            from_osd_satisfied_pools = set()
+            # pools whose pgs are below count limit on the from osd -> no need to try other pgs of these pools
+            from_osd_satisfied_pool_pgcount = set()
+            # pools whose pgs are too big
+            from_osd_satisfied_pool_pgsize = set()
 
             # now try to move the candidates to their possible destination
             # TODO: instead of having all candidates,
@@ -4540,8 +4545,12 @@ def balance(args, cluster):
 
                 pg_pool = pool_from_pg(move_pg)
 
-                if pg_pool in from_osd_satisfied_pools:
+                if pg_pool in from_osd_satisfied_pool_pgcount:
                     logging.debug("SKIP pg %s from osd.%s since pool=%s-pgs are already below expected", move_pg, osd_from, pg_pool)
+                    continue
+
+                if pg_pool in from_osd_satisfied_pool_pgsize:
+                    logging.debug("SKIP pg %s from osd.%s since pool=%s-pgs can't fit on any of the osd_to candidates", move_pg, osd_from, pg_pool)
                     continue
 
                 if pg_pool in unsuccessful_pools:
@@ -4559,9 +4568,12 @@ def balance(args, cluster):
                 # only move the pg if the source osd has more PGs of the pool than average
                 # otherwise the regular balancer will fill this OSD again
                 # with another PG (of the same pool) from somewhere
-                if ignore_ideal_pgcounts_src:
-                    if from_osd_pg_count[pg_pool] <= from_osd_pg_count_ideal:
-                        from_osd_satisfied_pools.add(pg_pool)
+                if not ignore_ideal_pgcounts_src:
+                    from_idealcount_difference = from_osd_pg_count_ideal - from_osd_pg_count[pg_pool]
+
+                    if from_idealcount_difference >= 0.0 or math.isclose(from_idealcount_difference, 0.0):
+                        # other pgs of this pool would also violate this check.
+                        from_osd_satisfied_pool_pgcount.add(pg_pool)
                         logging.debug("  BAD => skipping pg %s since source osd.%s "
                                       "doesn't have too many of pool=%s (%s <= %s)",
                                       move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
@@ -4575,23 +4587,27 @@ def balance(args, cluster):
                                   " pool=%s count %s, ideal %s",
                                   move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
 
-                # pre-filter PGs to rule out those that will for sure not gain any space
-                # TODO: rather test if osd_to would become the new limiting osd
-                pg_small_enough = False
-                for osd_to in osd_to_candidates:
-                    target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
+                if not allow_target_usage_grow:
+                    # pre-filter PGs to rule out those that will for sure not gain any space
+                    # TODO: rather test if osd_to would become the new limiting osd
+                    pg_small_enough = False
+                    for osd_to in osd_to_candidates:
+                        target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
 
-                    # check if the target osd will be used less than the source
-                    # after we moved the pg
-                    if target_predicted_usage < osd_from_used_percent:
-                        pg_small_enough = True
-                        break
+                        # check if the target osd will be used less than the source
+                        # after we moved the pg
+                        if target_predicted_usage < osd_from_used_percent:
+                            pg_small_enough = True
+                            break
 
-                if not pg_small_enough:
-                    # the pg is so big, it would increase the fill % of all osd_tos more than osd_from is
-                    # so we would increase the variance.
-                    logging.debug("  BAD => skipping pg %s, since its not small enough", move_pg)
-                    continue
+                    if not pg_small_enough:
+                        # the pg is so big, it would increase the fill % of all osd_tos more than osd_from is
+                        # so we would increase the variance.
+                        logging.debug("  BAD => skipping pg %s, since its not small enough", move_pg)
+
+                        # don't try other pgs from this pool (they would also bee to big)
+                        from_osd_satisfied_pool_pgsize.add(pg_pool)
+                        continue
 
                 try_pg_move.prepare_crush_check()
 
@@ -4619,7 +4635,8 @@ def balance(args, cluster):
                                               f"{to_osd_pg_count[pg_pool]}, target {to_osd_pg_count_ideal}"))
 
                     else:
-                        if to_osd_pg_count[pg_pool] >= to_osd_pg_count_ideal and not to_osd_pg_count_ideal < 1.0:
+                        to_idealcount_difference = to_osd_pg_count_ideal - to_osd_pg_count[pg_pool]
+                        if (to_idealcount_difference <= 0 or math.isclose(to_idealcount_difference, 0.0)) and not to_osd_pg_count_ideal < 1.0:
                             logging.debug(strlazy(lambda:
                                                   f" BAD => osd.{osd_to} already has too many of pool={pg_pool} "
                                                   f"({to_osd_pg_count[pg_pool]} >= {to_osd_pg_count_ideal})"))
@@ -4925,12 +4942,16 @@ def show(args, cluster):
             for osdid, props in cluster.osds.items():
                 hostname = props.get('host_name', '?')
                 crushclass = props['crush_class']
+                devsize = props.get('device_size', 0)
 
                 if args.only_crushclass:
                     if crushclass != args.only_crushclass:
                         continue
 
-                if props['device_size'] == 0:
+                if crushclass is None:
+                    crushclass = "?"
+
+                if devsize == 0:
                     util_val = 0
                 elif args.use_shardsize_sum:
                     used = 0
@@ -4947,13 +4968,11 @@ def show(args, cluster):
                 else:
                     used = props['device_used']
 
-                if props['device_size'] == 0:
-                    util_val = 0
-                else:
-                    util_val = 100 * used / props['device_size']
+                if devsize != 0:
+                    util_val = 100 * used / devsize
 
                 weight_val = props['weight']
-                cweight = props['crush_weight']
+                cweight = props.get('crush_weight', 0)
 
                 if args.use_weighted_utilization:
                     if weight_val == 0:
@@ -4963,8 +4982,6 @@ def show(args, cluster):
 
                 if util_val < args.osd_fill_min:
                     continue
-
-                devsize = props['device_size']
 
                 if pgstate == PGState.UP:
                     pg_count = props.get('pg_count_up', {})

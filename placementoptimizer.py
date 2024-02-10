@@ -3488,7 +3488,6 @@ class PGMappings:
 
         if self.osd_from_choice_method == OSDFromChoiceMethod.LIMITING:
             pool_limit = True
-            fullest_osd = True
         elif self.osd_from_choice_method == OSDFromChoiceMethod.FULLEST:
             fullest_osd = True
         elif self.osd_from_choice_method == OSDFromChoiceMethod.ALTERNATE:
@@ -3501,21 +3500,26 @@ class PGMappings:
         emitted = set()
 
         def limiting_osds():
-            # [(limiting_osdid, usage), ]
-            limiting_osd_usages = dict()
-            limiting_osd_count = defaultdict(lambda: 0)
+            # osdid -> sum of normalized limit_positions
+            # most limiting one time: 1, least limiting one time: 1/osdcount
+            # -> for each pool, sum those up.
+            limiting_osds_weight = defaultdict(lambda: 0)
+
             for poolid in self.pool_candidates:
                 # all limiting osds
-                # TODO: list of limiting osds, the most limiting one first.
-                min_avail, osdid = self.get_pool_max_avail_limited(poolid, negative_ok=True)
-                limiting_osd_usages[osdid] = self.get_osd_usage(osdid)
-                limiting_osd_count[osdid] += 1
+                _min_avail, limiting_osdids = self.get_pool_max_avail_limited(poolid, negative_ok=True, all_limitings=True)
+                osdcount = len(limiting_osdids)
+                for idx, osdid in enumerate(limiting_osdids):
+                    limiting_osds_weight[osdid] += (1 - idx) / osdcount
+
+            limiting_osd_usages = {osdid: self.get_osd_usage(osdid) for osdid in limiting_osds_weight.keys()}
 
             pool_count = len(self.pool_candidates)
             def cmp_limit_usage(osdid_usage):
                 osdid, usage = osdid_usage
-                # weight the usage by the pool limiting percentage
-                return usage * (limiting_osd_count[osdid] / pool_count)
+                # weight the usage (in percent) by the pool limiting percentage
+                # if the same device limited 3 pools, it would be device_usage * 3/poolcount.
+                return (limiting_osds_weight[osdid] / pool_count) * usage
 
             # not only sort by size, but prefer osds that limit many pools
             # osd_usage * pools_limited/pool_count
@@ -3832,7 +3836,9 @@ class PGMappings:
     @lru_cache(maxsize=2**16)
     def get_pool_max_avail_limited(self, poolid,
                                    pgstate: PGState = PGState.UP,
-                                   negative_ok: bool = False):
+                                   negative_ok: bool = False,
+                                   all_limitings: bool = False,
+                                   add_sizes: Dict[int, int] = {}):
         """
         given a pool id, predict how much space is available with the current mapping.
 
@@ -3841,7 +3847,12 @@ class PGMappings:
 
         this calculates maximum for the current pg placement.
 
-        returns (max_avail, limiting_osd)
+        add_sizes: allows to simulate osd usage changes while testing for the limits.
+
+        all_limitings: return a list of limiting osds, rather just the one (more compute time)
+            returns (max_avail, [most_limiting_osdid, ...])
+
+        returns (max_avail, limiting_osdid)
         """
 
         pool = self.cluster.pools[poolid]
@@ -3857,6 +3868,9 @@ class PGMappings:
         # given its selection probabiliy (due to pg distributions)
         min_avail = 0
         limiting_osd = None
+
+        # osdid -> available space
+        osds_avail = dict()
 
         if pgstate == PGState.UP:
             shard_counts = self.osd_pool_up_shard_count
@@ -3882,7 +3896,7 @@ class PGMappings:
             # shrink the device size by configured cluster full_ratio
             device_size *= self.cluster.full_ratio
 
-            used_size = self.get_osd_usage_size(osdid, pgstate=pgstate)
+            used_size = self.get_osd_usage_size(osdid, pgstate=pgstate, add_size=add_sizes.get(osdid, 0))
             usable = device_size - used_size
 
             # this is the "real" size prediction of an osd:
@@ -3894,6 +3908,8 @@ class PGMappings:
             if limiting_osd is None or predicted_usable < min_avail:
                 min_avail = predicted_usable
                 limiting_osd = osdid
+
+            osds_avail[osdid] = predicted_usable
 
             if False:
                 print(
@@ -3915,7 +3931,13 @@ class PGMappings:
         if not negative_ok and min_avail < 0:
             min_avail = 0
 
-        return min_avail, limiting_osd
+        if all_limitings:
+            limiting_osds = sorted(osds_avail.items(), key=lambda elem: elem[1])
+            assert limiting_osd == limiting_osds[0][0]
+            return min_avail, [elem[0] for elem in limiting_osds]
+
+        else:
+            return min_avail, limiting_osd
 
 
 class PGShardProps:

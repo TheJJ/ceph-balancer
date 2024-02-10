@@ -31,7 +31,7 @@ from collections import defaultdict
 from functools import lru_cache
 from itertools import chain, zip_longest
 from pprint import pformat, pprint
-from typing import Optional, Callable, Dict, List
+from typing import Optional, Callable, Dict, List, Tuple
 
 
 def parse_args():
@@ -146,6 +146,11 @@ def parse_args():
                           default='none',
                           help=("don't consider balancing by placement group count on an source/destination/both OSD. "
                                 "if you set this, the ceph's built-in balancer and this one will have a fight."))
+    balancep.add_argument('--target-usage-constraint', choices=['usage', 'nolimit'],
+                          default="usage",
+                          help=("how to ensure a movement target OSD won't be worse after a move. default: %(default)s. "
+                                "usage=make sure the target device is less used than the source after a move. "
+                                "nolimit=make sure the target device does not become the pool's size limit after a move"))
     balancep.add_argument('--allow-target-usage-grow', action="store_true",
                           help=("allow a destination OSD to become fuller than the source OSD of a movement is."))
     balancep.add_argument('--ensure-optimal-moves', action='store_true',
@@ -262,6 +267,14 @@ class OSDFromChoiceMethod(Enum):
     FULLEST = 1  # use the fullest osd
     LIMITING = 2  # use devices limiting the pool available space
     ALTERNATE = 3 # alternate between limiting and fullest devices
+
+
+class OSDToConstraintMethod(Enum):
+    """
+    how to verify a target osd doesn't make things worse.
+    """
+    USAGE = 1  # ensure the target OSD will be less full after a move than the source OSD
+    NOLIMIT = 2  # ensure the target OSD will not be the new limit of the moved pool
 
 
 class PGChoiceMethod(Enum):
@@ -3838,7 +3851,7 @@ class PGMappings:
                                    pgstate: PGState = PGState.UP,
                                    negative_ok: bool = False,
                                    all_limitings: bool = False,
-                                   add_sizes: Dict[int, int] = {}):
+                                   add_size: Optional[Tuple[int, int]] = None):
         """
         given a pool id, predict how much space is available with the current mapping.
 
@@ -3847,7 +3860,7 @@ class PGMappings:
 
         this calculates maximum for the current pg placement.
 
-        add_sizes: allows to simulate osd usage changes while testing for the limits.
+        add_size (osdid, size): allows to simulate osd usage changes while testing for the limits.
 
         all_limitings: return a list of limiting osds, rather just the one (more compute time)
             returns (max_avail, [most_limiting_osdid, ...])
@@ -3896,7 +3909,8 @@ class PGMappings:
             # shrink the device size by configured cluster full_ratio
             device_size *= self.cluster.full_ratio
 
-            used_size = self.get_osd_usage_size(osdid, pgstate=pgstate, add_size=add_sizes.get(osdid, 0))
+            size_adjust = 0 if not add_size or (add_size[0] == osdid) else add_size[1]
+            used_size = self.get_osd_usage_size(osdid, pgstate=pgstate, add_size=size_adjust)
             usable = device_size - used_size
 
             # this is the "real" size prediction of an osd:
@@ -4456,6 +4470,13 @@ def balance(args, cluster):
     else:
         raise RuntimeError(f"unknown osd usage rate method {args.osdused!r}")
 
+    if args.target_usage_constraint == "usage":
+        target_usage_constraint = OSDToConstraintMethod.USAGE
+    elif args.target_usage_constraint == "nolimit":
+        target_usage_constraint = OSDToConstraintMethod.NOLIMIT
+    else:
+        raise RuntimeError(f"unknown osd target usage constraint {args.target_usage_constraint!r}")
+
     if args.pg_choice == "largest":
         pg_choice_method = PGChoiceMethod.LARGEST
     elif args.pg_choice == "median":
@@ -4638,7 +4659,7 @@ def balance(args, cluster):
 
                 if not allow_target_usage_grow:
                     # pre-filter PGs to rule out those that will for sure not gain any space
-                    # TODO: rather test if osd_to would become the new limiting osd
+
                     pg_small_enough = False
                     for osd_to in osd_to_candidates:
                         target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
@@ -4699,19 +4720,28 @@ def balance(args, cluster):
                                                   f" OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
                                                   f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
 
-                    # how full will the target be
-                    target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
-                    source_usage = pg_mappings.get_osd_usage(osd_from)
+                    if target_usage_constraint == OSDToConstraintMethod.NOLIMIT:
+                        _, new_limiting_osd = pg_mappings.get_pool_max_avail_limited(pg_pool, add_size=(osd_to, move_pg_shardsize))
+                        if new_limiting_osd == osd_to:
+                            logging.debug(" BAD => osd.%s would become the new limiting osd", osd_to)
+                            continue
 
-                    # check that the destination osd won't be more full than the source osd
-                    # but what if we're balanced very good already? wouldn't we allow this if the variance decreased anyway?
-                    # maybe make it an optional flag because of this (--ensure-decreasing-usage)
-                    if target_predicted_usage > source_usage:
-                        logging.debug(strlazy(lambda:
-                                      f" BAD target will be more full than source currently is: "
-                                      f"osd.{osd_to} would have {target_predicted_usage:.3f}%, "
-                                      f"and source's osd.{osd_from} currently is {source_usage:.3f}%"))
-                        continue
+                    elif target_usage_constraint == OSDToConstraintMethod.USAGE:
+                        # how full will the target be
+                        target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
+                        source_usage = pg_mappings.get_osd_usage(osd_from)
+
+                        # check that the destination osd won't be more full than the source osd
+                        # but what if we're balanced very good already? wouldn't we allow this if the variance decreased anyway?
+                        # the nolimit target usage constraint may be better suited then.
+                        if target_predicted_usage > source_usage:
+                            logging.debug(strlazy(lambda:
+                                        f" BAD target will be more full than source currently is: "
+                                        f"osd.{osd_to} would have {target_predicted_usage:.3f}%, "
+                                        f"and source's osd.{osd_from} currently is {source_usage:.3f}%"))
+                            continue
+                    else:
+                        raise Exception(f"unknown target usage constraint {target_usage_constraint}")
 
                     # check if the movement size is nice
                     if args.ensure_optimal_moves:
@@ -4729,12 +4759,11 @@ def balance(args, cluster):
                     # check if the variance is decreasing
                     new_variance = try_pg_move.get_placement_variance(osd_from, osd_to)
 
-                    if new_variance >= variance_before:
+                    if args.ensure_variance_decrease and new_variance >= variance_before:
                         # even if the variance increases, we ensure we do progress by the
-                        # guaranteed usage rate decline
-                        if args.ensure_variance_decrease:
-                            logging.debug(f" BAD => variance not decreasing: {new_variance} not < {variance_before}")
-                            continue
+                        # guaranteed usage rate decline (or limiting device elimination)
+                        logging.debug(f" BAD => variance not decreasing: {new_variance} not < {variance_before}")
+                        continue
 
                     new_mapping_pos = None
 

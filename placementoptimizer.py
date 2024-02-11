@@ -4818,7 +4818,7 @@ def balance(args, cluster):
                     if args.ensure_variance_decrease and new_variance >= variance_before:
                         # even if the variance increases, we ensure we do progress by the
                         # guaranteed usage rate decline (or limiting device elimination)
-                        logging.debug(f" BAD => variance not decreasing: {new_variance} not < {variance_before}")
+                        logging.debug(f" BAD => variance not decreasing: {new_variance:.6f} not < {variance_before:.6f}")
                         continue
 
                     new_mapping_pos = None
@@ -4856,7 +4856,7 @@ def balance(args, cluster):
                     logging.info(f"    props: {pg_candidates.get_properties(move_pg)}")
                     logging.debug(strlazy(lambda: f"    pg {move_pg} was on {list_highlight(prev_pg_mapping, new_mapping_pos, 31)}"))
                     logging.debug(strlazy(lambda: f"    pg {move_pg} now on {list_highlight(new_pg_mapping, new_mapping_pos, 32)}"))
-                    logging.info(f"    => variance new={new_variance} {variance_op} {variance_before}=old")
+                    logging.info(f"    => variance new={new_variance:.6f} {variance_op} {variance_before:.6f}=old")
 
                     analyzer.log()
                     if args.save_timings:

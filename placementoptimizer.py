@@ -50,6 +50,7 @@ def parse_args():
     sp = cli.add_subparsers(dest='mode')
     sp.required = True
 
+    ### parsers used in subcommands
     statep = argparse.ArgumentParser(add_help=False)
     statep.add_argument("--state", "-s", help="load cluster state from this jsonfile")
 
@@ -80,11 +81,17 @@ def parse_args():
                                      "delta: adjust the builtin osd usage report by in-move pg deltas - more accurate but doesn't account pending data deletion.\n"
                                      "shardsum: estimate the usage by summing up all pg shardsizes - doesn't account PG metadata overhead."))
 
+    savemappingp = argparse.ArgumentParser(add_help=False)
+    savemappingp.add_argument("--save-mappings", help="filename to store the resulting up osdid set for all pgs (to see where things are placed)")
+
+    ### subcommands
     gathersp = sp.add_parser('gather', help="only gather cluster information, i.e. generate a state file")
     gathersp.add_argument("output_file", help="file to store cluster balancing information to")
 
-    showsp = sp.add_parser('show', parents=[statep, upmapp, predictionp, usedestimatep],
-                           help="show cluster properties like free pool space or OSD utilizations")
+    showsp = sp.add_parser('show', parents=[statep, upmapp, predictionp, usedestimatep, savemappingp],
+                           help=("show cluster properties like free pool space or OSD utilizations. "
+                                 "it shows all info for the 'acting' state by default. "
+                                 "use '--pgstate up' to look into the future and print how it will look after all movements are done."))
     showsp.add_argument('--only-crushclass',
                         help="only display devices of this crushclass")
     showsp.add_argument('--sort-shardsize', action='store_true',
@@ -111,7 +118,7 @@ def parse_args():
                         help="show how much space would be available if the pool had infinity many pgs")
     showsp.add_argument('--osd-fill-min', type=int, default=0,
                         help='minimum fill %% to show an osd, default: %(default)s%%')
-    showsp.add_argument('--dump-upmap-progress',
+    showsp.add_argument('--save-upmap-progress',
                         help="filename to store cluster stats after each after each upmap change")
 
     remappsp = sp.add_parser('showremapped', parents=[statep],
@@ -121,8 +128,10 @@ def parse_args():
     remappsp.add_argument('--osds',
                         help="only look at these osds when using --by-osd, comma separated")
 
-    balancep = sp.add_parser('balance', parents=[statep, upmapp, usedestimatep],
+    balancep = sp.add_parser('balance', parents=[statep, upmapp, usedestimatep, savemappingp],
                              help="distribute PGs for better capacity and performance in your cluster")
+    balancep.add_argument('--output', '-o', default="-",
+                          help="output filename for resulting movement instructions. default stdout.")
     balancep.add_argument('--max-pg-moves', '-m', type=int, default=10,
                           help='maximum number of pg movements to find, default: %(default)s')
     balancep.add_argument('--only-pool',
@@ -496,6 +505,27 @@ def stat_variance(iterable):
         diffsum += (val - mean) ** 2
 
     return 1/(count-1) * diffsum
+
+
+class open_or_stdout:
+    """
+    supports '-' as filename for stdout.
+    usage:
+    with open_or_stdout(filename) as bla:
+        ...
+    """
+    def __init__(self, filename, mode):
+        if filename == "-":
+            self.hdl = sys.stdout
+        else:
+            self.hdl = open(filename, mode)
+
+    def __enter__(self):
+        return self.hdl
+
+    def __exit__(self, type, value, tb):
+        if self.hdl != sys.stdout:
+            self.hdl.close()
 
 
 def moves_from_up_acting(up_osds: List[int],
@@ -1858,7 +1888,6 @@ class ClusterState:
             osdid = osd["id"]
             self.osds[osdid].update({
                 "utilization": osd["utilization"],
-                # "crush_weight": osd["crush_weight"],  # done when walking the crush trees
                 "status": osd["status"],
             })
 
@@ -1980,6 +2009,7 @@ class ClusterState:
 
             self.osds[osdid].update({
                 "weight": osd["weight"],
+                "crush_weight": 0,  # also in osd_df_dump ["crush_weight"], but we set it when walking the crush trees
                 "cluster_addr": osd["cluster_addr"],
                 "public_addr": osd["public_addr"],
                 "state": tuple(osd["state"]),
@@ -2365,7 +2395,7 @@ class ClusterState:
                 continue
             yield osdid
 
-    def get_osd_weighted_size(self, osdid):
+    def _get_osd_weighted_size(self, osdid):
         """
         return the weighted OSD device size
         """
@@ -2376,7 +2406,7 @@ class ClusterState:
 
         return size * weight
 
-    def get_osd_crush_weighted_size(self, osdid):
+    def _get_osd_crush_weighted_size(self, osdid):
         """
         return the weighted OSD device size
         """
@@ -2388,7 +2418,7 @@ class ClusterState:
         return size * weight
 
     @lru_cache(maxsize=2**20)
-    def get_osd_size(self, osdid, adjust_full_ratio=False):
+    def get_osd_size(self, osdid: int, adjust_full_ratio: bool):
         """
         return the osd size in bytes, depending on the size determination variant.
         can take into account the size loss due to "full_ratio"
@@ -2397,9 +2427,9 @@ class ClusterState:
         if self.osdsize_method == OSDSizeMethod.DEVICE:
             osd_size = self.osds[osdid]['device_size']
         elif self.osdsize_method == OSDSizeMethod.WEIGHTED:
-            osd_size = self.get_osd_weighted_size(osdid)
+            osd_size = self._get_osd_weighted_size(osdid)
         elif self.osdsize_method == OSDSizeMethod.CRUSH:
-            osd_size = self.get_osd_crush_weighted_size(osdid)
+            osd_size = self._get_osd_crush_weighted_size(osdid)
         else:
             raise RuntimeError(f"unknown osd weight method {self.osdsize_method!r}")
 
@@ -2420,7 +2450,7 @@ class ClusterState:
         size_sum = 0
 
         for osdid in candidate_osds:
-            size_sum += self.get_osd_size(osdid)
+            size_sum += self.get_osd_size(osdid, adjust_full_ratio=True)
 
         # uuh somehow no osd had a size or all weights 0?
         assert size_sum > 0
@@ -2434,7 +2464,7 @@ class ClusterState:
         return the ideal pg count for a pool id for some osdid.
         """
 
-        osd_size = self.get_osd_size(osdid)
+        osd_size = self.get_osd_size(osdid, adjust_full_ratio=True)
         if osd_size == 0:
             return 0
 
@@ -3368,6 +3398,19 @@ class PGMappings:
             logging.info(strlazy(lambda: f"applied {move_count} moves from file ({pformatsize(move_amount, 2)})"))
 
 
+    def save_mappings(self, filename):
+        """
+        save the current mapping (useful for comparing clusters when debugging...)
+
+        saves {pgid} {uposds} on each line.
+        """
+
+        with open_or_stdout(filename, "w") as outfd:
+            outfd.write("pg mappings:\n")
+            for pgid, uposds in sorted(self.pg_mappings.items()):
+                outfd.write(f"{pgid: <10} {uposds}\n")
+
+
     def _move_pg(self, pgid, osd_from, osd_to) -> bool:
         """
         simulate a remap pg from one osd to another.
@@ -3467,7 +3510,20 @@ class PGMappings:
         return ret
 
     def get_mapping(self, pgid):
+        """
+        return the up set for a given pgid.
+        returns [uposd, ...]
+        """
         return self.pg_mappings[pgid]
+
+    def get_mappings(self):
+        """
+        get the current mapping (useful for comparing clusters when debugging...)
+
+        returns {"pgid": [uposd, ...]}
+        """
+
+        return self.pg_mappings
 
     def get_osd_pgs_up(self, osdid):
         return self.osd_pgs_up[osdid]
@@ -3689,8 +3745,10 @@ class PGMappings:
     def get_osd_usage(self, osdid, add_size=0):
         """
         returns the occupied OSD space in percent.
+        the fullness is calculated without the full_ratio loss.
+        so when fullratio is 0.95 and and device was written to its limit, this function returns 0.95 instead of 1.
         """
-        osd_size = self.cluster.get_osd_size(osdid)
+        osd_size = self.cluster.get_osd_size(osdid, adjust_full_ratio=False)
 
         if osd_size == 0:
             raise RuntimeError(f"getting relative usage of osd.{osdid} which has size 0 impossible")
@@ -3814,9 +3872,8 @@ class PGMappings:
         limiting_osd = None
         for osdid, osdweight in osdid_candidates.items():
             # since we will adjust weight below, we need the raw device size
-            device_size = self.cluster.osds[osdid]['device_size']
             # shrink the device size by configured cluster full_ratio
-            device_size *= self.cluster.full_ratio
+            device_size = self.cluster.get_osd_size(osdid, adjust_full_ratio=True)
 
             used_size = self.get_osd_usage_size(osdid, pgstate=pgstate)
             usable = device_size - used_size
@@ -3905,9 +3962,8 @@ class PGMappings:
                 continue
 
             # raw device size as reported by osd
-            device_size = self.cluster.osds[osdid]["device_size"]
             # shrink the device size by configured cluster full_ratio
-            device_size *= self.cluster.full_ratio
+            device_size = self.cluster.get_osd_size(osdid, adjust_full_ratio=True)
 
             size_adjust = 0 if not add_size or (add_size[0] == osdid) else add_size[1]
             used_size = self.get_osd_usage_size(osdid, pgstate=pgstate, add_size=size_adjust)
@@ -4163,9 +4219,9 @@ class CrushclassUsage:
 class MappingAnalyzer:
     def __init__(self,
                  pool_free_method: PoolFreeMethod = PoolFreeMethod.LIMITING,
-                 dump_output: Optional[str] = None):
+                 save_file: Optional[str] = None):
         self.pool_free_method = pool_free_method
-        self.dump_output = dump_output
+        self.save_file = save_file
 
         self.pg_mappings: Optional[PGMappings] = None
         self.max_poolname_len: int = None
@@ -4178,7 +4234,7 @@ class MappingAnalyzer:
         # 0 = none yet.
         self.move_idx = 0
 
-        if self.dump_output:
+        if self.save_file:
             self.dump_moves = list()
             self.dump_pool_moves = list()
             self.dump_osd_moves = list()
@@ -4198,12 +4254,12 @@ class MappingAnalyzer:
         self.move_idx += 1
         self._update_stats((osd_from, osd_to))
 
-        if self.dump_output:
+        if self.save_file:
             shard_size = self.pg_mappings.cluster.get_pg_shardsize(pgid)
             self.dump_moves.append((self.move_idx, shard_size, pool_from_pg(pgid), pgid, osd_from, osd_to))
 
     def finish(self) -> None:
-        if self.dump_output:
+        if self.save_file:
             logging.info('generating output DataFrame...')
 
             import pandas as pd
@@ -4218,7 +4274,7 @@ class MappingAnalyzer:
 
             # metadata
             osd_props = pd.DataFrame(
-                [(osdid, cluster.get_osd_size(osdid), osdprops['crush_class'])
+                [(osdid, cluster.get_osd_size(osdid, adjust_full_ratio=False), osdprops['crush_class'])
                  for osdid, osdprops in cluster.osds.items()],
                 columns=['osdid', 'osdsize', 'crushclass'],
             )
@@ -4246,9 +4302,9 @@ class MappingAnalyzer:
                 columns=['move_idx', 'crushclass', 'class_variance'],
             )
 
-            logging.info(f'saving data to {self.dump_output!r}...')
+            logging.info(f'saving data to {self.save_file!r}...')
 
-            with open(self.dump_output, "w") as outfd:
+            with open(self.save_file, "w") as outfd:
                 json.dump(
                     {
                         "generated_at": datetime.datetime.now().astimezone().isoformat(),
@@ -4318,7 +4374,7 @@ class MappingAnalyzer:
                 osd_max_used=osd_max_used,
             )
 
-            if self.dump_output:
+            if self.save_file:
                 for osdid in cluster.get_crushclass_osds(crushclass, skip_zeroweight=True):
                     self.dump_osd_moves.append((
                         self.move_idx,
@@ -4327,7 +4383,7 @@ class MappingAnalyzer:
                         self.pg_mappings.get_osd_usage_size(osdid),
                     ))
 
-        if self.dump_output:
+        if self.save_file:
             for pool_id, (_, avail, limit_osd) in self.pool_avail.items():
                 self.dump_pool_moves.append((self.move_idx, pool_id, avail))
             for crushclass, variance in self.cluster_variance.items():
@@ -4633,7 +4689,7 @@ def balance(args, cluster):
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
                 osd_to_candidates = try_pg_move.get_osd_candidates(osd_from)
                 pool_pg_shard_count_ideal = cluster.pool_pg_shard_count_ideal(pg_pool, osd_to_candidates)
-                from_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_from)
+                from_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_from, adjust_full_ratio=True)
 
                 # only move the pg if the source osd has more PGs of the pool than average
                 # otherwise the regular balancer will fill this OSD again
@@ -4698,7 +4754,7 @@ def balance(args, cluster):
                     # otherwise the balancer will move a pg on the osd_from of this pool somewhere else
                     # i.e. don't be the +1
                     to_osd_pg_count = pg_mappings.osd_pool_up_shard_count[osd_to]
-                    to_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_to)
+                    to_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_to, adjust_full_ratio=True)
                     if ignore_ideal_pgcounts_dest:
                         logging.debug(strlazy(lambda:
                                               f" OK => osd.{osd_to} has pool={pg_pool} "
@@ -4838,6 +4894,9 @@ def balance(args, cluster):
                 "timings": move_calc_times,
             }, timingfd, indent=4)
 
+    if args.save_mappings:
+        pg_mappings.save_mappings(args.save_mappings)
+
     # show results!
     logging.info(80*"-")
     logging.info(f"generated {found_remap_count} remaps.")
@@ -4848,9 +4907,11 @@ def balance(args, cluster):
 
     logging.info(80*"-")
 
-    # print what we have been waiting for :)
-    for cmd in pg_mappings.get_upmap_items_commands():
-        print(cmd)
+    # return what we have been waiting for :)
+    with open_or_stdout(args.output, "w") as outfd:
+        for cmd in pg_mappings.get_upmap_items_commands():
+            outfd.write(cmd)
+            outfd.write("\n")
 
 
 def show(args, cluster):
@@ -4880,12 +4941,14 @@ def show(args, cluster):
 
     if (args.show_max_avail or
         pool_free_method == PoolFreeMethod.LIMITING or
-        args.dump_upmap_progress):
+        args.osds or
+        args.save_upmap_progress or
+        args.save_mappings):
 
-        if args.dump_upmap_progress:
+        if args.save_upmap_progress:
             analyzer = MappingAnalyzer(
                 pool_free_method=pool_free_method,
-                dump_output=args.dump_upmap_progress)
+                save_file=args.save_upmap_progress)
 
         mappings = PGMappings(cluster,
                               osdused_method=osdused_method,
@@ -4893,6 +4956,9 @@ def show(args, cluster):
                               add_upmaps=args.add_upmaps,
                               need_simulation=(osdused_method == OSDUsedMethod.DELTA and pgstate == PGState.UP),
                               analyzer=analyzer)
+
+        if args.save_mappings:
+            mappings.save_mappings(args.save_mappings)
 
     if args.format == 'plain':
         maxpoolnamelen = cluster.max_poolname_len
@@ -5020,7 +5086,7 @@ def show(args, cluster):
             for osdid, props in cluster.osds.items():
                 hostname = props.get('host_name', '?')
                 crushclass = props['crush_class']
-                devsize = props.get('device_size', 0)
+                devsize = cluster.get_osd_size(osdid, adjust_full_ratio=False)
 
                 if args.only_crushclass:
                     if crushclass != args.only_crushclass:
@@ -5029,36 +5095,23 @@ def show(args, cluster):
                 if crushclass is None:
                     crushclass = "?"
 
-                if devsize == 0:
-                    util_val = 0
-                elif args.use_shardsize_sum:
-                    used = 0
-                    if pgstate == PGState.UP:
-                        placed_pgs = props['pgs_up']
-                    elif pgstate == PGState.ACTING:
-                        placed_pgs = props['pgs_acting']
-                    else:
-                        raise RuntimeError("unknown pgstate")
-
-                    for pg in placed_pgs:
-                        used += cluster.get_pg_shardsize(pg)
-
+                if devsize > 0:
+                    util = mappings.get_osd_usage(osdid)
+                    used = mappings.get_osd_usage_size(osdid)
                 else:
-                    used = props['device_used']
-
-                if devsize != 0:
-                    util_val = 100 * used / devsize
+                    util = 0
+                    used = 0
 
                 weight_val = props['weight']
                 cweight = props.get('crush_weight', 0)
 
                 if args.use_weighted_utilization:
                     if weight_val == 0:
-                        util_val = 0
+                        util = 0
                     else:
-                        util_val /= weight_val
+                        util /= weight_val
 
-                if util_val < args.osd_fill_min:
+                if util < args.osd_fill_min:
                     continue
 
                 if pgstate == PGState.UP:
@@ -5084,7 +5137,7 @@ def show(args, cluster):
 
                 class_val = crushclass.rjust(maxcrushclasslen)
 
-                osd_entries.append((osdid, hostname, class_val, devsize, weight_val, cweight, util_val, pg_num, pool_list))
+                osd_entries.append((osdid, hostname, class_val, devsize, weight_val, cweight, used, util, pg_num, pool_list))
 
             # default sort by osdid
             sort_func = lambda x: x[0]
@@ -5097,8 +5150,8 @@ def show(args, cluster):
 
             # header:
             print()
-            print(f"{'osdid': >6} {'hostname': >10} {crushclassheader} {'devsize': >7} {'weight': >6} {'cweight': >7} {'util': >5} {'pg_num': >6}  pools")
-            for osdid, hostname, crushclass, devsize, weight, cweight, util, pg_num, pool_pgs in sorted(osd_entries, key=sort_func):
+            print(f"{'osdid': >6} {'hostname': >10} {crushclassheader} {'devsize': >7} {'weight': >6} {'cweight': >7} {'used': >7} {'util': >5} {'pg_num': >6}  pools")
+            for osdid, hostname, crushclass, devsize, weight, cweight, used, util, pg_num, pool_pgs in sorted(osd_entries, key=sort_func):
 
                 pool_overview = list()
                 for pool, count in pool_pgs.items():
@@ -5118,7 +5171,7 @@ def show(args, cluster):
                 weight = "%.2f" % weight
 
                 pool_list_str = ' '.join(pool_overview)
-                print(f"{osdid: >6} {hostname: >10} {crushclass} {pformatsize(devsize): >7} {weight: >6} {pformatsize(cweight): >7} {util: >5} {pg_num: >6}  {pool_list_str}")
+                print(f"{osdid: >6} {hostname: >10} {crushclass} {pformatsize(devsize): >7} {weight: >6} {pformatsize(cweight): >7} {pformatsize(used): >7}  {util: >5} {pg_num: >6}  {pool_list_str}")
 
     elif args.format == 'json':
 
@@ -5219,7 +5272,7 @@ def showremapped(args, cluster):
 
         for osdid, actions in osdlist:
             if osdid != -1:
-                osd_d_size = cluster.osds[osdid]['device_size']
+                osd_d_size = cluster.get_osd_size(osdid, adjust_full_ratio=False)
                 osd_d_size_pp = pformatsize(osd_d_size, 2)
 
                 osd_d_used = cluster.osds[osdid]['device_used']

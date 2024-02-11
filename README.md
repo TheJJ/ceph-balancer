@@ -159,19 +159,27 @@ Likely this can be optimized further.
 
 ### Cluster Information Display
 
+You can use the balancer's size predictions to view how much space your cluster actually has free.
+Ceph's integrated "free space" number is rather off, it doesn't consider the real pg placement and resulting space limits at all.
+
+Pool utilization:
+```
+./placementoptimizer.py show                # pool free sapace for the current cluster state (in the acting-state)
+./placementoptimizer.py show --pgstate up   # when all movements are done (i.e. the up-state is reached)
+```
+
+OSD utilization:
+```
+./placementoptimizer.py show --osds --sort-utilization
+./placementoptimizer.py show --osds --per-pool-count
+./placementoptimizer.py show --osds --per-pool-count --sort-utilization --only-crushclass hdd
+```
+
 Ongoing movement status
 ```
 ./placementoptimizer.py showremapped
 ./placementoptimizer.py showremapped --by-osd
 ./placementoptimizer.py showremapped --by-osd --osds 13337,4242
-```
-
-OSD utilization:
-```
-./placementoptimizer.py show
-./placementoptimizer.py show --osds --sort-utilization
-./placementoptimizer.py show --osds --per-pool-count
-./placementoptimizer.py show --osds --per-pool-count --sort-utilization --only-crushclass hdd
 ```
 
 ### Dumping and Importing Cluster State

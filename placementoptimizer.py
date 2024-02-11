@@ -674,20 +674,21 @@ def remaps_merge(target_remaps: Dict[int, int],
         destination.update(merge_remaps)
         merge_chains(destination)
 
-    # TODO: remove once confident enough the above is correct :)
-    for new_from, new_to in destination.items():
-        if new_from == new_to:
-            raise RuntimeError(f"somewhere something went wrong: "
-                            f"we map from osd.{new_from} to osd.{new_to} in "
-                            f"{destination}")
-        while True:
-            next_to = destination.get(new_to)
-            if next_to is not None:
-                raise RuntimeError(f"something went wrong: "
-                                   f"there's still transitive remaps left for {new_to}: "
-                                   f"{destination}")
-            else:
-                break
+    if False:
+        # TODO: remove once confident enough the above is correct :)
+        for new_from, new_to in destination.items():
+            if new_from == new_to:
+                raise RuntimeError(f"somewhere something went wrong: "
+                                f"we map from osd.{new_from} to osd.{new_to} in "
+                                f"{destination}")
+            while True:
+                next_to = destination.get(new_to)
+                if next_to is not None:
+                    raise RuntimeError(f"something went wrong: "
+                                    f"there's still transitive remaps left for {new_to}: "
+                                    f"{destination}")
+                else:
+                    break
 
 
     return destination
@@ -3772,6 +3773,21 @@ class PGMappings:
 
         return variances
 
+    def get_remaps_shardsize_count(self):
+        """
+        return (size_sum, count) of all calculated movements
+        """
+        move_sum = 0
+        move_count = 0
+        for pgid, moves in self.remaps.items():
+            moves = remaps_merge(moves)
+            count = len(moves)
+            move_count += count
+            move_sum += count * self.cluster.get_pg_shardsize(pgid)
+
+        return move_sum, move_count
+
+
     def get_upmaps(self):
         """
         get all applied mappings for generating movement instructions.
@@ -4601,8 +4617,7 @@ def balance(args, cluster):
 
     # number of found remaps
     found_remap_count = 0
-    # size of found remaps
-    found_remap_size_sum = 0
+
     force_finish = False
     found_remap = False
 
@@ -4864,8 +4879,6 @@ def balance(args, cluster):
 
                     found_remap = True
                     found_remap_count += 1
-                    # TODO: calculate this though the PGMappings remaps
-                    found_remap_size_sum += move_pg_shardsize
                     break
 
                 if not found_remap:
@@ -4880,6 +4893,8 @@ def balance(args, cluster):
             # end of pg loop
         # end of from-loop
 
+    move_size, move_count = pg_mappings.get_remaps_shardsize_count()
+
     # generation performance
     if args.save_timings:
         import socket
@@ -4891,6 +4906,10 @@ def balance(args, cluster):
                 "cpuname": platform.processor(),
                 "fsid": cluster.fsid,
                 "argv": sys.argv,
+                "max_steps": args.max_pg_moves,
+                "move_count": move_count,
+                "move_steps": found_remap_count,
+                "move_size": move_size,
                 "timings": move_calc_times,
             }, timingfd, indent=4)
 
@@ -4899,8 +4918,8 @@ def balance(args, cluster):
 
     # show results!
     logging.info(80*"-")
-    logging.info(f"generated {found_remap_count} remaps.")
-    logging.info(f"total movement size: {pformatsize(found_remap_size_sum)}.")
+    logging.info("generated %s remaps in %s steps.", move_count, found_remap_count)
+    logging.info("total movement size: %s", pformatsize(move_size))
     logging.info(80*"-")
 
     init_analyzer.log_compare_with(analyzer)

@@ -1685,14 +1685,14 @@ class ClusterState:
         logging.warning(f"cluster state exported as osdmap to {output_file}")
 
 
-    @lru_cache(maxsize=2**20)
+    @lru_cache(maxsize=None)
     def pg_is_ec(self, pg):
         pool_id = pool_from_pg(pg)
         pool = self.pools[pool_id]
         return pool["repl_type"] == "ec"
 
 
-    @lru_cache(maxsize=2**20)
+    @lru_cache(maxsize=None)
     def get_pg_shardsize(self, pgid):
         pg_stats = self.pgs[pgid]['stat_sum']
         shard_size = pg_stats['num_bytes']
@@ -2277,7 +2277,7 @@ class ClusterState:
 
         del bucket_info
 
-    @lru_cache(maxsize=2 ** 14)
+    @lru_cache(maxsize=None)
     def candidates_for_root(self, root_name):
         """
         get the all osds where a crush rule could place shards.
@@ -2302,7 +2302,7 @@ class ClusterState:
 
         return ret
 
-    @lru_cache(maxsize=2 ** 14)
+    @lru_cache(maxsize=None)
     def candidates_for_pool(self, poolid):
         """
         get all osd candidates for a given pool (due to its crush rule).
@@ -2340,7 +2340,7 @@ class ClusterState:
         return osd_weights
 
 
-    @lru_cache(maxsize=2 ** 14)
+    @lru_cache(maxsize=None)
     def trace_crush_root(self, osdid, root_name):
         """
         in the given root, trace back all items from the osd up to the root
@@ -2420,7 +2420,7 @@ class ClusterState:
 
         return size * weight
 
-    @lru_cache(maxsize=2**20)
+    @lru_cache(maxsize=None)
     def get_osd_size(self, osdid: int, adjust_full_ratio: bool):
         """
         return the osd size in bytes, depending on the size determination variant.
@@ -3501,7 +3501,7 @@ class PGMappings:
         """
         return {osdid: self.get_osd_usage(osdid) for osdid in self.osd_candidates}
 
-    @lru_cache(maxsize=1)
+    @lru_cache(maxsize=None)
     def get_class_osd_usages(self):
         """
         calculate {crushclass -> {osdid -> usage percent}}
@@ -3691,7 +3691,7 @@ class PGMappings:
                                    reverse=False):
             yield osdid, usage
 
-    @lru_cache(maxsize=2**20)
+    @lru_cache(maxsize=None)
     def get_osd_usage_size(self, osdid, add_size=0, pgstate=PGState.UP):
         """
         returns the occupied space on an osd.
@@ -3744,7 +3744,7 @@ class PGMappings:
 
         return used
 
-    @lru_cache(maxsize=2**20)
+    @lru_cache(maxsize=None)
     def get_osd_usage(self, osdid, add_size=0):
         """
         returns the occupied OSD space in percent.
@@ -3858,7 +3858,7 @@ class PGMappings:
         self._upmap_items[pgid] = ret
         return ret
 
-    @lru_cache(maxsize=2**16)
+    @lru_cache(maxsize=None)
     def get_pool_max_avail_weight(self, poolid,
                                   pgstate: PGState = PGState.UP,
                                   negative_ok: bool = False):
@@ -3921,7 +3921,7 @@ class PGMappings:
 
         return min_avail, limiting_osd
 
-    @lru_cache(maxsize=2**16)
+    @lru_cache(maxsize=None)
     def get_pool_max_avail_limited(self, poolid,
                                    pgstate: PGState = PGState.UP,
                                    negative_ok: bool = False,

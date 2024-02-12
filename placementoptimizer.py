@@ -43,9 +43,6 @@ def parse_args():
                      help="decrease program verbosity")
     cli.add_argument("--profile", action="store_true",
                      help=("activate the performance profiler for the balancer itself"))
-    cli.add_argument('--osdsize', choices=['device', 'weighted', 'crush'], default="crush",
-                     help=("what parameter to take for determining the osd size. default: %(default)s. "
-                           "device=device_size, weighted=devsize*weight, crush=crushweight*weight"))
 
     sp = cli.add_subparsers(dest='mode')
     sp.required = True
@@ -53,6 +50,11 @@ def parse_args():
     ### parsers used in subcommands
     statep = argparse.ArgumentParser(add_help=False)
     statep.add_argument("--state", "-s", help="load cluster state from this jsonfile")
+
+    osdsizep = argparse.ArgumentParser(add_help=False)
+    osdsizep.add_argument('--osdsize', choices=['device', 'weighted', 'crush'], default="crush",
+                          help=("what parameter to take for determining the osd size. default: %(default)s. "
+                                "device=device_size, weighted=devsize*weight, crush=crushweight*weight"))
 
     # upmap item filtering
     upmapignorep = argparse.ArgumentParser(add_help=False)
@@ -88,7 +90,7 @@ def parse_args():
     gathersp = sp.add_parser('gather', help="only gather cluster information, i.e. generate a state file")
     gathersp.add_argument("output_file", help="file to store cluster balancing information to")
 
-    showsp = sp.add_parser('show', parents=[statep, upmapp, predictionp, usedestimatep, savemappingp],
+    showsp = sp.add_parser('show', parents=[statep, upmapp, predictionp, osdsizep, usedestimatep, savemappingp],
                            help=("show cluster properties like free pool space or OSD utilizations. "
                                  "it shows all info for the 'acting' state by default. "
                                  "use '--pgstate up' to look into the future and print how it will look after all movements are done."))
@@ -121,14 +123,14 @@ def parse_args():
     showsp.add_argument('--save-upmap-progress',
                         help="filename to store cluster stats after each after each upmap change")
 
-    remappsp = sp.add_parser('showremapped', parents=[statep],
+    remappsp = sp.add_parser('showremapped', parents=[statep, osdsizep],
                              help="show current PG remaps and their progress")
     remappsp.add_argument('--by-osd', action='store_true',
                         help="group the results by osd")
     remappsp.add_argument('--osds',
                         help="only look at these osds when using --by-osd, comma separated")
 
-    balancep = sp.add_parser('balance', parents=[statep, upmapp, usedestimatep, savemappingp],
+    balancep = sp.add_parser('balance', parents=[statep, upmapp, osdsizep, usedestimatep, savemappingp],
                              help="distribute PGs for better capacity and performance in your cluster")
     balancep.add_argument('--output', '-o', default="-",
                           help="output filename for resulting movement instructions. default stdout.")
@@ -175,7 +177,7 @@ def parse_args():
     balancep.add_argument('--save-timings',
                           help="filename to save timing information for each generated move")
 
-    pooldiffp = sp.add_parser('poolosddiff', parents=[statep])
+    pooldiffp = sp.add_parser('poolosddiff', parents=[statep, osdsizep])
     pooldiffp.add_argument('--pgstate', choices=['up', 'acting'], default="acting",
                            help="what pg set to take, up or acting (default acting).")
     pooldiffp.add_argument('pool1',
@@ -183,7 +185,7 @@ def parse_args():
     pooldiffp.add_argument('pool2',
                            help="compare to this pool which osds are involved")
 
-    sp.add_parser('repairstats', parents=[statep],
+    sp.add_parser('repairstats', parents=[statep, osdsizep],
                   help="which OSDs repaired their stored data?")
 
     testp = sp.add_parser('test', help="test internal stuff")
@@ -194,7 +196,7 @@ def parse_args():
     osdmapsp = osdmapp.add_subparsers(dest='osdmapmode')
     osdmapsp.required = True
 
-    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep, upmapignorep], help="create osdmap files")
+    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep, osdsizep, upmapignorep], help="create osdmap files")
     osdmapexportsp.add_argument("output_file", help="osdmap filename to save to")
 
     args = cli.parse_args()
@@ -4980,6 +4982,7 @@ def show(args, cluster):
             mappings.save_mappings(args.save_mappings)
 
     if args.format == 'plain':
+        print(f"cluster {'up' if pgstate == PGState.UP else 'acting'} state")
         maxpoolnamelen = cluster.max_poolname_len
 
         maxcrushclasslen = 0
@@ -5105,7 +5108,7 @@ def show(args, cluster):
             for osdid, props in cluster.osds.items():
                 hostname = props.get('host_name', '?')
                 crushclass = props['crush_class']
-                devsize = cluster.get_osd_size(osdid, adjust_full_ratio=False)
+                devsize = cluster.osds[osdid]['device_size']
 
                 if args.only_crushclass:
                     if crushclass != args.only_crushclass:

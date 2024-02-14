@@ -196,7 +196,7 @@ def parse_args():
     osdmapsp = osdmapp.add_subparsers(dest='osdmapmode')
     osdmapsp.required = True
 
-    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep, osdsizep, upmapignorep], help="create osdmap files")
+    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep, upmapignorep], help="create osdmap files")
     osdmapexportsp.add_argument("output_file", help="osdmap filename to save to")
 
     args = cli.parse_args()
@@ -1235,6 +1235,8 @@ class ClusterState:
 
         # which crush device classes are present?
         # this is kind of a hack since the real IDs never show up in a json dump...
+        # if we encounter new classes in crush that have no osds, we add another id in here.
+        # (below when getting the id for a class name)
         crush_class_ids = dict()
         for idx, crush_class in enumerate(self.state["crush_class_osds"].keys()):
             crush_class_ids[crush_class] = idx
@@ -1265,7 +1267,12 @@ class ClusterState:
             bucket_name = bucket["name"]
             if "~" in bucket_name:
                 base_bucket_name, class_name = bucket_name.split("~")
-                class_id = crush_class_ids[class_name]
+                class_id = crush_class_ids.get(class_name)
+                if class_id is None:
+                    # this is a class that has no osds, so we assign it a new id...
+                    class_id = len(crush_class_ids)
+                    crush_class_ids[class_name] = class_id
+
                 buckets_with_class[bucket_id] = class_id
 
                 # store what base bucket this shadow bucket is associated to.
@@ -5421,6 +5428,10 @@ def main():
         state.dump(args.output_file)
 
     else:
+        if args.mode == "osdmap":
+            # so that arg doesn't have to be in the osdmap argparser...
+            args.osdsize = "device"
+
         if args.osdsize == "device":
             osdsize_method = OSDSizeMethod.DEVICE
         elif args.osdsize == "weighted":

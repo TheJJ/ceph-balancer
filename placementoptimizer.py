@@ -1282,12 +1282,6 @@ class ClusterState:
         # the dump loops for (i=-1, i > -max_buckets-1, i--)
         # and dumps id=i
         max_buckets = -min_bucket_id
-        # xxx dirty hack: my cluster's osdmap has 256 max_buckets although only -174 is used.
-        # but to equalize the output, lets force it... can probably be removed,
-        # but it doesn't hurt, we just allocate nonexistent bucket memory,
-        # which is used when buckets are created.
-        if max_buckets == 174:
-            max_buckets = 256
 
         # max_buckets: s32
         writeb(struct.pack('<i', max_buckets), 'crush_max_buckets')

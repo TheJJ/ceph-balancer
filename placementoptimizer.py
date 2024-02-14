@@ -2948,7 +2948,7 @@ class PGMoveChecker:
 
         # we should have processed exactly pool-size many devices
         assert devices_chosen == self.pool_size, f"devices_chosen={devices_chosen} != poolsize={self.pool_size}"
-        assert devices_chosen == len(constraining_traces) + pg_missing_up_osds
+        assert devices_chosen == len(constraining_traces) + pg_missing_up_osds, f"not enough traces collected for {self.pg} on {self.pg_osds}"
         # for each rule step there should be a tree depth entry
         assert len(rule_tree_depth) == rule_step
         # for each rule step, we should have registered item usages
@@ -3163,15 +3163,24 @@ class PGMappings:
         self.enable_simulation = need_simulation
         if add_upmaps or ignore_cluster_upmaps or analyzer is not None:
             self.enable_simulation = True
-        if not self.enable_simulation:
-            return
 
-        # new simulated movements by apply_remap
+        # un-do all present upmap items in the cluster
+        self.ignore_cluster_upmaps = ignore_cluster_upmaps
+
+        # create new upmap items to un-do existing upmap items
+        # -> creates movements so a cluster would become upmap-free
+        self.emit_ignored_upmaps = emit_ignored_upmaps
+
+        # movements we did by apply_remap
         # pg->{osd_from: osd_to, ...}
-        self.remaps = defaultdict(dict)
-        # combined version of self.remaps and cluster.upmap_items
+        self._remaps = defaultdict(dict)
+        # combined version of self._remaps and cluster.upmap_items
         # caches the merged remaps
         self._upmap_items = defaultdict(dict)
+
+        ## things only needed for simulation
+        if not self.enable_simulation:
+            return
 
         # collect crushclasses from all enabled pools
         self._enabled_crushclasses = cluster.crushclass_osds.keys()
@@ -3249,8 +3258,6 @@ class PGMappings:
         # which movements did we un-do: pgid->{from: to}, ...
         # (i.e. we applied the opposite)
         self.reverted_upmaps = defaultdict(dict)
-        self.ignore_cluster_upmaps = ignore_cluster_upmaps
-        self.emit_ignored_upmaps = emit_ignored_upmaps
 
         if emit_ignored_upmaps and not ignore_cluster_upmaps:
             raise RuntimeError('when emitting ignored upmaps, upmap ignoring must be enabled')
@@ -3262,7 +3269,7 @@ class PGMappings:
                     self.init_analyzer.analyze(self)
 
             # revert existing upmaps in the mappings and size estimation
-            self.revert_upmaps(emit_ignored_upmaps)
+            self.revert_upmaps(emit_ignored_upmaps, skip_failures=True)
 
         if not emit_ignored_upmaps and self.init_analyzer is not None:
             # ignored upmaps are not emitted -> analyze after the reverts were done
@@ -3275,7 +3282,7 @@ class PGMappings:
             # add custom movements
             self.apply_file_upmaps(add_upmaps)
 
-    def revert_upmaps(self, emit: bool = False):
+    def revert_upmaps(self, emit: bool = False, skip_failures: bool = False):
         """
         un-do all adjustments from the default crush-mapping state.
         """
@@ -3290,23 +3297,26 @@ class PGMappings:
         move_amount = 0
         for pgid, pg_upmaps in self.cluster.upmap_items.items():
             for osd_from, osd_to in pg_upmaps.items():
-                logging.debug(strlazy(lambda: f"move pg {pgid} from osd.{osd_to}->osd.{osd_from} to revert{' and emit' if emit else ''} upmap"))
-                move_ok = movement_applier(pgid, osd_to, osd_from)
+                move_size = self.cluster.get_pg_shardsize(pgid)
+                logging.debug(strlazy(lambda: (f"move pg {pgid} from osd.{osd_to}->osd.{osd_from} "
+                                               f"(size {pformatsize(move_size)}) to revert{' and emit' if emit else ''} upmap")))
+                move_ok, msg = movement_applier(pgid, osd_to, osd_from)
                 if not move_ok:
-                    raise RuntimeError(
-                        f'failed reverting move of {pgid} from osd.{osd_to} to osd.{osd_from}. '
-                        'this would be due to an internal inconsistency:\n'
-                        f'the cluster upmap items indicate the pg is on osd.{osd_to}, '
-                        f"but PGMappings thinks it's not. \n"
+                    info = lambda: (
+                        f'failed reverting move of {pgid} from osd.{osd_to} to osd.{osd_from}: {msg}\n'
                         f"pg_upmaps[{pgid}]  = {pg_upmaps}\n"
                         f"cluster[{pgid}]    = {self.cluster.pgs[pgid]['up']!r}\n"
                         f"pgmappings[{pgid}] = {self.get_mapping(pgid)!r}\n"
                     )
+                    if skip_failures:
+                        logging.warning(strlazy(info))
+                    else:
+                        raise RuntimeError(info())
 
                 self.reverted_upmaps[pgid][osd_from] = osd_to
 
                 move_count += 1
-                move_amount += self.cluster.get_pg_shardsize(pgid)
+                move_amount += move_size
 
         logging.info(strlazy(lambda: f"reverted {move_count} moves ({pformatsize(move_amount, 2)})"))
 
@@ -3387,22 +3397,22 @@ class PGMappings:
                         else:
                             break
 
-                    move_ok = self.apply_remap(pgid, osd_from, osd_to)
+                    move_ok, msg = self.apply_remap(pgid, osd_from, osd_to)
                     if move_ok:
                         move_count += 1
-                        move_amount += self.cluster.get_pg_shardsize(pgid)
+                        move_size = self.cluster.get_pg_shardsize(pgid)
+                        move_amount += move_size
                         logging.debug(
-                            strlazy(lambda: (f"move pg={pgid} from {osd_from}->{osd_to} "
+                            strlazy(lambda: (f"move pg={pgid} (size {pformatsize(move_size)}) from {osd_from}->{osd_to} "
                                              f"now mapped to: {self.get_mapping(pgid)}"))
                         )
                     else:
                         logging.warning(
-                            strlazy(lambda: (f"skipped moving pg={pgid} from {osd_from}->{osd_to} "
-                                             f"since it's not mapped on osd.{osd_from}\n"
+                            strlazy(lambda: (f"skipped moving pg={pgid} from {osd_from}->{osd_to}: {msg}\n"
                                              f"currently mapped to: {self.get_mapping(pgid)}\n"
                                              f"cluster mapping: {self.cluster.pg_osds_up[pgid]}\n"
                                              f"cluster upmaps for pg={pgid}: {cluster_upmaps}\n"
-                                             f"recorded remaps for pg={pgid}: {self.remaps[pgid]}\n"
+                                             f"recorded remaps for pg={pgid}: {self._remaps[pgid]}\n"
                                              f"reverted upmaps for pg={pgid}: {reverted_upmaps}")))
 
             logging.info(strlazy(lambda: f"applied {move_count} moves from file ({pformatsize(move_amount, 2)})"))
@@ -3420,6 +3430,12 @@ class PGMappings:
             for pgid, uposds in sorted(self.pg_mappings.items()):
                 outfd.write(f"{pgid: <10} {uposds}\n")
 
+            outfd.write("upmaps active:\n")
+            for pgid, upmaps in sorted(self.get_upmaps(all_pgs=True).items()):
+                if not upmaps:
+                    continue
+                outfd.write(f"{pgid: <10} {upmaps}\n")
+
 
     def _move_pg(self, pgid, osd_from, osd_to) -> bool:
         """
@@ -3427,24 +3443,27 @@ class PGMappings:
         tracked sizes are estimated, but this is not recorded as a upmap-movement.
 
         you should probably use apply_remap to record this movement in the upmap list!
+        this function does not record the movement in the upmap adjustment list
+        (so one can revert upmaps without emitting that).
         """
 
-        if pgid not in self.osd_pgs_up[osd_from]:
-            return False
-
-        self.osd_pgs_up[osd_from].remove(pgid)
-        self.osd_pgs_up[osd_to].add(pgid)
-
         pg_mapping = self.pg_mappings[pgid]
-        did_remap = False
+
+        if pgid not in self.osd_pgs_up[osd_from]:
+            return False, f"move {pgid} on {pg_mapping} doesn't have source osd.{osd_from}"
+
+        if osd_to in pg_mapping:
+            return False, f"move {pgid} on {pg_mapping} from osd.{osd_from}->osd.{osd_to} with target already used"
+
         for i in range(len(pg_mapping)):
             if pg_mapping[i] == osd_from:
                 pg_mapping[i] = osd_to
-                did_remap = True
                 break
+        else:
+            raise RuntimeError(f"osd_from={osd_from} not in {pg_mapping}")
 
-        if not did_remap:
-            raise RuntimeError(f"did not find osd {osd_from} in pg {pgid} mapping")
+        self.osd_pgs_up[osd_from].remove(pgid)
+        self.osd_pgs_up[osd_to].add(pgid)
 
         # adjust the tracked sizes
         shard_size = self.cluster.get_pg_shardsize(pgid)
@@ -3464,31 +3483,31 @@ class PGMappings:
         self.get_pool_max_avail_limited.cache_clear()
         self.get_pool_max_avail_weight.cache_clear()
 
-        return True
+        return True, ""
 
     def apply_remap(self, pgid: str,
                     osd_from: int, osd_to: int,
                     revert: bool = False) -> bool:
         """
         simulate a remap pg from one osd to another.
-        this updates the generated upmap mappings.
+        this updates the emitted upmap mappings.
         """
 
         # transfer between osds
-        move_ok = self._move_pg(pgid, osd_from, osd_to)
+        move_ok, msg = self._move_pg(pgid, osd_from, osd_to)
 
         if move_ok:
             logging.debug(strlazy(lambda: f"recording move of pg={pgid} from {osd_from}->{osd_to}"))
 
             # to track, insert a new mapping pair
-            self.remaps[pgid][osd_from] = osd_to
+            self._remaps[pgid][osd_from] = osd_to
 
             if self.analyzer is not None:
                 if not revert:
                     # TODO: maybe allow reverted move analysis if requested by cli arg
                     self.analyzer.record_move(pgid, osd_from, osd_to)
 
-        return move_ok
+        return move_ok, msg
 
     def get_enabled_crushclasses(self):
         """
@@ -3788,7 +3807,7 @@ class PGMappings:
         """
         move_sum = 0
         move_count = 0
-        for pgid, moves in self.remaps.items():
+        for pgid, moves in self._remaps.items():
             moves = remaps_merge(moves)
             count = len(moves)
             move_count += count
@@ -3797,34 +3816,41 @@ class PGMappings:
         return move_sum, move_count
 
 
-    def get_upmaps(self):
+    def get_upmaps(self, all_pgs=False):
         """
         get all applied mappings for generating movement instructions.
+        all_pgs: True - return for all pgs, False - return for balancing-adjusted pgs only.
         return {pgid -> {map_from: map_to, ...}}
         """
 
         upmap_results = dict()
 
+        if all_pgs:
+            pgs = self.pg_mappings.keys()
+        else:
+            pgs = self._remaps.keys()
+
         # only look at newly adjusted pgs
-        for pgid in self.remaps.keys():
+        for pgid in pgs:
             upmap_results[pgid] = self.get_pg_upmap(pgid)
 
         return upmap_results
 
-    def get_upmap_items_commands(self):
+    def get_upmap_items_commands(self, all_pgs=False):
         """
+        all_pgs: if true, return for all known pgs, else return for adjusted pgs only.
         return ceph upmap_items instructions
         """
-        for pgid, upmaps in self.get_upmaps().items():
+        for pgid, upmaps in self.get_upmaps(all_pgs).items():
             if upmaps:
                 upmap_str = " ".join([f"{osd_from} {osd_to}" for (osd_from, osd_to) in upmaps.items()])
                 yield f"ceph osd pg-upmap-items {pgid} {upmap_str}"
             else:
                 # cluster had previous upmaps for this pg
-                if len(self.get_cluster_upmaps(pgid)) > 0:
+                if len(self._get_cluster_upmaps(pgid)) > 0:
                     yield f"ceph osd rm-pg-upmap-items {pgid}"
 
-    def get_cluster_upmaps(self, pgid):
+    def _get_cluster_upmaps(self, pgid):
         # current_upmaps are is [(osdfrom, osdto), ...]
         if self.ignore_cluster_upmaps and not self.emit_ignored_upmaps:
             # since we wanted to start with a "non-upmapped" cluster,
@@ -3844,15 +3870,15 @@ class PGMappings:
             return cached
 
         # this is already redundancy-filtered
-        previous_remaps = self.get_cluster_upmaps(pgid)
+        previous_remaps = self._get_cluster_upmaps(pgid)
         # this may not be redundancy-filtered
-        new_remaps = self.remaps.get(pgid, {})
+        new_remaps = self._remaps.get(pgid, {})
 
         if not new_remaps and not previous_remaps:
             return {}
 
         # merge new upmaps
-        # this actually modifies the self.remaps, intentionally.
+        # this actually modifies the self._remaps, intentionally.
         new_remaps = remaps_merge(new_remaps, in_place=True)
 
         if not previous_remaps:
@@ -4860,10 +4886,9 @@ def balance(args, cluster):
                         raise RuntimeError(f"prev_mapping={prev_pg_mapping} doesn't contain osd_from={osd_from}")
 
                     # record the mapping
-                    move_ok = pg_mappings.apply_remap(move_pg, osd_from, osd_to)
+                    move_ok, msg = pg_mappings.apply_remap(move_pg, osd_from, osd_to)
                     if not move_ok:
-                        raise RuntimeError(f'failed to move pg {move_pg} from osd.{osd_from} - '
-                                           f"the simulator thinks it's not mapped there.")
+                        raise RuntimeError(f'failed to move pg {move_pg} from osd.{osd_from}: {msg}')
 
                     if args.save_timings:
                         analysis_start = time.time()

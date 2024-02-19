@@ -71,7 +71,7 @@ def parse_args():
 
     predictionp = argparse.ArgumentParser(add_help=False)
     predictionp.add_argument('--avail-prediction', choices=['weight', 'limiting'], default='limiting',
-                             help=("algorithm to use for available pool size prediction.\n"
+                             help=("algorithm to use for available pool size prediction. default: %(default)s\n"
                                    "weight: use ceph's original prediction based on crush weights. "
                                    "it's unfortunately wrong for multi-take crush rules, "
                                    "and it doesn't respect the current pg placements at all.\n"
@@ -4367,11 +4367,11 @@ class MappingAnalyzer:
                 )
 
     def _update_stats(self, modified_osds=tuple()):
-        # TODO: use modified_osds for more efficient update...
-        # if it's not the limit_osd, a pool didn't gain space.
+        # TODO: use modified_osds for more efficient update?
+        # if it's not the limit_osd, a pool didn't gain space, but it may have lost space.
 
         if self.pg_mappings is None:
-            raise RuntimeError("analysis missing")
+            raise RuntimeError("analysis missing pg mappings")
 
         cluster = self.pg_mappings.cluster
 

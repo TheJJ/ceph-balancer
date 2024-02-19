@@ -142,6 +142,9 @@ def parse_args():
                           help='comma separated list of pool ids to consider for balancing')
     balancep.add_argument('--only-crushclass',
                           help='comma separated list of crush classes to balance')
+    balancep.add_argument('--source-osds',
+                          help=("only consider these osds as movement source, separated by ',' or ' '. "
+                                'to balance just one bucket, use "$(ceph osd ls-tree bucketname)"'))
     balancep.add_argument('--pg-choice', choices=['largest', 'median', 'auto'],
                           default='largest',
                           help=('method to select a PG move candidate on a OSD based on its size. '
@@ -157,13 +160,13 @@ def parse_args():
                           default='none',
                           help=("don't consider balancing by placement group count on an source/destination/both OSD. "
                                 "if you set this, the ceph's built-in balancer and this one will have a fight."))
-    balancep.add_argument('--target-usage-constraint', choices=['usage', 'nolimit'],
-                          default="usage",
-                          help=("how to ensure a movement target OSD won't be worse after a move. default: %(default)s. "
-                                "usage=make sure the target device is less used than the source after a move. "
-                                "nolimit=make sure the target device does not become the pool's size limit after a move"))
-    balancep.add_argument('--allow-target-usage-grow', action="store_true",
-                          help=("allow a destination OSD to become fuller than the source OSD of a movement is."))
+    balancep.add_argument('--ignore-pgsize-toolarge', action="store_true",
+                          help=("don't pre-filter PGs to rule out those that will for sure not gain any space "
+                                "- the target OSD would become fuller than the source OSD of a movement is."))
+    balancep.add_argument('--ignore-target-usage', action="store_true",
+                          help=("don't ensure the target device is less used than the source after a move. "))
+    balancep.add_argument('--ensure-target-limits', action="store_true",
+                          help=("make sure the target device does not become the pool's size limit after a move"))
     balancep.add_argument('--ensure-optimal-moves', action='store_true',
                           help='make sure that only movements which win full shardsizes are done')
     balancep.add_argument('--ensure-variance-decrease', action='store_true',
@@ -171,9 +174,6 @@ def parse_args():
     balancep.add_argument('--max-move-attempts', type=int, default=2,
                           help=("current source osd can't be emptied more, "
                                 "try this many more other osds candidates to empty. default: %(default)s"))
-    balancep.add_argument('--source-osds',
-                          help=("only consider these osds as movement source, separated by ',' or ' '. "
-                                'to balance just one bucket, use "$(ceph osd ls-tree bucketname)"'))
     balancep.add_argument('--save-timings',
                           help="filename to save timing information for each generated move")
 
@@ -278,14 +278,6 @@ class OSDFromChoiceMethod(Enum):
     FULLEST = 1  # use the fullest osd
     LIMITING = 2  # use devices limiting the pool available space
     ALTERNATE = 3 # alternate between limiting and fullest devices
-
-
-class OSDToConstraintMethod(Enum):
-    """
-    how to verify a target osd doesn't make things worse.
-    """
-    USAGE = 1  # ensure the target OSD will be less full after a move than the source OSD
-    NOLIMIT = 2  # ensure the target OSD will not be the new limit of the moved pool
 
 
 class PGChoiceMethod(Enum):
@@ -4444,10 +4436,10 @@ class MappingAnalyzer:
             logging.info(f"  {crushclass: >15}: {variance:.3f}")
 
         logging.debug("usable space, caused by osd")
-        logging.debug(strlazy(lambda: f"  {'pool'.ljust(self.max_poolname_len)} {'size': >8} {'osd': >6}"))
+        logging.debug(strlazy(lambda: f"  {'pool'.ljust(self.max_poolname_len)} {'avail': >8} {'limitosd': >8}"))
         for poolname, avail, limit_osd in self.pool_avail.values():
             poolname = poolname.ljust(self.max_poolname_len)
-            logging.debug(strlazy(lambda: f"  {poolname} {pformatsize(avail, 2): >8} {limit_osd: >6}"))
+            logging.debug(strlazy(lambda: f"  {poolname} {pformatsize(avail, 2): >8} {limit_osd: >8}"))
 
         logging.info("OSD fill rate by crushclass:")
         for crushclass, usage in self.crushclass_usages.items():
@@ -4571,13 +4563,6 @@ def balance(args, cluster):
     else:
         raise RuntimeError(f"unknown osd usage rate method {args.osdused!r}")
 
-    if args.target_usage_constraint == "usage":
-        target_usage_constraint = OSDToConstraintMethod.USAGE
-    elif args.target_usage_constraint == "nolimit":
-        target_usage_constraint = OSDToConstraintMethod.NOLIMIT
-    else:
-        raise RuntimeError(f"unknown osd target usage constraint {args.target_usage_constraint!r}")
-
     if args.pg_choice == "largest":
         pg_choice_method = PGChoiceMethod.LARGEST
     elif args.pg_choice == "median":
@@ -4607,7 +4592,8 @@ def balance(args, cluster):
     ignore_ideal_pgcounts_src = args.ignore_ideal_pgcounts in ('source', 'all')
     ignore_ideal_pgcounts_dest = args.ignore_ideal_pgcounts in ('destination', 'all')
 
-    allow_target_usage_grow = args.allow_target_usage_grow
+    target_constrain_usage = not args.ignore_target_usage
+    target_constrain_limit = args.ensure_target_limits
 
     # movement change tracking and logging
     analyzer = MappingAnalyzer()
@@ -4757,7 +4743,7 @@ def balance(args, cluster):
                                   " pool=%s count %s, ideal %s",
                                   move_pg, osd_from, pg_pool, from_osd_pg_count[pg_pool], from_osd_pg_count_ideal)
 
-                if not allow_target_usage_grow:
+                if not args.ignore_pgsize_toolarge:
                     # pre-filter PGs to rule out those that will for sure not gain any space
 
                     pg_small_enough = False
@@ -4773,7 +4759,7 @@ def balance(args, cluster):
                     if not pg_small_enough:
                         # the pg is so big, it would increase the fill % of all osd_tos more than osd_from is
                         # so we would increase the variance.
-                        logging.debug("  BAD => skipping pg %s, since its not small enough", move_pg)
+                        logging.debug("  BAD => skipping pg %s, since it doesn't fit on any target osd candidate", move_pg)
 
                         # don't try other pgs from this pool (they would also bee to big)
                         from_osd_satisfied_pool_pgsize.add(pg_pool)
@@ -4820,13 +4806,7 @@ def balance(args, cluster):
                                                   f" OK => osd.{osd_to} doesn't have pool={pg_pool} yet "
                                                   f"({to_osd_pg_count[pg_pool]} < {to_osd_pg_count_ideal})"))
 
-                    if target_usage_constraint == OSDToConstraintMethod.NOLIMIT:
-                        _, new_limiting_osd = pg_mappings.get_pool_max_avail_limited(pg_pool, add_size=(osd_to, move_pg_shardsize))
-                        if new_limiting_osd == osd_to:
-                            logging.debug(" BAD => osd.%s would become the new limiting osd", osd_to)
-                            continue
-
-                    elif target_usage_constraint == OSDToConstraintMethod.USAGE:
+                    if target_constrain_usage:
                         # how full will the target be
                         target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
                         source_usage = pg_mappings.get_osd_usage(osd_from)
@@ -4840,8 +4820,12 @@ def balance(args, cluster):
                                         f"osd.{osd_to} would have {target_predicted_usage:.3f}%, "
                                         f"and source's osd.{osd_from} currently is {source_usage:.3f}%"))
                             continue
-                    else:
-                        raise Exception(f"unknown target usage constraint {target_usage_constraint}")
+
+                    if target_constrain_limit:
+                        _, new_limiting_osd = pg_mappings.get_pool_max_avail_limited(pg_pool, add_size=(osd_to, move_pg_shardsize))
+                        if new_limiting_osd == osd_to:
+                            logging.debug(" BAD => osd.%s would become the new limiting osd", osd_to)
+                            continue
 
                     # check if the movement size is nice
                     if args.ensure_optimal_moves:

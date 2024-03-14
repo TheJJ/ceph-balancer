@@ -1989,9 +1989,9 @@ class ClusterState:
                 'pg_count_up': pg_count_up,
                 'pg_count_acting': pg_count_acting,
                 'pg_num_up': len(pgs_up),
-                'pgs_up': pgs_up,
+                'pgs_up': list(pgs_up),
                 'pg_num_acting': len(pgs_acting),
-                'pgs_acting': pgs_acting,
+                'pgs_acting': list(pgs_acting),
                 'objs_up': osd_objs_up,
                 'objs_acting': osd_objs_acting,
             })
@@ -2053,7 +2053,10 @@ class ClusterState:
 
                 # calculated by weighting osd metadata sizes by pg object counts
                 pg_objects = self.pgs[pgid]['stat_sum']['num_objects']
-                metadata_estimate = int(meta_amount * pg_objects / osd_objs_acting)
+                if osd_objs_acting > 0:
+                    metadata_estimate = int(meta_amount * pg_objects / osd_objs_acting)
+                else:
+                    metadata_estimate = 0
 
                 estimates = self.pgs[pgid]["metadata_estimates"]
                 estimates[osdid] = metadata_estimate
@@ -4771,7 +4774,7 @@ def balance(args, cluster):
                 variance_before = try_pg_move.get_placement_variance(osd_from)
 
                 for osd_to, osd_to_usage in pg_mappings.get_osd_target_candidates(osd_to_candidates, move_pg):
-                    if not osd_to in osd_to_candidates:
+                    if osd_to not in osd_to_candidates:
                         raise RuntimeError("tried non-candidate target osd")
 
                     if osd_to == osd_from:
@@ -5487,6 +5490,7 @@ def main():
             run()
 
     return 0
+
 
 if __name__ == "__main__":
     exit(main())

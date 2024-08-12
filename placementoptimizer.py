@@ -2212,11 +2212,16 @@ class ClusterState:
 
 
         # store osd host name
-        for node in self.state["osd_df_tree_dump"]["nodes"]:
-            if node['type'] == "host":
-                for osdid in node['children']:
-                    self.osds[osdid]["host_name"] = node['name']
-
+        nodes = self.state["osd_df_tree_dump"]["nodes"]
+        def host_extend_osds(host, node):
+            for child_id in node['children']:
+                for child in [n for n in nodes if n['id'] == child_id]:
+                    if child['type'] == 'osd' and child_id in self.osds:
+                        self.osds[child_id]['host_name'] = host['name']
+                    else:
+                        host_extend_osds(host, child)
+        for host in [n for n in nodes if n['type'] == 'host']:
+            host_extend_osds(host, host)
 
         # crush infos
         for rule in self.state["crush_dump"]["rules"]:

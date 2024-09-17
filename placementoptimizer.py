@@ -2215,7 +2215,8 @@ class ClusterState:
         for node in self.state["osd_df_tree_dump"]["nodes"]:
             if node['type'] == "host":
                 for osdid in node['children']:
-                    self.osds[osdid]["host_name"] = node['name']
+                    if node['type'] == "osd":
+                        self.osds[osdid]["host_name"] = node['name']
 
 
         # crush infos

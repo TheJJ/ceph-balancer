@@ -4631,7 +4631,7 @@ def balance(args, cluster):
     # to restrict source osds
     source_osds = None
     if args.source_osds:
-        splitter = ',' if ',' in args._source_osds else None
+        splitter = ',' if ',' in args.source_osds else None
         source_osds = [int(osdid) for osdid in args.source_osds.split(splitter)]
 
     # number of found remaps

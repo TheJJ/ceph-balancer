@@ -3755,7 +3755,7 @@ class PGMappings:
 
                 # this returns the estimated up-size by adjusting for ongoing transfers
                 # (outgoing ones to be deleted, incoming ones to be completed)
-                used += self.cluster.osd_transfer_remainings[osdid]
+                used += self.cluster.osd_transfer_remainings.get(osdid, 0)
 
             elif pgstate == PGState.ACTING:
                 # used already has the correct current amount.

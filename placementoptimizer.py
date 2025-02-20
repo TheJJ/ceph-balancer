@@ -5356,9 +5356,11 @@ def showremapped(args, cluster):
                 fullness = (f"  drive={osd_d_fullness:.1f}% {osd_d_used_pp}/{osd_d_size_pp}"
                             f"  crush={osd_c_fullness:.1f}% {osd_d_used_pp}/{osd_c_size_pp}")
 
+                osdparent = cluster.osds[osdid].get('parent_bucket', "?")
             else:
                 osdname = "osd.missing"
                 fullness = ""
+                osdparent = ""
 
             sum_to = len(actions['to'])
             sum_from = len(actions['from'])
@@ -5369,7 +5371,7 @@ def showremapped(args, cluster):
             sum_data_from_pp = pformatsize(sum_data_from, 2)
             sum_data_delta_pp = pformatsize(sum_data_delta, 2)
 
-            print(f"{osdname}: {cluster.osds[osdid].get('parent_bucket')}  =>{sum_to} {sum_data_to_pp} <={sum_from} {sum_data_from_pp}"
+            print(f"{osdname}: {osdparent}  =>{sum_to} {sum_data_to_pp} <={sum_from} {sum_data_from_pp}"
                   f" (\N{Greek Capital Letter Delta}{sum_data_delta_pp}) {fullness}")
 
             for pgid, to_osd in actions["to"].items():

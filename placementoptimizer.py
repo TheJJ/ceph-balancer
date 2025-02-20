@@ -5204,10 +5204,10 @@ def show(args, cluster):
             sort_func = lambda x: x[0]
 
             if args.sort_utilization:
-                sort_func = lambda x: x[6]
+                sort_func = lambda x: x[7]
 
             if args.sort_pg_count is not None:
-                sort_func = lambda x: x[7].get(args.sort_pg_count, 0)
+                sort_func = lambda x: x[8].get(args.sort_pg_count, 0)
 
             # header:
             print()
@@ -5228,6 +5228,7 @@ def show(args, cluster):
                         pool_overview.insert(0, entry)
                     else:
                         pool_overview.append(entry)
+
                 util = "%.1f%%" % util
                 weight = "%.2f" % weight
 

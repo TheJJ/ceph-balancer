@@ -2239,13 +2239,12 @@ class ClusterState:
                     f"size={pformatsize(osd['device_size'], 3)}")))
 
 
-        # store osd host name
+        # store osd parent bucket name (host, in most cases)
         for node in self.state["osd_df_tree_dump"]["nodes"]:
-            if node['type'] == "host":
+            if node['id'] < 0:
                 for osdid in node['children']:
-                    if node['type'] == "osd":
-                        self.osds[osdid]["host_name"] = node['name']
-
+                    if osdid >= 0:
+                        self.osds[osdid]["parent_bucket"] = node['name']
 
         # crush infos
         for rule in self.state["crush_dump"]["rules"]:
@@ -5145,7 +5144,7 @@ def show(args, cluster):
             osd_entries = list()
 
             for osdid, props in cluster.osds.items():
-                hostname = props.get('host_name', '?')
+                parent_bucket = props.get('parent_bucket', '?')
                 crushclass = props['crush_class']
                 devsize = cluster.osds[osdid]['device_size']
 
@@ -5198,7 +5197,7 @@ def show(args, cluster):
 
                 class_val = crushclass.rjust(maxcrushclasslen)
 
-                osd_entries.append((osdid, hostname, class_val, devsize, weight_val, cweight, used, util, pg_num, pool_list))
+                osd_entries.append((osdid, parent_bucket, class_val, devsize, weight_val, cweight, used, util, pg_num, pool_list))
 
             # default sort by osdid
             sort_func = lambda x: x[0]
@@ -5212,7 +5211,7 @@ def show(args, cluster):
             # header:
             print()
             print(f"{'osdid': >6} {'hostname': >10} {crushclassheader} {'devsize': >7} {'weight': >6} {'cweight': >7} {'used': >7} {'util': >5} {'pg_num': >6}  pools")
-            for osdid, hostname, crushclass, devsize, weight, cweight, used, util, pg_num, pool_pgs in sorted(osd_entries, key=sort_func):
+            for osdid, parent_bucket, crushclass, devsize, weight, cweight, used, util, pg_num, pool_pgs in sorted(osd_entries, key=sort_func):
 
                 pool_overview = list()
                 for pool, count in pool_pgs.items():
@@ -5233,7 +5232,7 @@ def show(args, cluster):
                 weight = "%.2f" % weight
 
                 pool_list_str = ' '.join(pool_overview)
-                print(f"{osdid: >6} {hostname: >10} {crushclass} {pformatsize(devsize): >7} {weight: >6} {pformatsize(cweight): >7} {pformatsize(used): >7}  {util: >5} {pg_num: >6}  {pool_list_str}")
+                print(f"{osdid: >6} {parent_bucket: >10} {crushclass} {pformatsize(devsize): >7} {weight: >6} {pformatsize(cweight): >7} {pformatsize(used): >7}  {util: >5} {pg_num: >6}  {pool_list_str}")
 
     elif args.format == 'json':
 
@@ -5370,7 +5369,7 @@ def showremapped(args, cluster):
             sum_data_from_pp = pformatsize(sum_data_from, 2)
             sum_data_delta_pp = pformatsize(sum_data_delta, 2)
 
-            print(f"{osdname}: {cluster.osds[osdid]['host_name']}  =>{sum_to} {sum_data_to_pp} <={sum_from} {sum_data_from_pp}"
+            print(f"{osdname}: {cluster.osds[osdid].get('parent_bucket')}  =>{sum_to} {sum_data_to_pp} <={sum_from} {sum_data_from_pp}"
                   f" (\N{Greek Capital Letter Delta}{sum_data_delta_pp}) {fullness}")
 
             for pgid, to_osd in actions["to"].items():

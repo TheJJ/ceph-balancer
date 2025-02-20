@@ -2028,7 +2028,9 @@ class ClusterState:
 
             self.osds[osdid].update({
                 "weight": osd["weight"],
-                "crush_weight": 0,  # also in osd_df_dump ["crush_weight"], but we set it when walking the crush trees
+                # also in osd_df_dump ["crush_weight"], which crush tree is that from?
+                # we set it when walking the crush trees, and check for inconsistencies
+                "crush_weight": None,
                 "cluster_addr": osd["cluster_addr"],
                 "public_addr": osd["public_addr"],
                 "state": tuple(osd["state"]),
@@ -2285,9 +2287,13 @@ class ClusterState:
                     # json-crushweight is in 64-gbyte blocks apparently
                     size = (item["weight"] / 64) * 1024 ** 3
 
-                    self.osds[item_id].update({
-                        "crush_weight": size,
-                    })
+                    prev_size = self.osds[item_id]["crush_weight"]
+                    if prev_size is not None and prev_size != size:
+                        raise Exception(f"osd.{item_id} has different 'crush_weight' in {bucket['name']} "
+                                        "than it had in a previous bucket: "
+                                        f" was={prev_size} != {size}=now")
+
+                    self.osds[item_id]["crush_weight"] = size
 
     @lru_cache(maxsize=None)
     def get_bucket_tree(self, bucket_name: str) -> dict[int, CrushNode]:

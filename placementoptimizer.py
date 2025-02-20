@@ -7,8 +7,6 @@ Ceph balancer.
 GPLv3 or later
 """
 
-from __future__ import annotations
-
 import argparse
 import binascii
 import datetime
@@ -33,10 +31,7 @@ from functools import lru_cache
 from itertools import chain, zip_longest
 from pprint import pformat, pprint
 
-import typing
-
-if typing.TYPE_CHECKING:
-    from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple, Any, Iterator
 
 
 def parse_args():
@@ -703,7 +698,7 @@ class CrushNode:
     weight: float
     deviceclass: str | None
     parent: int | None
-    children: list[CrushNode] | None
+    children: list['CrushNode'] | None
 
 
 def bucket_fill(node_id, bucket_info: dict, parent_id=None) -> tuple[CrushNode, dict[int, CrushNode]]:

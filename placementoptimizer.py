@@ -4675,7 +4675,6 @@ def balance(args, cluster):
             source_attempts = 0
 
         found_remap = False
-        unsuccessful_pools = set()
         last_attempt = -1
 
         # try to move the biggest pg from the fullest disk to the next suiting smaller disk
@@ -4734,10 +4733,6 @@ def balance(args, cluster):
 
                 if pg_pool in from_osd_satisfied_pool_pgsize:
                     logging.debug("SKIP pg %s from osd.%s since pool=%s-pgs can't fit on any of the osd_to candidates", move_pg, osd_from, pg_pool)
-                    continue
-
-                if pg_pool in unsuccessful_pools:
-                    logging.debug("SKIP pg %s from osd.%s since pool (%s) can't be balanced more", move_pg, osd_from, pg_pool)
                     continue
 
                 move_pg_shardsize = pg_candidates.get_size(move_pg)
@@ -4918,14 +4913,6 @@ def balance(args, cluster):
                     found_remap = True
                     found_remap_count += 1
                     break
-
-                if not found_remap:
-                    # we tried all osds to place this pg,
-                    # so the shardsize is just too big
-                    # if pg_size_choice is auto, we try to avoid this PG anyway,
-                    # but if we still end up here, it means the choices for moves are really
-                    # becoming tight.
-                    unsuccessful_pools.add(pg_pool)
 
                 # end of to-loop
             # end of pg loop

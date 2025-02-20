@@ -3702,7 +3702,7 @@ class PGMappings:
 
     def get_osd_target_candidates(self,
                                   osd_candidates: Optional[dict] = None,
-                                  move_pg: Optional[str] = None):
+                                  move_pg: Optional[str] = None) -> Iterator[tuple[int, float]]:
         """
         generate target candidates to move a pg to.
 
@@ -3711,6 +3711,8 @@ class PGMappings:
 
         method: emptiest
         use the relatively emptiest osd.
+
+        returns {osdid: usage_in_percent}
         """
 
         move_pg_shardsize = 0
@@ -4833,16 +4835,15 @@ def balance(args, cluster):
 
                     if target_constrain_usage:
                         # how full will the target be
-                        target_predicted_usage = pg_mappings.get_osd_usage(osd_to, add_size=move_pg_shardsize)
                         source_usage = pg_mappings.get_osd_usage(osd_from)
 
                         # check that the destination osd won't be more full than the source osd
                         # but what if we're balanced very good already? wouldn't we allow this if the variance decreased anyway?
                         # the nolimit target usage constraint may be better suited then.
-                        if target_predicted_usage > source_usage:
+                        if osd_to_usage > source_usage:
                             logging.debug(strlazy(lambda:
                                         f" BAD target will be more full than source currently is: "
-                                        f"osd.{osd_to} would have {target_predicted_usage:.3f}%, "
+                                        f"osd.{osd_to} would have {osd_to_usage:.3f}%, "
                                         f"and source's osd.{osd_from} currently is {source_usage:.3f}%"))
                             continue
 
@@ -4857,8 +4858,8 @@ def balance(args, cluster):
                         # check if there's a target osd that will be filled less than mean of osd_to and osd_from after move
                         # predicted_target_usage < (target_usage + source_usage)/2 + limit
                         mean_usage = (pg_mappings.get_osd_usage(osd_to) + osd_from_used_percent) / 2
-                        if target_predicted_usage > mean_usage:
-                            logging.debug(f" BAD non-optimal size {move_pg} predicted={target_predicted_usage:.3f}% > mean={mean_usage:.3f}%")
+                        if osd_to_usage > mean_usage:
+                            logging.debug(f" BAD non-optimal size {move_pg} predicted={osd_to_usage:.3f}% > mean={mean_usage:.3f}%")
                             continue
 
                     if not try_pg_move.is_move_valid(osd_from, osd_to):

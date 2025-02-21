@@ -24,14 +24,13 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
 from enum import Enum
 from collections import defaultdict
 from functools import lru_cache
 from itertools import chain, zip_longest
 from pprint import pformat, pprint
 
-from typing import Optional, Dict, List, Tuple, Any, Iterator
+from typing import Optional, Dict, List, Tuple, Any, Iterator, Union
 
 
 def parse_args():
@@ -689,19 +688,26 @@ def remaps_merge(target_remaps: Dict[int, int],
 def pool_from_pg(pg):
     return int(pg.split(".")[0])
 
-
-@dataclass
+# TODO: use dataclass when we drop python3.6 support
 class CrushNode:
-    id: int
-    name: str
-    type_name: str
-    weight: float
-    deviceclass: str | None
-    parent: int | None
-    children: list['CrushNode'] | None
+    def __init__(self,
+                 id: int,
+                 name: str,
+                 type_name: str,
+                 weight: float,
+                 deviceclass: Union[str, None],
+                 parent: Union[int, None],
+                 children: Union[List['CrushNode'], None]) -> None:
+        self.id = id
+        self.name = name
+        self.type_name = type_name
+        self.weight = weight
+        self.deviceclass = deviceclass
+        self.parent = parent
+        self.children = children
 
 
-def bucket_fill(node_id, bucket_info: dict, parent_id=None) -> tuple[CrushNode, dict[int, CrushNode]]:
+def bucket_fill(node_id, bucket_info: dict, parent_id=None) -> Tuple[CrushNode, Dict[int, CrushNode]]:
     """
     returns: (tree structure of CrushNode, {id: Bucket})
     the id-mapped buckets are the same as in the tree structure.
@@ -716,7 +722,7 @@ def bucket_fill(node_id, bucket_info: dict, parent_id=None) -> tuple[CrushNode, 
     # we use it as bytes everywhere.
     size = (bucket["weight"] / 64) * 1024 ** 3
 
-    children: list[CrushNode] = list()
+    children: List[CrushNode] = list()
     this_bucket = CrushNode(
         id = node_id,
         name = bucket["name"],
@@ -727,7 +733,7 @@ def bucket_fill(node_id, bucket_info: dict, parent_id=None) -> tuple[CrushNode, 
         children = children,
     )
 
-    ids: dict[int, CrushNode] = dict()
+    ids: Dict[int, CrushNode] = dict()
     ids[node_id] = this_bucket
 
     for child_item in bucket["items"]:
@@ -765,7 +771,7 @@ class ClusterState:
 
     def __init__(self, statefile: Optional[str] = None,
                  osdsize_method: OSDSizeMethod = OSDSizeMethod.CRUSH):
-        self.state: dict[str, Any] = dict()
+        self.state: Dict[str, Any] = dict()
         self.load(statefile)
 
         self.osdsize_method = osdsize_method
@@ -2299,7 +2305,7 @@ class ClusterState:
                     self.osds[item_id]["crush_weight"] = size
 
     @lru_cache(maxsize=None)
-    def get_bucket_tree(self, bucket_name: str) -> dict[int, CrushNode]:
+    def get_bucket_tree(self, bucket_name: str) -> Dict[int, CrushNode]:
         """
         return {bucket_id: CrushNode} for the whole subtree starting at given name.
         """
@@ -2312,7 +2318,7 @@ class ClusterState:
         return id_map
 
     @lru_cache(maxsize=None)
-    def bucket_candidates(self, bucket_name: str) -> dict[int, float]:
+    def bucket_candidates(self, bucket_name: str) -> Dict[int, float]:
         """
         given a bucket name as root, get the all osds where a crush rule could place shards.
         returns {osdid: osdweight}
@@ -2333,7 +2339,7 @@ class ClusterState:
         return ret
 
     @lru_cache(maxsize=None)
-    def candidates_for_pool(self, poolid) -> dict[int, float]:
+    def candidates_for_pool(self, poolid) -> Dict[int, float]:
         """
         get all osd candidates for a given pool (due to its crush rule).
         returns {osdid: osdweight_summed_and_normalized_to_weight_sum}
@@ -2348,7 +2354,7 @@ class ClusterState:
         # {rootname -> relative_root_selection_weight}
         rootweights = rootweights_from_rule(pool_crushrule, pool_size)
         root_weight_sum = sum(rootweights.values())
-        osd_weights: dict[int, float] = defaultdict(lambda: 0.0)
+        osd_weights: Dict[int, float] = defaultdict(lambda: 0.0)
 
         crush_sum = 0.0
         for root_name, root_weight in rootweights.items():
@@ -2500,7 +2506,7 @@ class ClusterState:
         return self.pool_pg_shard_count_ideal(poolid, candidate_osds) * osd_size
 
 
-def bucket_uses_from_rule(rule, pool_size) -> tuple[dict[str, int], list[str]]:
+def bucket_uses_from_rule(rule, pool_size) -> Tuple[Dict[str, int], List[str]]:
     """
     rule: crush rule id
     pool_size: number of osds in one pg
@@ -2509,11 +2515,11 @@ def bucket_uses_from_rule(rule, pool_size) -> tuple[dict[str, int], list[str]]:
     for the given crush rule.
     """
     # bucket_name -> number of chooses for this bucket
-    bucket_usages: dict[str, int] = defaultdict(int)
-    bucket_order: list[str] = list()
+    bucket_usages: Dict[str, int] = defaultdict(int)
+    bucket_order: List[str] = list()
 
     chosen = 0
-    bucket_name: str | None = None
+    bucket_name: Union[str, None] = None
     bucket_choice_count: int = 0
 
     for step in rule["steps"]:
@@ -2651,7 +2657,7 @@ class PGMoveChecker:
             self.osd_roots[osdid] = root
 
         # root_name -> osdid candidates -> weight
-        self._move_osd_candidates: dict[str, dict[int, float]] = dict()
+        self._move_osd_candidates: Dict[str, Dict[int, float]] = dict()
         for bucket_name in bucket_uses.keys():
             self._move_osd_candidates[bucket_name] = self.cluster.bucket_candidates(bucket_name)
 
@@ -3454,7 +3460,7 @@ class PGMappings:
                 outfd.write(f"{pgid: <10} {upmaps}\n")
 
 
-    def _move_pg(self, pgid, osd_from, osd_to) -> tuple[bool, str]:
+    def _move_pg(self, pgid, osd_from, osd_to) -> Tuple[bool, str]:
         """
         simulate a remap pg from one osd to another.
         tracked sizes are estimated, but this is not recorded as a upmap-movement.
@@ -3504,7 +3510,7 @@ class PGMappings:
 
     def apply_remap(self, pgid: str,
                     osd_from: int, osd_to: int,
-                    revert: bool = False) -> tuple[bool, str]:
+                    revert: bool = False) -> Tuple[bool, str]:
         """
         simulate a remap pg from one osd to another.
         this updates the emitted upmap mappings.
@@ -3708,7 +3714,7 @@ class PGMappings:
 
     def get_osd_target_candidates(self,
                                   osd_candidates: Optional[dict] = None,
-                                  move_pg: Optional[str] = None) -> Iterator[tuple[int, float]]:
+                                  move_pg: Optional[str] = None) -> Iterator[Tuple[int, float]]:
         """
         generate target candidates to move a pg to.
 

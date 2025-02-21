@@ -2081,7 +2081,7 @@ class ClusterState:
                 else:
                     metadata_estimate = 0
 
-                estimates = self.pgs[pgid]["metadata_estimates"]
+                estimates = self.pgs[pgid]["metadata_estimates"]  # is {osdid: meta_bytes}
                 estimates[osdid] = metadata_estimate
 
                 self.pgs[pgid]["metadata_bytes"] = int(sum(estimates.values()) / len(estimates))
@@ -2114,10 +2114,10 @@ class ClusterState:
 
             # pgs that are transferred to the osd, so they will be acting soon(tm)
             for pg_incoming in (osdpgs['up'] - osdpgs['acting']):
-                shardsize = self.get_pg_shardsize(pg_incoming)
                 pginfo = self.pgs[pg_incoming]
 
                 pg_objs = pginfo["stat_sum"]["num_objects"]
+                pg_obj_copies = pginfo["stat_sum"]["num_object_copies"]
 
                 if pg_objs <= 0:
                     shardsize_already_transferred = 0
@@ -2139,12 +2139,14 @@ class ClusterState:
                     # so we can only estimate the remaining object sizes.
                     # -> utilization estimation will work best if there are no more remapped PGs!
 
-
-                    # we figure out how many shards are misplaced/degraded,
-                    # and divide these numbers to get an estimate per shard.
+                    # the pg reports how many shards are misplaced/degraded,
                     # this we can then assign to our current osdid.
-                    pg_objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
-                    pg_objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
+                    # b49a71daf51bf2fdd892cbfc033c0760cbce0464 (in v10) changed this:
+
+                    # num_objects_degraded: num_object_copies - copies in [acting] and backfilling [up] OSDs.
+                    # num_objects_misplaced: all copies on acting set OSDs not in up set - copies that have been backfilled to up set OSDs.
+                    pg_obj_copies_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
+                    pg_obj_copies_degraded = pginfo["stat_sum"]["num_objects_degraded"]
 
                     # the pginfo statistics only provide us with pg-overall statistics
                     # so we need to figure out how much of that affects the current osdid
@@ -2186,33 +2188,37 @@ class ClusterState:
                     # when there's multiple from/to osds for this pg
                     # we can't do better apparently since we don't get missing object
                     # counts per shard, but just per-pg unfortunately.
-                    osd_pg_objs_to_restore = 0
+                    pg_obj_copies_to_restore = 0
 
                     # estimate the degraded object counts for each shard
                     if pg_degraded_moves > 0:
-                        pg_shard_objs_degraded = pg_objs_degraded / pg_degraded_moves
-                        osd_pg_objs_to_restore += pg_shard_objs_degraded * pg_degraded_shards_on_osd
+                        pg_obj_copies_to_restore += (pg_obj_copies_degraded / pg_degraded_moves) * pg_degraded_shards_on_osd
 
                     # same for misplaced objects
                     if pg_misplaced_moves > 0:
-                        pg_shard_objs_misplaced = pg_objs_misplaced / pg_misplaced_moves
-                        osd_pg_objs_to_restore += pg_shard_objs_misplaced * pg_misplaced_shards_on_osd
+                        pg_obj_copies_to_restore += (pg_obj_copies_misplaced / pg_misplaced_moves) * pg_misplaced_shards_on_osd
 
-                    # adjust fs size by average object size times estimated restoration count.
-                    # this is also kinda lame but it seems one can't get more info easily.
-                    pg_obj_size = shardsize / pg_objs
-                    pg_objs_transferred = pg_objs - osd_pg_objs_to_restore
-                    if pg_objs_transferred < 0:
+                    # shard-objects already present at current osd
+                    pg_obj_copies_transferred = pg_obj_copies - int(pg_obj_copies_to_restore)
+                    if pg_obj_copies_transferred < 0:
                         raise RuntimeError(f"pg {pg_incoming} to be moved to osd.{osdid} is misplaced "
-                                           f"with {pg_objs_transferred}<0 objects already transferred")
+                                           f"with {pg_obj_copies_transferred}<0 objects already transferred")
 
-                    shardsize_already_transferred = int(pg_obj_size * pg_objs_transferred)
+                    # partial transfer amount estimation to the current osd: average_object_size * estimated_restoration_count.
+                    # this is also kinda lame but it seems one can't get more info easily.
+
+                    # (shardsize/copies) * (copies_transferred)
+                    # = average_copy_size * copies_transferred
+                    shardsize = self.get_pg_shardsize(pg_incoming)
+                    pg_obj_copy_size = shardsize / pg_obj_copies
+                    shardsize_already_transferred = int(pg_obj_copy_size * pg_obj_copies_transferred)
 
                 # already-transferred is not missing - it's included in the device fill level already
                 missing_shardsize = shardsize - shardsize_already_transferred
 
                 if missing_shardsize < 0:
-                    raise Exception("a negative amount of shardsize is not yet transferred?")
+                    raise Exception("a negative amount of shardsize is not yet transferred "
+                                    f"in pg {pg_incoming} to osd.{osdid}?")
 
                 # add the estimated future shardsize
                 osd_transfer_remaining += missing_shardsize

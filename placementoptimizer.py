@@ -50,6 +50,10 @@ def parse_args():
     statep = argparse.ArgumentParser(add_help=False)
     statep.add_argument("--state", "-s", help="load cluster state from this jsonfile")
 
+    cephcmdp = argparse.ArgumentParser(add_help=False)
+    cephcmdp.add_argument("--ceph-command", default="ceph",
+                          help="command to call when communicating with ceph. default: %(default)s")
+
     osdsizep = argparse.ArgumentParser(add_help=False)
     osdsizep.add_argument('--osdsize', choices=['device', 'weighted', 'crush'], default="crush",
                           help=("what parameter to take for determining the osd size. default: %(default)s. "
@@ -86,10 +90,11 @@ def parse_args():
     savemappingp.add_argument("--save-mappings", help="filename to store the resulting up osdid set for all pgs (to see where things are placed)")
 
     ### subcommands
-    gathersp = sp.add_parser('gather', help="only gather cluster information, i.e. generate a state file")
+    gathersp = sp.add_parser('gather', parents=[cephcmdp],
+                             help="only gather cluster information, i.e. generate a state file")
     gathersp.add_argument("output_file", help="file to store cluster balancing information to")
 
-    showsp = sp.add_parser('show', parents=[statep, upmapp, predictionp, osdsizep, usedestimatep, savemappingp],
+    showsp = sp.add_parser('show', parents=[cephcmdp, statep, upmapp, predictionp, osdsizep, usedestimatep, savemappingp],
                            help=("show cluster properties like free pool space or OSD utilizations. "
                                  "it shows all info for the 'acting' state by default. "
                                  "use '--pgstate up' to look into the future and print how it will look after all movements are done."))
@@ -122,14 +127,14 @@ def parse_args():
     showsp.add_argument('--save-upmap-progress',
                         help="filename to store cluster stats after each after each upmap change")
 
-    remappsp = sp.add_parser('showremapped', parents=[statep, osdsizep],
+    remappsp = sp.add_parser('showremapped', parents=[cephcmdp, statep, osdsizep],
                              help="show current PG remaps and their progress")
     remappsp.add_argument('--by-osd', action='store_true',
                         help="group the results by osd")
     remappsp.add_argument('--osds',
                         help="only look at these osds when using --by-osd, comma separated")
 
-    balancep = sp.add_parser('balance', parents=[statep, upmapp, osdsizep, usedestimatep, savemappingp],
+    balancep = sp.add_parser('balance', parents=[cephcmdp, statep, upmapp, osdsizep, usedestimatep, savemappingp],
                              help="distribute PGs for better capacity and performance in your cluster")
     balancep.add_argument('--output', '-o', default="-",
                           help="output filename for resulting movement instructions. default stdout.")
@@ -176,7 +181,7 @@ def parse_args():
     balancep.add_argument('--save-timings',
                           help="filename to save timing information for each generated move")
 
-    pooldiffp = sp.add_parser('poolosddiff', parents=[statep, osdsizep])
+    pooldiffp = sp.add_parser('poolosddiff', parents=[cephcmdp, statep, osdsizep])
     pooldiffp.add_argument('--pgstate', choices=['up', 'acting'], default="acting",
                            help="what pg set to take, up or acting (default acting).")
     pooldiffp.add_argument('pool1',
@@ -184,7 +189,7 @@ def parse_args():
     pooldiffp.add_argument('pool2',
                            help="compare to this pool which osds are involved")
 
-    sp.add_parser('repairstats', parents=[statep, osdsizep],
+    sp.add_parser('repairstats', parents=[cephcmdp, statep, osdsizep],
                   help="which OSDs repaired their stored data?")
 
     testp = sp.add_parser('test', help="test internal stuff")
@@ -195,7 +200,7 @@ def parse_args():
     osdmapsp = osdmapp.add_subparsers(dest='osdmapmode')
     osdmapsp.required = True
 
-    osdmapexportsp = osdmapsp.add_parser('export', parents=[statep, upmapignorep], help="create osdmap files")
+    osdmapexportsp = osdmapsp.add_parser('export', parents=[cephcmdp, statep, upmapignorep], help="create osdmap files")
     osdmapexportsp.add_argument("output_file", help="osdmap filename to save to")
 
     args = cli.parse_args()
@@ -310,6 +315,7 @@ def jsoncall(cmd, swallow_stderr=False):
     # in ceph reef, inf is encoded in invalid format for python's json.
     rawdata = rawdata.replace(b':inf', b':Infinity')
     rawdata = rawdata.decode()
+    rawdata = "{}"
     return json.loads(rawdata)
 
 
@@ -770,7 +776,10 @@ class ClusterState:
     STATE_VERSION = 1
 
     def __init__(self, statefile: Optional[str] = None,
-                 osdsize_method: OSDSizeMethod = OSDSizeMethod.CRUSH):
+                 osdsize_method: OSDSizeMethod = OSDSizeMethod.CRUSH,
+                 ceph_command: str = "ceph"):
+        self._ceph_command: str = ceph_command
+
         self.state: Dict[str, Any] = dict()
         self.load(statefile)
 
@@ -788,7 +797,7 @@ class ClusterState:
                 raise RuntimeError(f"imported file stores state in version {import_version}, but we need {self.STATE_VERSION}")
 
         else:
-            logging.info(f"gathering cluster state via ceph api...")
+            logging.info("gathering cluster state via ceph api...")
             # this is shitty: this whole script depends on these outputs,
             # but they might be inconsistent, if the cluster had changes
             # between calls....
@@ -797,29 +806,29 @@ class ClusterState:
             self.state = dict(
                 stateversion=self.STATE_VERSION,
                 timestamp=datetime.datetime.now().isoformat(),
-                versions=jsoncall("ceph versions --format=json".split()),
-                health_detail=jsoncall("ceph health detail --format=json".split()),
-                osd_dump=jsoncall("ceph osd dump --format json".split()),
+                versions=jsoncall(f"{self._ceph_command} versions --format=json".split()),
+                health_detail=jsoncall(f"{self._ceph_command} health detail --format=json".split()),
+                osd_dump=jsoncall(f"{self._ceph_command} osd dump --format json".split()),
                 # ceph pg dump always echoes "dumped all" on stderr, silence that.
-                pg_dump=jsoncall("ceph pg dump --format json".split(), swallow_stderr=True),
-                osd_df_dump=jsoncall("ceph osd df --format json".split()),
-                osd_df_tree_dump=jsoncall("ceph osd df tree --format json".split()),
-                df_dump=jsoncall("ceph df detail --format json".split()),
-                pool_dump=jsoncall("ceph osd pool ls detail --format json".split()),
-                crush_dump=jsoncall("ceph osd crush dump --format json".split()),
+                pg_dump=jsoncall(f"{self._ceph_command} pg dump --format json".split(), swallow_stderr=True),
+                osd_df_dump=jsoncall(f"{self._ceph_command} osd df --format json".split()),
+                osd_df_tree_dump=jsoncall(f"{self._ceph_command} osd df tree --format json".split()),
+                df_dump=jsoncall(f"{self._ceph_command} df detail --format json".split()),
+                pool_dump=jsoncall(f"{self._ceph_command} osd pool ls detail --format json".split()),
+                crush_dump=jsoncall(f"{self._ceph_command} osd crush dump --format json".split()),
                 crush_class_osds=dict(),
             )
 
-            crush_classes = jsoncall("ceph osd crush class ls --format json".split())
+            crush_classes = jsoncall(f"{self._ceph_command} osd crush class ls --format json".split())
             for crush_class in crush_classes:
-                class_osds = jsoncall(f"ceph osd crush class ls-osd {crush_class} --format json".split())
+                class_osds = jsoncall(f"{self._ceph_command} osd crush class ls-osd {crush_class} --format json".split())
                 if not class_osds:
                     continue
                 self.state["crush_class_osds"][crush_class] = class_osds
 
             # check if the osdmap version changed meanwhile
             # => we'd have inconsistent state
-            if self.state['osd_dump']['epoch'] != jsoncall("ceph osd dump --format json".split())['epoch']:
+            if self.state['osd_dump']['epoch'] != jsoncall(f"{self._ceph_command} osd dump --format json".split())['epoch']:
                 raise RuntimeError("Cluster topology changed during information gathering (e.g. a pg changed state). "
                                    "Wait for things to calm down and try again")
 
@@ -5453,7 +5462,7 @@ def main():
         return 1 if failed > 0 else 0
 
     elif args.mode == 'gather':
-        state = ClusterState()
+        state = ClusterState(ceph_command=args.ceph_command)
         state.dump(args.output_file)
 
     else:
@@ -5470,7 +5479,7 @@ def main():
         else:
             raise RuntimeError(f"unknown osd weight method {args.osdsize!r}")
 
-        state = ClusterState(args.state, osdsize_method=osdsize_method)
+        state = ClusterState(args.state, osdsize_method=osdsize_method, ceph_command=args.ceph_command)
         state.preprocess()
 
         if args.mode == 'balance':

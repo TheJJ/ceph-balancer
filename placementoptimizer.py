@@ -828,8 +828,9 @@ class ClusterState:
             # check if the osdmap version changed meanwhile
             # => we'd have inconsistent state
             if self.state['osd_dump']['epoch'] != jsoncall(f"{self._ceph_command} osd dump --format json".split())['epoch']:
-                raise RuntimeError("Cluster topology changed during information gathering (e.g. a pg changed state). "
-                                   "Wait for things to calm down and try again")
+                raise RuntimeError("Cluster osdmap epoch changed during information gathering (e.g. a pg changed state). "
+                                   "Wait for things to calm down and try again - "
+                                   "or implement/request a transactional state dump feature for Ceph.")
 
     def dump(self, output_file):
         logging.info(f"cluster state dumped. now saving to {output_file}...")

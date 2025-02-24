@@ -315,7 +315,6 @@ def jsoncall(cmd, swallow_stderr=False):
     # in ceph reef, inf is encoded in invalid format for python's json.
     rawdata = rawdata.replace(b':inf', b':Infinity')
     rawdata = rawdata.decode()
-    rawdata = "{}"
     return json.loads(rawdata)
 
 

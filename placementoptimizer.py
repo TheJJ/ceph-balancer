@@ -2250,7 +2250,7 @@ class ClusterState:
 
             # pgs that will be transferred off the osd
             for pg_outgoing in (osdpgs['acting'] - osdpgs['up']):
-                pginfo = self.pgs[pg_incoming]
+                pginfo = self.pgs[pg_outgoing]
                 pg_shards_on_osd = pginfo["acting"].count(osdid)
                 osd_transfer_remaining -= self.get_pg_shardsize(pg_outgoing) * pg_shards_on_osd
 

@@ -528,7 +528,7 @@ class open_or_stdout:
 
 def moves_from_up_acting(up_osds: List[int],
                          acting_osds: List[int],
-                         is_ec: bool):
+                         is_ec: bool) -> List[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
     """
     up_osds: planned position
     acting_osds: current position
@@ -558,6 +558,9 @@ def moves_from_up_acting(up_osds: List[int],
     >>> moves_from_up_acting(up_osds=[10, 2, 5, 4], acting_osds=[1, 2, -1, 4], is_ec=True)
     [((1,), (10,)), ((-1,), (5,))]
 
+    >>> moves_from_up_acting(up_osds=[1, -1, 3, 4], acting_osds=[1, -1, -1, 4], is_ec=True)
+    [((-1,), (-1,)), ((-1,), (3,))]
+
     # non-ec tests:
     >>> moves_from_up_acting(up_osds=[397, 902, 888, 74], acting_osds=[397, 902, 888], is_ec=False)
     [((-1,), (74,))]
@@ -576,11 +579,11 @@ def moves_from_up_acting(up_osds: List[int],
 
     """
 
-    moves = list()
+    moves: List[Tuple[Tuple[int, ...], Tuple[int, ...]]] = list()
     if is_ec:
         # for ec, order is important.
         for up_osd, acting_osd in zip(up_osds, acting_osds):
-            if up_osd != acting_osd:
+            if up_osd != acting_osd or up_osd == -1:
                 moves.append(((acting_osd,), (up_osd,)))
 
     else:
@@ -2132,10 +2135,11 @@ class ClusterState:
                 pginfo = self.pgs[pg_incoming]
 
                 pg_objs = pginfo["stat_sum"]["num_objects"]
-                pg_obj_copies = pginfo["stat_sum"]["num_object_copies"]
+
+                shardsize = self.get_pg_shardsize(pg_incoming)
 
                 if pg_objs <= 0:
-                    shardsize_already_transferred = 0
+                    osd_shards_objs_size_transferred = 0
 
                 else:
                     # in ceph 17 the degraded calculation is done in PeeringState::update_calc_stats
@@ -2176,6 +2180,8 @@ class ClusterState:
                     pg_degraded_shards_on_osd = 0
                     # this osd is the target of a pg move where the source does exist
                     pg_misplaced_shards_on_osd = 0
+                    # this osd has shards of the pg
+                    pg_shards_on_osd = 0
 
                     # get the real current remaps active in the cluster
                     incoming_pg_moves = self.get_remaps(pginfo)
@@ -2190,10 +2196,14 @@ class ClusterState:
 
                         # osd list lengths are always equal
                         for osd_from, osd_to in zip(osds_from, osds_to):
+                            if osd_to == osdid:
+                                pg_shards_on_osd += 1
+
                             if osd_from == -1:
                                 pg_degraded_moves += 1
                                 if osd_to == osdid:
                                     pg_degraded_shards_on_osd += 1
+
                             elif osd_from != osd_to:
                                 pg_misplaced_moves += 1
                                 if osd_to == osdid:
@@ -2201,46 +2211,48 @@ class ClusterState:
 
                     # the following assumes that all shards of this pg are recovered at the same rate,
                     # when there's multiple from/to osds for this pg
-                    # we can't do better apparently since we don't get missing object
-                    # counts per shard, but just per-pg unfortunately.
-                    pg_obj_copies_to_restore = 0
+                    # we can't do better since we don't get missing object counts per shard, but just per-pg unfortunately.
+                    osd_shards_objs_to_restore = 0
 
                     # estimate the degraded object counts for each shard
                     if pg_degraded_moves > 0:
-                        pg_obj_copies_to_restore += (pg_obj_copies_degraded / pg_degraded_moves) * pg_degraded_shards_on_osd
+                        osd_shards_objs_to_restore += (pg_obj_copies_degraded / pg_degraded_moves) * pg_degraded_shards_on_osd
 
                     # same for misplaced objects
                     if pg_misplaced_moves > 0:
-                        pg_obj_copies_to_restore += (pg_obj_copies_misplaced / pg_misplaced_moves) * pg_misplaced_shards_on_osd
+                        osd_shards_objs_to_restore += (pg_obj_copies_misplaced / pg_misplaced_moves) * pg_misplaced_shards_on_osd
 
                     # shard-objects already present at current osd
-                    pg_obj_copies_transferred = pg_obj_copies - int(pg_obj_copies_to_restore)
-                    if pg_obj_copies_transferred < 0:
+                    # objs/osd - objs_missing/osd
+                    osd_shards_objs_transferred = (pg_objs * pg_shards_on_osd) - int(osd_shards_objs_to_restore)
+                    if osd_shards_objs_transferred < 0:
                         raise RuntimeError(f"pg {pg_incoming} to be moved to osd.{osdid} is misplaced "
-                                           f"with {pg_obj_copies_transferred}<0 objects already transferred")
+                                           f"with {osd_shards_objs_transferred}<0 objects already transferred")
 
                     # partial transfer amount estimation to the current osd: average_object_size * estimated_restoration_count.
                     # this is also kinda lame but it seems one can't get more info easily.
 
-                    # (shardsize/copies) * (copies_transferred)
-                    # = average_copy_size * copies_transferred
-                    shardsize = self.get_pg_shardsize(pg_incoming)
-                    pg_obj_copy_size = shardsize / pg_obj_copies
-                    shardsize_already_transferred = int(pg_obj_copy_size * pg_obj_copies_transferred)
+                    # (shardsize/objs) * objs_transferred
+                    # = size of already transferred shards objects
+                    shard_obj_size = shardsize / pg_objs
+                    osd_shards_objs_size_transferred = int(shard_obj_size * osd_shards_objs_transferred)
 
-                # already-transferred is not missing - it's included in the device fill level already
-                missing_shardsize = shardsize - shardsize_already_transferred
+                # the already-transferred is included in the device fill level already
+                # how much is missing, though?
+                missing_shards_size = (shardsize * pg_shards_on_osd) - osd_shards_objs_size_transferred
 
-                if missing_shardsize < 0:
+                if missing_shards_size < 0:
                     raise Exception("a negative amount of shardsize is not yet transferred "
                                     f"in pg {pg_incoming} to osd.{osdid}?")
 
                 # add the estimated future shardsize
-                osd_transfer_remaining += missing_shardsize
+                osd_transfer_remaining += missing_shards_size
 
             # pgs that will be transferred off the osd
             for pg_outgoing in (osdpgs['acting'] - osdpgs['up']):
-                osd_transfer_remaining -= self.get_pg_shardsize(pg_outgoing)
+                pginfo = self.pgs[pg_incoming]
+                pg_shards_on_osd = pginfo["acting"].count(osdid)
+                osd_transfer_remaining -= self.get_pg_shardsize(pg_outgoing) * pg_shards_on_osd
 
             self.osd_transfer_remainings[osdid] = osd_transfer_remaining
 

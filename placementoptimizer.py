@@ -127,12 +127,33 @@ def parse_args():
     showsp.add_argument('--save-upmap-progress',
                         help="filename to store cluster stats after each after each upmap change")
 
-    remappsp = sp.add_parser('showremapped', parents=[cephcmdp, statep, osdsizep],
-                             help="show current PG remaps and their progress")
-    remappsp.add_argument('--by-osd', action='store_true',
-                        help="group the results by osd")
-    remappsp.add_argument('--osds',
-                        help="only look at these osds when using --by-osd, comma separated")
+    remapp = sp.add_parser('remap')
+    remapsp = remapp.add_subparsers(dest='remap_mode', required=True)
+
+    remap_showp = remapsp.add_parser('show', parents=[cephcmdp, statep, osdsizep],
+                                     help="show current PG remaps and their progress")
+    remap_showp.add_argument('--by-osd', action='store_true',
+                             help="group the results by osd")
+    remap_showp.add_argument('--osds',
+                             help="only look at these osds when using --by-osd, space separated")
+
+    remap_undop = remapsp.add_parser('undo', parents=[cephcmdp, statep, osdsizep],
+                                     help="generate upmap items that un-remap currently remapped pgs")
+    remap_undop.add_argument('--output', '-o', default="-",
+                             help="output filename for resulting movement instructions. default stdout.")
+    remap_undop.add_argument('--exclude-backfilling', action="store_true",
+                             help="only take backfill_wait, exclude currently backfilling PGs")
+    remap_undop.add_argument('--source-osds',
+                             help="only cancel backfills where the space-separated OSDs are a source")
+    remap_undop.add_argument('--target-osds',
+                             help="only cancel backfills having these space-separated OSDs as target")
+
+    remap_undop.add_argument('--only-on-osds',
+                             help="just backfills of PGs currently acting on these space-separated OSDs")
+
+    _remap_drainp = remapsp.add_parser('drain', parents=[cephcmdp, statep, osdsizep],
+                                       help=("generate upmap items to empty osds. "
+                                             "consider setting an OSD's weight to 0 instead."))
 
     balancep = sp.add_parser('balance', parents=[cephcmdp, statep, upmapp, osdsizep, usedestimatep, savemappingp],
                              help="distribute PGs for better capacity and performance in your cluster")
@@ -197,7 +218,7 @@ def parse_args():
 
     osdmapp = sp.add_parser('osdmap', parents=[],
                             help="compatibility with ceph osd maps")
-    osdmapsp = osdmapp.add_subparsers(dest='osdmapmode')
+    osdmapsp = osdmapp.add_subparsers(dest='osdmap_mode')
     osdmapsp.required = True
 
     osdmapexportsp = osdmapsp.add_parser('export', parents=[cephcmdp, statep, upmapignorep], help="create osdmap files")
@@ -2120,7 +2141,7 @@ class ClusterState:
             # the already-transferred part is part of device_used.
             osd_transfer_remaining = 0
 
-            # this is a bit similar to the implementation of `showremapped` to figure out
+            # this is a bit similar to the implementation of `show_remapped` to figure out
             # movement progress.
             #
             # we want to estimate the up-utilization, i.e. the osd utilization when all moves
@@ -3223,6 +3244,21 @@ class PGMappings:
         # caches the merged remaps
         self._upmap_items = defaultdict(dict)
 
+        # pg movement statistics tracking
+        #
+        # analysis order:
+        # simulate cluster state
+        # ->init_analysis  if emit_ignored_upmaps
+        # revert cluster upmaps
+        # ->init_analysis  if not emit_ignored_upmaps
+        # ->analysis
+        # file upmaps (and in apply_remap, record moves)
+        #
+        # analysis for the base state
+        self.init_analyzer = init_analyzer
+        # analysis for the current state
+        self.analyzer = analyzer
+
         ## things only needed for simulation
         if not self.enable_simulation:
             return
@@ -3283,21 +3319,6 @@ class PGMappings:
             crushclass_osds = set(self.cluster.get_crushclass_osds(crushclass, skip_zeroweight=True))
             self._considered_osds.update(crushclass_osds)
             self._considered_class_osds[crushclass] = crushclass_osds
-
-        # pg movement statistics tracking
-        #
-        # analysis order:
-        # simulate cluster state
-        # ->init_analysis  if emit_ignored_upmaps
-        # revert cluster upmaps
-        # ->init_analysis  if not emit_ignored_upmaps
-        # ->analysis
-        # file upmaps (and in apply_remap, record moves)
-        #
-        # analysis for the base state
-        self.init_analyzer = init_analyzer
-        # analysis for the current state
-        self.analyzer = analyzer
 
         # which movements did we un-do: pgid->{from: to}, ...
         # (i.e. we applied the opposite)
@@ -5278,7 +5299,7 @@ def show(args, cluster):
         analyzer.finish()
 
 
-def showremapped(args, cluster):
+def show_remapped(args, cluster):
     # pgid -> move information
     pg_move_status = dict()
 
@@ -5287,62 +5308,63 @@ def showremapped(args, cluster):
 
     for pgid, pginfo in cluster.pgs.items():
         pgstate = pginfo["state"].split("+")
-        if "remapped" in pgstate:
+        if "remapped" not in pgstate:
+            continue
 
-            # this calculation is a bit similar to what we do in PGMappings
-            # pending move size estimation.
+        # this calculation is a bit similar to what we do in PGMappings
+        # pending move size estimation.
 
-            moves = list()
-            osd_move_count = 0
-            for osds_from, osds_to in cluster.get_remaps(pginfo):
-                for osd_from, osd_to in zip(osds_from, osds_to):
-                    osd_actions[osd_from]["to"][pgid] = osd_to
-                    osd_actions[osd_to]["from"][pgid] = osd_from
+        moves = list()
+        osd_move_count = 0
+        for osds_from, osds_to in cluster.get_remaps(pginfo):
+            for osd_from, osd_to in zip(osds_from, osds_to):
+                osd_actions[osd_from]["to"][pgid] = osd_to
+                osd_actions[osd_to]["from"][pgid] = osd_from
 
-                froms = ','.join(str(osdid) for osdid in osds_from)
-                tos = ','.join(str(osdid) for osdid in osds_to)
-                moves.append(f"{froms}->{tos}")
-                osd_move_count += len(osds_to)
+            froms = ','.join(str(osdid) for osdid in osds_from)
+            tos = ','.join(str(osdid) for osdid in osds_to)
+            moves.append(f"{froms}->{tos}")
+            osd_move_count += len(osds_to)
 
-            # multiply with move-count since each shard remap adds all objects
-            # to the num_objects_{misplaced,degraded} again
-            objs_total = pginfo["stat_sum"]["num_objects"] * osd_move_count
-            objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
-            objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
-            objs_to_restore = objs_misplaced + objs_degraded
+        # multiply with move-count since each shard remap adds all objects
+        # to the num_objects_{misplaced,degraded} again
+        objs_total = pginfo["stat_sum"]["num_objects"] * osd_move_count
+        objs_misplaced = pginfo["stat_sum"]["num_objects_misplaced"]
+        objs_degraded = pginfo["stat_sum"]["num_objects_degraded"]
+        objs_to_restore = objs_misplaced + objs_degraded
 
-            if objs_total > 0:
-                progress = 1 - (objs_to_restore / objs_total)
-            else:
-                progress = 1
-            progress *= 100
+        if objs_total > 0:
+            progress = 1 - (objs_to_restore / objs_total)
+        else:
+            progress = 1
+        progress *= 100
 
-            state = "backfill" if "backfilling" in pgstate else "waiting"
-            if "backfill_toofull" in pgstate:
-                state = "toofull"
-            if "degraded" in pgstate:
-                state = f"degraded+{state:<8}"
-            else:
-                state = f"         {state:<8}"
+        state = "backfill" if "backfilling" in pgstate else "waiting"
+        if "backfill_toofull" in pgstate:
+            state = "toofull"
+        if "degraded" in pgstate:
+            state = f"degraded+{state:<8}"
+        else:
+            state = f"         {state:<8}"
 
-            pg_move_size = cluster.get_pg_shardsize(pgid)
-            pg_move_size_pp = pformatsize(pg_move_size)
+        pg_move_size = cluster.get_pg_shardsize(pgid)
+        pg_move_size_pp = pformatsize(pg_move_size)
 
-            pg_move_status[pgid] = {
-                "state": state,
-                "objs_total": objs_total,
-                "objs_pending": objs_total - objs_to_restore,
-                "size": pg_move_size,
-                "sizepp": pg_move_size_pp,
-                "progress": progress,
-                "moves": moves,
-            }
+        pg_move_status[pgid] = {
+            "state": state,
+            "objs_total": objs_total,
+            "objs_pending": objs_total - objs_to_restore,
+            "size": pg_move_size,
+            "sizepp": pg_move_size_pp,
+            "progress": progress,
+            "moves": moves,
+        }
 
     if args.by_osd:
         # generate [(osdid, actions), ...]
         # where actions = {"to": {pgid->osdid}, "from": {pgid->osdid}}
         if args.osds:
-            osdids = [int(osdid) for osdid in args.osds.split(",")]
+            osdids = [int(osdid) for osdid in args.osds.split(" ")]
             osdlist = sorted((osdid, osd_actions[osdid]) for osdid in osdids)
         else:
             osdlist = sorted(osd_actions.items())
@@ -5407,6 +5429,41 @@ def showremapped(args, cluster):
             progress = pgmoveinfo['progress']
             move_actions = ';'.join(pgmoveinfo['moves'])
             print(f"pg {pgid: <6} {state} {move_size_pp: >6}: {objs_pending} of {objs_total}, {progress:.1f}%, {move_actions}")
+
+
+def undo_remapped(args, cluster) -> None:
+    pg_mappings = PGMappings(cluster, need_simulation=False)
+
+    source_osdids = None
+    if args.source_osds:
+        source_osdids = {int(osdid) for osdid in args.osds.split(" ")}
+
+    target_osdids = None
+    if args.target_osds:
+        target_osdids = {int(osdid) for osdid in args.osds.split(" ")}
+
+    for pgid, pginfo in cluster.pgs.items():
+        pgstate = pginfo["state"].split("+")
+        if "remapped" not in pgstate:
+            continue
+        if args.exclude_backfilling and "backfilling" in pgstate:
+            continue
+
+        for osds_from, osds_to in cluster.get_remaps(pginfo):
+            for osd_from, osd_to in zip(osds_from, osds_to):
+                if source_osdids and osd_from not in source_osdids:
+                    continue
+                if target_osdids and osd_to not in target_osdids:
+                    continue
+                if osd_to == -1 or osd_from == -1:
+                    continue
+
+                pg_mappings.apply_remap(pgid, osd_to, osd_from)
+
+    with open_or_stdout(args.output, "w") as outfd:
+        for cmd in pg_mappings.get_upmap_items_commands():
+            outfd.write(cmd)
+            outfd.write("\n")
 
 
 def poolosddiff(args, cluster):
@@ -5500,8 +5557,20 @@ def main():
         elif args.mode == 'show':
             run = lambda: show(args, state)
 
-        elif args.mode == 'showremapped':
-            run = lambda: showremapped(args, state)
+        elif args.mode == 'remap':
+            if args.remap_mode == "show":
+                run = lambda: show_remapped(args, state)
+
+            elif args.remap_mode == 'undo':
+                run = lambda: undo_remapped(args, state)
+
+            elif args.remap_mode == "drain":
+                print("for now, to drain OSDs: set their weight to 0, and then run the balancer.")
+                return 1
+                # TODO: maybe implement draining through our normal balancing procedure.
+
+            else:
+                raise NotImplementedError()
 
         elif args.mode == 'poolosddiff':
             run = lambda: poolosddiff(args, state)
@@ -5510,13 +5579,13 @@ def main():
             run = lambda: repairstats(args, state)
 
         elif args.mode == "osdmap":
-            if args.osdmapmode == "export":
+            if args.osdmap_mode == "export":
                 run = lambda: state.export_osdmap(
                     args.output_file,
                     ignore_state_upmaps=args.ignore_state_upmaps
                 )
             else:
-                raise RuntimeError(f"unknown osdmap mode {args.osdmapmode!r}")
+                raise RuntimeError(f"unknown osdmap mode {args.osdmap_mode!r}")
 
         else:
             raise RuntimeError(f"unknown mode: {args.mode}")

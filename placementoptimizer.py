@@ -2079,7 +2079,7 @@ class ClusterState:
             statfs = osd_stat['statfs']
             self.osds[osdid].update({
                 "device_size": statfs["total"],
-                "device_used": statfs["allocated"] + statfs["internal_metadata"],
+                "device_used": statfs["allocated"] + statfs["internal_metadata"] + statfs["omap_allocated"],
                 "device_used_data": statfs["allocated"],
                 "device_used_meta": statfs["internal_metadata"],
                 "device_used_omap": statfs["omap_allocated"],

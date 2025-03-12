@@ -128,7 +128,8 @@ def parse_args():
                         help="filename to store cluster stats after each after each upmap change")
 
     remapp = sp.add_parser('remap')
-    remapsp = remapp.add_subparsers(dest='remap_mode', required=True)
+    remapsp = remapp.add_subparsers(dest='remap_mode')
+    remapsp.required = True
 
     remap_showp = remapsp.add_parser('show', parents=[cephcmdp, statep, osdsizep],
                                      help="show current PG remaps and their progress")

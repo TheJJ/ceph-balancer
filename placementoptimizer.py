@@ -171,6 +171,9 @@ def parse_args():
     balancep.add_argument('--source-osds',
                           help=("only consider these osds as movement source, separated by ',' or ' '. "
                                 'to balance just one bucket, use "$(ceph osd ls-tree bucketname)"'))
+    balancep.add_argument('--destination-osds',
+                          help=("only consider these osds as movement destination, separated by ',' or ' '. "
+                                'to write just to one bucket, use "$(ceph osd ls-tree bucketname)"'))
     balancep.add_argument('--pg-choice', choices=['largest', 'median', 'auto'],
                           default='largest',
                           help=('method to select a PG move candidate on a OSD based on its size. '
@@ -4712,6 +4715,12 @@ def balance(args, cluster):
         splitter = ',' if ',' in args.source_osds else None
         source_osds = [int(osdid) for osdid in args.source_osds.split(splitter)]
 
+    # to restrict destination osds
+    destination_osds = None
+    if args.destination_osds:
+        splitter = ',' if ',' in args.destination_osds else None
+        destination_osds = [int(osdid) for osdid in args.destination_osds.split(splitter)]
+
     # number of found remaps
     found_remap_count = 0
 
@@ -4852,6 +4861,9 @@ def balance(args, cluster):
                         raise RuntimeError("tried non-candidate target osd")
 
                     if osd_to == osd_from:
+                        continue
+
+                    if destination_osds is not None and osd_to not in destination_osds:
                         continue
 
                     logging.debug("TRY-1 move %s osd.%s => osd.%s", move_pg, osd_from, osd_to)

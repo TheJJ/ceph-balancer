@@ -176,6 +176,10 @@ def parse_args():
     balancep.add_argument('--destination-osds',
                           help=("only consider these osds as movement destination, separated by ',' or ' '. "
                                 'to write just to one bucket, use "$(ceph osd ls-tree bucketname)"'))
+    balancep.add_argument('--max-moves-per-osd', type=int,
+                          help=("only consider moves between OSDs with fewer movements than the given maximum. "
+                                "This includes movements that are both ongoing and planned. "
+                                "It applies to the movement source OSDs as well as the destination ones."))
     balancep.add_argument('--pg-choice', choices=['largest', 'median', 'auto'],
                           default='largest',
                           help=('method to select a PG move candidate on a OSD based on its size. '
@@ -2140,6 +2144,7 @@ class ClusterState:
         # to estimate osd utilization with DELTA method.
         # this is the expected utilization change once we reach the up pg state.
         self.osd_transfer_remainings = dict()
+        self.osd_ongoing_moves_nums = dict()
         for osdid, osdpgs in osd_mappings.items():
             if osdid == -1:
                 continue
@@ -2148,6 +2153,7 @@ class ClusterState:
             # this is the estimated size of remaining pg transfer amount
             # the already-transferred part is part of device_used.
             osd_transfer_remaining = 0
+            osd_ongoing_moves_num = 0
 
             # this is a bit similar to the implementation of `show_remapped` to figure out
             # movement progress.
@@ -2276,14 +2282,18 @@ class ClusterState:
 
                 # add the estimated future shardsize
                 osd_transfer_remaining += missing_shards_size
+                osd_ongoing_moves_num += 1
 
             # pgs that will be transferred off the osd
             for pg_outgoing in (osdpgs['acting'] - osdpgs['up']):
                 pginfo = self.pgs[pg_outgoing]
                 pg_shards_on_osd = pginfo["acting"].count(osdid)
                 osd_transfer_remaining -= self.get_pg_shardsize(pg_outgoing) * pg_shards_on_osd
+                osd_ongoing_moves_num += 1
 
             self.osd_transfer_remainings[osdid] = osd_transfer_remaining
+            if osd_ongoing_moves_num > 0:
+                self.osd_ongoing_moves_nums[osdid] = osd_ongoing_moves_num
 
             if False:
                 osd_fs_used = osd_transfer_remaining + osd['device_used']
@@ -4725,6 +4735,9 @@ def balance(args, cluster):
         splitter = ',' if ',' in args.destination_osds else None
         destination_osds = [int(osdid) for osdid in args.destination_osds.split(splitter)]
 
+    # init counters of planned transfers per osd
+    osd_planned_moves_nums = dict()
+
     # number of found remaps
     found_remap_count = 0
 
@@ -4755,12 +4768,19 @@ def balance(args, cluster):
                 if osd_from not in source_osds:
                     continue
 
+            # filter only osds with available movement reservations
+            moves_per_osd = cluster.osd_ongoing_moves_nums.get(osd_from, 0)
+            moves_per_osd += osd_planned_moves_nums.get(osd_from, 0)
+            if args.max_moves_per_osd is not None and args.max_moves_per_osd <= moves_per_osd:
+                continue
+
             source_attempts += 1
 
             if source_attempts > args.max_move_attempts:
                 logging.info(f"couldn't empty osd.{last_attempt}, so we're done. "
-                             f"if you want to try more often, set --max-move-attempts=$nr, this may unlock "
-                             f"more balancing possibilities. "
+                             f"if you want to try more often, set --max-move-attempts=$nr "
+                             f"with $nr > {args.max_move_attempts}, which is currently in effect. "
+                             f"this may unlock more balancing possibilities. "
                              f"setting --ignore-ideal-pgcounts also unlocks more, but will then we will "
                              f"fight with ceph's default balancer.")
                 force_finish = True
@@ -4807,10 +4827,14 @@ def balance(args, cluster):
                 logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
+                # filter only-allowed destination osds and those with available movement reservations
                 osd_to_candidates = [
                     osdid
                     for osdid in try_pg_move.get_osd_candidates(osd_from)
-                    if destination_osds is None or osdid in destination_osds
+                    if (destination_osds is None or osdid in destination_osds) and (
+                        args.max_moves_per_osd is None or
+                        cluster.osd_ongoing_moves_nums.get(osdid, 0) + osd_planned_moves_nums.get(osdid, 0) < args.max_moves_per_osd
+                    )
                 ]
                 pool_pg_shard_count_ideal = cluster.pool_pg_shard_count_ideal(pg_pool, osd_to_candidates)
                 from_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_from, adjust_full_ratio=True)
@@ -4984,11 +5008,16 @@ def balance(args, cluster):
 
                     found_remap = True
                     found_remap_count += 1
+                    osd_planned_moves_nums[osd_from] = osd_planned_moves_nums.get(osd_from, 0) + 1
+                    osd_planned_moves_nums[osd_to] = osd_planned_moves_nums.get(osd_to, 0) + 1
                     break
 
                 # end of to-loop
             # end of pg loop
         # end of from-loop
+        if source_attempts==0:
+            logging.info("no more suitable movemvent source candidate OSDs found")
+            break
 
     move_size, move_count = pg_mappings.get_remaps_shardsize_count()
 

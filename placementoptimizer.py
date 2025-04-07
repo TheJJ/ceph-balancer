@@ -42,6 +42,8 @@ def parse_args():
                      help="decrease program verbosity")
     cli.add_argument("--profile", action="store_true",
                      help=("activate the performance profiler for the balancer itself"))
+    cli.add_argument("--unsafe", action="store_true",
+                     help="ignore epoch changes during cluster state gathering")
 
     sp = cli.add_subparsers(dest='mode')
     sp.required = True
@@ -801,15 +803,15 @@ class ClusterState:
 
     def __init__(self, statefile: Optional[str] = None,
                  osdsize_method: OSDSizeMethod = OSDSizeMethod.CRUSH,
-                 ceph_command: str = "ceph"):
+                 ceph_command: str = "ceph", safe=True):
         self._ceph_command: str = ceph_command
 
         self.state: Dict[str, Any] = dict()
-        self.load(statefile)
+        self.load(statefile, safe)
 
         self.osdsize_method = osdsize_method
 
-    def load(self, statefile: Optional[str]):
+    def load(self, statefile: Optional[str], safe=True):
         # use cluster state from a file
         if statefile:
             logging.info(f"loading cluster state from file {statefile}...")
@@ -852,7 +854,7 @@ class ClusterState:
 
             # check if the osdmap version changed meanwhile
             # => we'd have inconsistent state
-            if self.state['osd_dump']['epoch'] != jsoncall(f"{self._ceph_command} osd dump --format json".split())['epoch']:
+            if safe and self.state['osd_dump']['epoch'] != jsoncall(f"{self._ceph_command} osd dump --format json".split())['epoch']:
                 raise RuntimeError("Cluster osdmap epoch changed during information gathering (e.g. a pg changed state). "
                                    "Wait for things to calm down and try again - "
                                    "or implement/request a transactional state dump feature for Ceph.")
@@ -5532,7 +5534,7 @@ def main():
         return 1 if failed > 0 else 0
 
     elif args.mode == 'gather':
-        state = ClusterState(ceph_command=args.ceph_command)
+        state = ClusterState(ceph_command=args.ceph_command, safe=not args.unsafe)
         state.dump(args.output_file)
 
     else:
@@ -5549,7 +5551,7 @@ def main():
         else:
             raise RuntimeError(f"unknown osd weight method {args.osdsize!r}")
 
-        state = ClusterState(args.state, osdsize_method=osdsize_method, ceph_command=args.ceph_command)
+        state = ClusterState(args.state, osdsize_method=osdsize_method, ceph_command=args.ceph_command, safe=not args.unsafe)
         state.preprocess()
 
         if args.mode == 'balance':

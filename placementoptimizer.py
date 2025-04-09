@@ -4807,7 +4807,11 @@ def balance(args, cluster):
                 logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
                 try_pg_move = PGMoveChecker(pg_mappings, move_pg)
-                osd_to_candidates = try_pg_move.get_osd_candidates(osd_from)
+                osd_to_candidates = [
+                    osdid
+                    for osdid in try_pg_move.get_osd_candidates(osd_from)
+                    if destination_osds is None or osdid in destination_osds
+                ]
                 pool_pg_shard_count_ideal = cluster.pool_pg_shard_count_ideal(pg_pool, osd_to_candidates)
                 from_osd_pg_count_ideal = pool_pg_shard_count_ideal * cluster.get_osd_size(osd_from, adjust_full_ratio=True)
 
@@ -4865,9 +4869,6 @@ def balance(args, cluster):
                         raise RuntimeError("tried non-candidate target osd")
 
                     if osd_to == osd_from:
-                        continue
-
-                    if destination_osds is not None and osd_to not in destination_osds:
                         continue
 
                     logging.debug("TRY-1 move %s osd.%s => osd.%s", move_pg, osd_from, osd_to)

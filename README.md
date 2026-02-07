@@ -1,51 +1,60 @@
 JJ's Ceph Balancer
 ==================
 
-[Ceph](https://ceph.io)'s "main" design issue is equal data placement.
-One mitigation is the [mgr balancer](https://docs.ceph.com/en/latest/rados/operations/balancer/).
+A significant shortcoming of Ceph's CRUSH algorithm is uniform data placement.
+The availble storage capacity of a Ceph cluster for new data is limited by how full the most-full OSD is at a given time.
+CRUSH assigns Placement Groups (PG)s to OSDs probabilistically, where probabilities are adjusted by storage device, node, rack, etc. (aggregate) sizes.
+This can result in non-uniform distribution of data, which means that some of your precious storage capacity cannot be used.
+The default mitigation is Ceph's built-in [Manager balancer](https://docs.ceph.com/en/latest/rados/operations/balancer/), but it only considers PG shard numbers, not their sizes.
 
 This is an alternative Ceph balancer implementation.
 * The upstream balancer optimizes for (weighted) equal number of PGs on each OSD for each pool.
 * This balancer optimizes for equal OSD storage utilization and PG placement across all pools.
+* This balancer yields better results when multiple CRUSH roots or a very large number of RADOS pools are present.
 
 For most clusters, the `mgr balancer` works well.
 For heterogeneous clusters with a lot of device and server capacity variance _and_ many pools, placement may be very bad - the reason this balancer was created.
-
 
 ## How?
 
 * [Ceph Overview](https://docs.ceph.com/en/latest/start/intro/)
 * [Ceph Cheatsheet](https://github.com/TheJJ/ceph-cheatsheet)
 
-
 ### Why balancing?
 
-A [data pool](https://docs.ceph.com/en/latest/rados/operations/pools/) is split into placement groups (PGs).
-The number of PGs is configured via the `pg_num` pool attribute.
+Each [RADOS pool](https://docs.ceph.com/en/latest/rados/operations/pools/) is split into placement groups (PGs).
+The number of PGs for each pool is configured via the `pg_num` pool attribute, which may or may not be managed by the PG autoscaler.
+When the PG autoscaler is used, it advised to increase the default values of `mon_target_pg_per_osd` and `mon_max_pg_per_osd` from their default values of 100 and 250 to 300 and 600, respectively.
+This is important for balancing as the defaults result in PGs that each may grow to hold a relatively large amount of data, which confounds the balancer's ability to distribute them uniformly.
+
+Clusters with OSD media larger than, say, 15TB may find it advantageous to also deploy more
+than one OSD per device.
+
 Hence, one PG roughly has size `pg_size = pool_size/pg_num`.
 
 PGs are placed on OSDs (a disk), using constraints defined via [CRUSH](https://docs.ceph.com/en/latest/rados/operations/crush-map/).
-Usually PGs are spread across servers, so that when one server goes down, enough disks are in other servers so the data remains available.
-The number of OSDs for one PG is configured via the pools `size` property.
+Usually PGs are replicated across servers, so that when one server goes down, enough OSDs in other servers survive, and data remains available.
+The number and kind of OSDs to be used for a given PG's shards is configured via the pool's `size` property and associated CRUSH rule.
+It is best in most cases for each PG to store 200-300 shards: when the PG autoscaler is in use, the `mon_target_pg_per_osd` option sets a ceiling on its budget. This _PG ratio_ is shown by the `ceph osd df` command in the `PGS` column.
 
-There are two kind of pools: replica and [erasure coded](https://en.wikipedia.org/wiki/Erasure_code).
+There are two kind of pools: replicated and [erasure coded](https://en.wikipedia.org/wiki/Erasure_code).
 
 The utilized space on one OSD is the sum of all PG shards that are stored on it.
 A PG shard is the data of one of the participating OSDs in one PG.
 For replica-pools, the shard size equals `pg_size / pool_size` - one full copy.
 For EC-pools, the shard size equals `pg_size / (pool_size * k)`, k is the number of data chunks in the EC profile.
 
-CRUSH organizes all the datacenters, racks, servers, OSDs in a tree structure.
+CRUSH organizes all the datacenters, racks, servers, OSDs in a tree structure: the _CRUSH topology_.
 Each subtree usually has the weight of all the OSDs below it, and PGs are now distributed evenly, weighted by the sub-tree size at each tree level.
-That way big servers/racks/datacenters/... get more data than small ones, but the relative amount is the same.
+That way servers/racks/datacenters/... with larger aggreate raw capacities get more data than small ones, but the relative amount is the same.
 
 In theory, each OSD should thus be filled exactly the same relative amount, all are e.g. 30% full.
 In practice, not so much:
 
-The cluster, which was the motivation to create this balancer, had devices (same device class, weighted at 1.0) ranging from 55% to 80% size utilization.
+One cluster, which was the motivation to create this balancer, had devices (same device class, weighted at 1.0) ranging from 55% to 80% size utilization.
 
-The reason is this: The cluster has many pools of different sizes (at time of writing 46), OSD sizes vary from 1T to 14T, 4 to 40 OSDs per server.
-And the `mgr balancer` can't handle this.
+The reason is this: the cluster has many pools of different sizes (at time of writing 46), OSD sizes vary from 1T to 14T, 4 to 40 OSDs per server.
+And the `mgr balancer` couldn't handle this.
 
 
 ### `mgr balancer`
@@ -54,7 +63,7 @@ Ceph's included balancer optimizes by PG count on devices.
 It does so by analyzing each pool independently, and then tries to move each pool's PGs so that each participating device has equal normalized PG counts.
 Normalized means placing double the PGs on a double-sized OSD.
 
-Example: Placing 600 PGs on a 2T and 4T OSD means each 1T gets `600PGs/(4T+2T) = 100PGs/T`, thus the 2T OSD gets 200PGs, the 4T OSD 600.
+Example: placing 600 PGs on a 2T and 4T OSD means each 1T gets `600PGs/(4T+2T) = 100PGs/T`, thus the 2T OSD gets 200PGs, the 4T OSD 400.
 
 PG counts are powers of two, so distributing them really equally will almost never work.
 

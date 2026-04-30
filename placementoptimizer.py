@@ -2167,6 +2167,12 @@ class ClusterState:
 
                 shardsize = self.get_pg_shardsize(pg_incoming)
 
+                # this osd has shards of the pg.
+                # initialised here (not in the else-branch below) so the
+                # `missing_shards_size` calculation outside the if/else is
+                # always defined, including when pg_objs <= 0.
+                pg_shards_on_osd = 0
+
                 if pg_objs <= 0:
                     osd_shards_objs_size_transferred = 0
 
@@ -2209,8 +2215,6 @@ class ClusterState:
                     pg_degraded_shards_on_osd = 0
                     # this osd is the target of a pg move where the source does exist
                     pg_misplaced_shards_on_osd = 0
-                    # this osd has shards of the pg
-                    pg_shards_on_osd = 0
 
                     # get the real current remaps active in the cluster
                     incoming_pg_moves = self.get_remaps(pginfo)

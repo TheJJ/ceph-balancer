@@ -607,6 +607,9 @@ def moves_from_up_acting(up_osds: List[int],
     >>> moves_from_up_acting(up_osds=[1, 2, 3, 4], acting_osds=[3, 2], is_ec=False)
     [((-1, -1), (1, 4))]
 
+    >>> moves_from_up_acting(up_osds=[3, 2], acting_osds=[1, 2, 3, 4], is_ec=False)
+    [((1, 4), (-1, -1))]
+
     """
 
     moves: List[Tuple[Tuple[int, ...], Tuple[int, ...]]] = list()
@@ -626,8 +629,14 @@ def moves_from_up_acting(up_osds: List[int],
         # all that are acting but don't stay in up.
         from_osds = list(actings - ups)
 
+        # pad the shorter side with -1 sentinels so |from| == |to|.
+        # the acting set can be wider than up (e.g. recovery, pool size shrink,
+        # temporary mappings) — the original code only handled the opposite case.
         missing_osds = len(to_osds) - len(from_osds)
-        from_osds.extend([-1] * missing_osds)
+        if missing_osds > 0:
+            from_osds.extend([-1] * missing_osds)
+        elif missing_osds < 0:
+            to_osds.extend([-1] * -missing_osds)
 
         if not len(from_osds) == len(to_osds):
             raise Exception(f"|from| != |to|: |{from_osds}| != |{to_osds}|")

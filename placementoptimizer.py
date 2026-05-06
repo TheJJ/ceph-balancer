@@ -4819,7 +4819,16 @@ def balance(args, cluster):
                 move_pg_shardsize = pg_candidates.get_size(move_pg)
                 logging.debug("TRY-0 moving pg %s (%s/%s) with %s from osd.%s", move_pg, move_pg_idx+1, len(pg_candidates), pformatsize(move_pg_shardsize), osd_from)
 
-                try_pg_move = PGMoveChecker(pg_mappings, move_pg)
+                # an undersized PG (its up set is shorter than pool_size,
+                # e.g. CRUSH could not place all shards) makes PGMoveChecker
+                # raise — skip those candidates instead of aborting the whole
+                # balance run. The shard must be recovered by Ceph before any
+                # planned upmap is meaningful anyway.
+                try:
+                    try_pg_move = PGMoveChecker(pg_mappings, move_pg)
+                except RuntimeError as exc:
+                    logging.debug("SKIP pg %s from osd.%s: %s", move_pg, osd_from, exc)
+                    continue
                 osd_to_candidates = [
                     osdid
                     for osdid in try_pg_move.get_osd_candidates(osd_from)

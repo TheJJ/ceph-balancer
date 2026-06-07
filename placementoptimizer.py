@@ -5467,17 +5467,23 @@ def undo_remapped(args, cluster) -> None:
 
     source_osdids = None
     if args.source_osds:
-        source_osdids = {int(osdid) for osdid in args.osds.split(" ")}
+        source_osdids = {int(osdid) for osdid in args.source_osds.split(" ")}
 
     target_osdids = None
     if args.target_osds:
-        target_osdids = {int(osdid) for osdid in args.osds.split(" ")}
+        target_osdids = {int(osdid) for osdid in args.target_osds.split(" ")}
+
+    only_on_osdids = None
+    if args.only_on_osds:
+        only_on_osdids = {int(osdid) for osdid in args.only_on_osds.split(" ")}
 
     for pgid, pginfo in cluster.pgs.items():
         pgstate = pginfo["state"].split("+")
         if "remapped" not in pgstate:
             continue
         if args.exclude_backfilling and "backfilling" in pgstate:
+            continue
+        if only_on_osdids and not (set(pginfo["acting"]) & only_on_osdids):
             continue
 
         for osds_from, osds_to in cluster.get_remaps(pginfo):

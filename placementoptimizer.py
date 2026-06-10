@@ -5213,7 +5213,11 @@ def show(args, cluster):
             for osdid, props in cluster.osds.items():
                 parent_bucket = props.get('parent_bucket', '?')
                 crushclass = props['crush_class']
-                devsize = cluster.osds[osdid]['device_size']
+                devsize = cluster.osds[osdid].get('device_size')
+
+                # osd is down -> not part of pg_dump/pg_map/{pg_stats,osd_stats}
+                if devsize is None:
+                    continue
 
                 if args.only_crushclass:
                     if crushclass != args.only_crushclass:

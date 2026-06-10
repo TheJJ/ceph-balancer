@@ -3,7 +3,7 @@
 """
 Ceph balancer.
 
-(c) 2020-2025 Jonas Jelten <jj@sft.lol>
+(c) 2020-2026 Jonas Jelten <jj@sft.lol>
 GPLv3 or later
 """
 
@@ -193,7 +193,7 @@ def parse_args():
     balancep.add_argument('--ignore-ideal-pgcounts', choices=['all', 'source', 'destination', 'none'],
                           default='none',
                           help=("don't consider balancing by placement group count on an source/destination/both OSD. "
-                                "if you set this, the Ceph Manager's built-in balancer and this one will work against each other."))
+                                "if you set this, Ceph's built-in mgr balancer will generate conflicting movemements (so it should be disabled): %(default)s"))
     balancep.add_argument('--ignore-pgsize-toolarge', action="store_true",
                           help=("don't pre-filter PGs to rule out those that will for sure not gain any space "
                                 "- the target OSD would become more full than the source OSD of a movement."))
@@ -4771,11 +4771,10 @@ def balance(args, cluster):
             source_attempts += 1
 
             if source_attempts > args.max_move_attempts:
-                logging.info(f"couldn't empty osd.{last_attempt}, so we're done. "
-                             f"if you want to try more often, set --max-move-attempts=$nr, this may unlock "
-                             f"more balancing possibilities. "
-                             f"setting --ignore-ideal-pgcounts also unlocks more, but will then we will "
-                             f"fight with ceph's default balancer.")
+                logging.info(f"couldn't empty osd.{last_attempt}, so we're done. options for more balancing possibilities:\n"
+                             f"--ignore-ideal-pgcounts=destination => lift PGs-on-OSD count constraints - unlocks more balancing opportunities, but fights with ceph's default balancer (which you should turn off then).\n"
+                             f"--max-move-attempts=$nr => try to empty more OSDs (fullest first) until giving up\n"
+                             "and of course many other configuration options, have a look at `--help`!"
                 force_finish = True
                 continue
 

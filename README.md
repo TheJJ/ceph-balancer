@@ -159,10 +159,14 @@ Likely this can be optimized further.
 # to generate max 10 pg movements:
 ./placementoptimizer.py -v balance --max-pg-moves 10 | tee /tmp/balance-upmaps
 
-# -> if you're satisfied, run: $ bash /tmp/balance-upmaps
+# -> if you're satisfied, run:
+bash /tmp/balance-upmaps
 
-# but it can do more than balance!
-# there's some examples below.
+# for better balancing, disable ceph's mgr balancer, and run:
+./placementoptimizer.py -v balance --ignore-ideal-pgcounts=destination --max-pg-moves 10 | tee /tmp/balance-upmaps
+# you can even set --ignore-ideal-pgcounts=all, but this may not terminate :)
+
+# this tool can do more than balance! see some examples below.
 ./placementoptimizer.py --help
 ```
 

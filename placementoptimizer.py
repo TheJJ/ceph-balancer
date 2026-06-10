@@ -1203,12 +1203,12 @@ class ClusterState:
         writeb(struct.pack('<I', max_osd), 'osd_state_len')
         state_bits = {
             "exists": 1 << 0,
-		    "up": 1 << 1,
-		    "autoout": 1 << 2,
-		    "new": 1 << 3,
-		    "full": 1 << 4,
-		    "nearfull": 1 << 5,
-		    "backfillfull": 1 << 6,
+            "up": 1 << 1,
+            "autoout": 1 << 2,
+            "new": 1 << 3,
+            "full": 1 << 4,
+            "nearfull": 1 << 5,
+            "backfillfull": 1 << 6,
             "destroyed": 1 << 7,
             "noup": 1 << 8,
             "nodown": 1 << 9,

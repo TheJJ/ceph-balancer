@@ -4774,7 +4774,7 @@ def balance(args, cluster):
                 logging.info(f"couldn't empty osd.{last_attempt}, so we're done. options for more balancing possibilities:\n"
                              f"--ignore-ideal-pgcounts=destination => lift PGs-on-OSD count constraints - unlocks more balancing opportunities, but fights with ceph's default balancer (which you should turn off then).\n"
                              f"--max-move-attempts=$nr => try to empty more OSDs (fullest first) until giving up\n"
-                             "and of course many other configuration options, have a look at `--help`!"
+                             "and of course many other configuration options, have a look at `--help`!")
                 force_finish = True
                 continue
 

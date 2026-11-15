@@ -43,6 +43,7 @@ The utilized space on one OSD is the sum of all PG shards that are stored on it.
 A PG shard is the data of one of the participating OSDs in one PG.
 For replica-pools, the shard size equals `pg_size / pool_size` - one full copy.
 For EC-pools, the shard size equals `pg_size / (pool_size * k)`, k is the number of data chunks in the EC profile.
+For pools with bluestore compression, the shard size is scaled by how much space the pool's data really takes on disk.
 
 CRUSH organizes all the datacenters, racks, servers, OSDs in a tree structure: the _CRUSH topology_.
 Each subtree usually has the weight of all the OSDs below it, and PGs are now distributed evenly, weighted by the sub-tree size at each tree level.

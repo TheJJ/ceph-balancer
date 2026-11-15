@@ -1778,6 +1778,10 @@ class ClusterState:
         ec_profile = pool["erasure_code_profile"]
         if ec_profile:
             shard_size /= self.ec_profiles[ec_profile]["data_chunks"]
+        # compressed pools: scale to the data's size on disk (see shard_size_scale in preprocess).
+        # whole bytes, so the transfer estimation can't go negative from float rounding.
+        if pool["shard_size_scale"] != 1.0:
+            shard_size = int(shard_size * pool["shard_size_scale"])
         # metadata is per-shard (each needs object infos), so no influence by ec
         shard_size += self.pgs[pgid]['metadata_bytes']
 
@@ -1913,6 +1917,10 @@ class ClusterState:
                 "objects": pooldf["stats"]["objects"],  # number of pool objects
                 # data_bytes_used + omap_bytes_used including redundancy of data + omap
                 "used": pooldf["stats"]["bytes_used"],
+                # object data on disk including redundancy, after compression, without omap
+                "data_used": pooldf["stats"].get("data_bytes_used"),
+                # uncompressed size of the data that bluestore compressed, including redundancy
+                "compress_under": pooldf["stats"].get("compress_under_bytes", 0),
                 # available storage amount according to ceph's internal calculation
                 "store_avail": pooldf["stats"]["max_avail"],
                 "percent_used": pooldf["stats"]["percent_used"],
@@ -1939,6 +1947,8 @@ class ClusterState:
             if pool['stored'] == pool['used']:
                 # TODO: when ec supports omap, we may need to blowup omap differently.
                 pool['used'] *= blowup_rate
+                # data_used can't be trusted either then, so don't scale pg sizes with it
+                pool['data_used'] = None
 
             pg_shard_size_avg = pool["used"] / pool["pg_num"] / pool["size"]
 
@@ -2141,6 +2151,31 @@ class ClusterState:
                 estimates[osdid] = metadata_estimate
 
                 self.pgs[pgid]["metadata_bytes"] = int(sum(estimates.values()) / len(estimates))
+
+        # pg num_bytes is the object data size before bluestore compression.
+        # => for compressed pools, scale the pg sizes so they add up to the pool's actual data usage.
+        # this also covers snapshot clones and sparse objects, where num_bytes doesn't match the disk either.
+        pool_pg_bytes = defaultdict(int)
+        pool_pg_count = defaultdict(int)
+        for pgid, pginfo in self.pgs.items():
+            poolid = pool_from_pg(pgid)
+            pool_pg_bytes[poolid] += pginfo['stat_sum']['num_bytes']
+            pool_pg_count[poolid] += 1
+
+        for poolid, pool in self.pools.items():
+            pool["shard_size_scale"] = 1.0
+            if not pool.get("data_used") or not pool.get("compress_under"):
+                continue
+            pg_bytes = pool_pg_bytes[poolid] * pool["blowup_rate"]
+            if pg_bytes <= 0:
+                continue
+            pg_count = pool_pg_count[poolid]
+            if pg_count != pool["pg_num"]:
+                # pgs in unknown state were skipped, assume they're as big as the others
+                logging.warning(f"pool {pool['name']}: only {pg_count}/{pool['pg_num']} pgs known, "
+                                f"estimating its compression from those")
+                pg_bytes *= pool["pg_num"] / pg_count
+            pool["shard_size_scale"] = pool["data_used"] / pg_bytes
 
         #for pgid, p in self.pgs.items():
         #    print(f"id {pgid}, shrd={pformatsize(self.get_pg_shardsize(pgid))}, meta={pformatsize(p['metadata_bytes'])}, est={p['metadata_estimates']}")

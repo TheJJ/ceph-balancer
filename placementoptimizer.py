@@ -2154,7 +2154,8 @@ class ClusterState:
 
         # pg num_bytes is the object data size before bluestore compression.
         # => for compressed pools, scale the pg sizes so they add up to the pool's actual data usage.
-        # this also covers snapshot clones and sparse objects, where num_bytes doesn't match the disk either.
+        # in those pools this also covers snapshot clones and sparse objects, where num_bytes doesn't
+        # match the disk either.  uncompressed pools are skipped and keep their num_bytes sizes.
         pool_pg_bytes = defaultdict(int)
         pool_pg_count = defaultdict(int)
         for pgid, pginfo in self.pgs.items():
